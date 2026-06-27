@@ -102,6 +102,7 @@ fun i-return-call(i): link(18, leb-u(i)) end
 fun i-return-call-indirect(typeidx, tableidx): append([list: 19], append(leb-u(typeidx), leb-u(tableidx))) end
 fun i-ref-null(ht): link(208, leb-u(ht)) end   # NB: heaptypes >=0 are typeidx; abstract use the negative encodings (TODO)
 fun i-ref-func(i): link(210, leb-u(i)) end
+ref-eq = [list: 211]                            # ref.eq : (eqref, eqref) -> i32  (0xD3)
 # control flow. blocktype: 64 = empty; a single value type list = that result type;
 # a typeidx (sleb, non-negative) = a function-type block.
 bt-empty = [list: 64]
@@ -123,6 +124,8 @@ fun array-new(t): gc(6, [list: t]) end
 fun array-new-default(t): gc(7, [list: t]) end
 fun array-new-fixed(t, n): gc(8, [list: t, n]) end
 fun array-get(t): gc(11, [list: t]) end
+fun array-get-s(t): gc(12, [list: t]) end   # packed (i8/i16) signed read
+fun array-get-u(t): gc(13, [list: t]) end   # packed (i8/i16) unsigned read
 fun array-set(t): gc(14, [list: t]) end
 array-len = gc(15, [list: ])
 fun ref-test(ht): gc(20, [list: ht]) end

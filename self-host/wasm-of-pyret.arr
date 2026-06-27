@@ -11,11 +11,13 @@ provide *
 # $Closure env and read them back from the env inside the body — boxed `var`s capture the
 # box so mutation is shared), a-data-expr CONSTRUCTOR emission (one table function per
 # variant building a $Variant, plus the $variant_names global), the prim-app dispatch
-# table, and inline $truthy (i31 cast + get_s).  `$raise` stays a trapping stand-in: the
-# function index space is import-free (runtime.arr's internal `call`s are hard-indexed
-# from 0), so a host import would shift every index — wiring it needs a coordinated
-# runtime.arr change.  Most runtime kernels are still `todo()` stubs, so a compiled module
-# does not RUN end-to-end yet; this emits faithful bytes for the structure above.
+# table (equality/raw-array/type-predicates/string-to-code-point), inline $truthy, and
+# singleton constructors as VALUES.  `$raise` is now a real call to the host `raise`
+# import: the funcidx space is [host imports ++ runtime ++ lambdas ++ ctors ++ main], so
+# imports occupy the lowest indices and every defined-function reference is offset by
+# NUM-IMPORTS (centralized in runtime.arr's num-host-imports).  Most runtime kernels are
+# still `todo()` stubs, so a compiled module does not RUN end-to-end yet; this emits
+# faithful bytes for the structure above.
 
 import encoder as E
 import ast-anf as N
@@ -38,14 +40,17 @@ T-OBJECT = 11       # (struct (ref $Names), (ref $Fields))
 T-METHOD = 12       # (struct (ref $Closure))
 ANYREF-BT = [list: 110]   # blocktype: single anyref result
 I31-HT = 108              # the i31 abstract heaptype byte (== i31ref value-type byte)
+EQREF-HT = 109            # the eq abstract heaptype byte (== eqref value-type byte)
 
 # ===== runtime-function indices =====
-# The function index space is [runtime fns ++ user lambdas ++ variant ctors ++ main] (NO
-# imports — runtime.arr's bodies `call` each other by hard-coded index from 0, so adding
-# an import section would shift every index). A runtime fn's func index == its position in
-# build-runtime(); resolve by name so the idx-* below stay correct as the runtime grows.
+# The function index space is [HOST IMPORTS ++ runtime fns ++ user lambdas ++ variant
+# ctors ++ main]. Imports occupy the lowest funcidxs (wasm requires imports first), so
+# EVERY defined-function reference is offset by NUM-IMPORTS. `rt-index(name)` is a runtime
+# fn's POSITION in build-runtime(); `rt-funcidx(name)` adds the import offset to get the
+# real funcidx for a `call`. Host imports are called by their import index (host-funcidx).
 NUM-GC-TYPES = 13
 RT-FUNS = R.build-runtime()
+NUM-IMPORTS = R.num-host-imports
 fun rt-index(name :: String) -> Number: rt-index-from(RT-FUNS, name, 0) end
 fun rt-index-from(fs, name :: String, i :: Number) -> Number:
   cases(List) fs:
@@ -53,18 +58,29 @@ fun rt-index-from(fs, name :: String, i :: Number) -> Number:
     | link(f, r) => if f.name == name: i else: rt-index-from(r, name, i + 1) end
   end
 end
-fun idx-make-fix(): rt-index("$make_fix") end
-fun idx-make-object(): rt-index("$make_object") end
-fun idx-obj-get(): rt-index("$obj_get") end
-fun idx-obj-extend(): rt-index("$obj_extend") end
-fun idx-variant-field-by-name(): rt-index("$variant_field_by_name") end
-fun idx-variant-id(): rt-index("$variant_id") end
+# real funcidx of a runtime fn (= import block + its position).
+fun rt-funcidx(name :: String) -> Number: NUM-IMPORTS + rt-index(name) end
+# funcidx of a host import (lives in the low import block; no offset).
+fun host-funcidx(name :: String) -> Number: R.host-import-index(name) end
+fun idx-make-fix(): rt-funcidx("$make_fix") end
+fun idx-make-object(): rt-funcidx("$make_object") end
+fun idx-obj-get(): rt-funcidx("$obj_get") end
+fun idx-obj-extend(): rt-funcidx("$obj_extend") end
+fun idx-variant-field-by-name(): rt-funcidx("$variant_field_by_name") end
+fun idx-variant-id(): rt-funcidx("$variant_id") end
+fun idx-num-to-i32(): rt-funcidx("$num_to_i32") end
 
 # bools/nothing are i31 (true=1,false=0,nothing=2). $truthy is inlined: cast to i31 then
 # i31.get_s, leaving an i32 the `if` consumes (mirrors compile.ts's truthy()).
 fun truthy-instr() -> List<Number>: E.ref-cast(I31-HT).append(E.i31-get-s) end
-# $raise: see header — no runtime fn / import yet, so emit a trap. TODO(port): host import.
-fun raise-instr() -> List<Number>: E.i-unreachable end
+# $raise(ptr,len) host import: host throws a PyretError, never returns. We pass an empty
+# message span (0,0) for now (TODO(port): write the real message into scratch memory),
+# then `unreachable` so the surrounding (anyref-typed) block still validates.
+fun raise-instr() -> List<Number>:
+  E.i32-const(0).append(E.i32-const(0)).append(E.i-call(host-funcidx("raise"))).append(E.i-unreachable)
+end
+# wrap an i32 (0/1) bool on the stack into a Pyret boolean (i31). (mirrors mkBool.)
+fun to-bool() -> List<Number>: E.ref-i31 end
 
 # prim-app names the front-end throws for failed control flow (desugar.arr). They abort.
 throw-prims :: List<String> = [list:
@@ -251,6 +267,63 @@ fun emit-names-of(names) -> List<Number>:
   E.concat(names.map(lam(nm): emit-str(nm) end)).append(E.array-new-fixed(T-NAMES, length(names)))
 end
 
+# ===== prim-app dispatch =====
+# Mirrors the seed's intrinsic ladder (compile.ts buildPrimApp): the raw-array library,
+# value-model type predicates, equality, and string-to-code-point lower to inline GC ops +
+# runtime calls; control-flow throw-prims and the unmapped tail call the $raise host import.
+# Each branch leaves ONE anyref on the stack.  Args are $Num/anyref AVals.
+fun prim-type-test(args, c :: Ctx, t :: Number) -> List<Number>:
+  compile-aval(args.first, c).append(E.ref-test-null(t)).append(to-bool())
+end
+fun compile-prim-app(fname :: String, args, c :: Ctx) -> List<Number>:
+  ask:
+    # ---- equality ----
+    | (fname == "equal-always") or (fname == "equal-now") then:
+      compile-avals(args, c).append(E.i-call(rt-funcidx("$equal"))).append(to-bool())
+    | fname == "identical" then:
+      compile-aval(args.first, c).append(E.ref-cast(EQREF-HT))
+        .append(compile-aval(args.rest.first, c)).append(E.ref-cast(EQREF-HT))
+        .append(E.ref-eq).append(to-bool())
+    | fname == "not" then:
+      compile-aval(args.first, c).append(truthy-instr()).append(E.i32-eqz).append(to-bool())
+    # ---- raw arrays = a $Fields (array (mut anyref)) ----
+    | (fname == "raw-array-get") or (fname == "prim-raw-array-get") then:
+      compile-aval(args.first, c).append(E.ref-cast(T-FIELDS))
+        .append(compile-aval(args.rest.first, c)).append(E.i-call(idx-num-to-i32()))
+        .append(E.array-get(T-FIELDS))
+    | (fname == "raw-array-length") or (fname == "prim-raw-array-length") then:
+      compile-aval(args.first, c).append(E.ref-cast(T-FIELDS)).append(E.array-len)
+        .append(E.i64-extend-i32-u).append(E.i-call(idx-make-fix()))
+    | (fname == "raw-array-set") or (fname == "prim-raw-array-set") then:
+      a = c.next-local                                  # stash array; assignment returns it
+      compile-aval(args.first, c).append(E.local-set(a))
+        .append(E.local-get(a)).append(E.ref-cast(T-FIELDS))
+        .append(compile-aval(args.rest.first, c)).append(E.i-call(idx-num-to-i32()))
+        .append(compile-aval(args.rest.rest.first, c))
+        .append(E.array-set(T-FIELDS))
+        .append(E.local-get(a))
+    | (fname == "raw-array-of") or (fname == "prim-raw-array-of") then:
+      # array.new $Fields : [init, i32 count] -> arrayref  (init = elt, count = n)
+      compile-aval(args.first, c)
+        .append(compile-aval(args.rest.first, c)).append(E.i-call(idx-num-to-i32()))
+        .append(E.array-new(T-FIELDS))
+    # ---- the byte code point of a 1-char string ----
+    | fname == "string-to-code-point" then:
+      compile-aval(args.first, c).append(E.ref-cast(T-STR))
+        .append(E.i32-const(0)).append(E.array-get-u(T-STR))
+        .append(E.i64-extend-i32-u).append(E.i-call(idx-make-fix()))
+    # ---- value-model type predicates (ref.test the runtime representation) ----
+    | fname == "is-string" then: prim-type-test(args, c, T-STR)
+    | fname == "is-number" then: prim-type-test(args, c, T-NUM)
+    | fname == "is-function" then: prim-type-test(args, c, T-CLOSURE)
+    | fname == "is-object" then: prim-type-test(args, c, T-OBJECT)
+    | fname == "is-raw-array" then: prim-type-test(args, c, T-FIELDS)
+    # ---- control-flow aborts + the unmapped tail -> $raise host import ----
+    | throw-prims.member(fname) then: raise-instr()
+    | otherwise: raise-instr()   # TODO(port): makeArrayN, getMaker*, getColonField, getBracket, makeSome/None, run-task...
+  end
+end
+
 # ===== ALettable -> instructions (leaves the value; `tail` => return_call) =====
 fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
   cases(N.ALettable) lt:
@@ -280,15 +353,7 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(pack-fields(args, c))                             # arg1: args as $Fields
         .append(E.local-get(cl)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))  # selector
         .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
-    | a-prim-app(l, fname, args, info) =>
-      # prim-app dispatch (mirrors js-of-pyret's prim table + the seed's intrinsic ladder).
-      ask:
-        | fname == "equal-always" then: compile-avals(args, c).append(E.i-call(rt-index("$equal")))
-        | fname == "not" then:
-          compile-aval(args.first, c).append(truthy-instr()).append(E.i32-eqz).append(E.ref-i31)
-        | throw-prims.member(fname) then: raise-instr()
-        | otherwise: raise-instr()   # TODO(port): raw_array_*, makeArrayN, getMaker*, getBracket, makeSome/None, ...
-      end
+    | a-prim-app(l, fname, args, info) => compile-prim-app(fname, args, c)
     | a-if(l, cnd, t, e) =>
       compile-aval(cnd, c)
         .append(truthy-instr())
@@ -360,11 +425,13 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # an $Object mapping each variant name -> its constructor closure, so later code can
       # reach the constructors. The $variant_names global (for $variant_field_by_name) is
       # built by the assembler from the same registry.
-      # TODO(port): is-<variant> predicates, singleton ctor as a value not a closure, and
-      # binding the constructor names that the front-end's ANF references directly.
+      # Singleton variants bind to their constructed VALUE; regular variants bind to a
+      # constructor closure (see data-field-value). TODO(port): is-<variant> predicates and
+      # binding the constructor names that the front-end's ANF references directly (needs
+      # the top-level/global id resolution that a-id still leaves as null).
       this-names = variants.map(variant-name)
       emit-names-of(this-names)
-        .append(E.concat(variants.map(lam(vv): ctor-closure(c, vv) end)))
+        .append(E.concat(variants.map(lam(vv): data-field-value(c, vv) end)))
         .append(E.array-new-fixed(T-FIELDS, length(variants)))
         .append(E.i-call(idx-make-object()))
     | a-ref(l, ann) => E.i-ref-null(110)                                   # TODO(port): bare ref
@@ -379,6 +446,22 @@ fun ctor-closure(c :: Ctx, v) -> List<Number>:
   cases(Option) data-lookup(c, vn):
     | none => E.i-ref-null(T-CLOSURE)
     | some(d) => E.i32-const(c.nlams + d.id).append(E.i-ref-null(T-FIELDS)).append(E.struct-new(T-CLOSURE))
+  end
+end
+# the value bound to a variant name in the data object: a SINGLETON variant is the
+# constructed $Variant VALUE (no args, so it's used directly, not called); a regular
+# variant is its constructor closure.
+fun data-field-value(c :: Ctx, v) -> List<Number>:
+  vn = variant-name(v)
+  cases(N.AVariant) v:
+    | a-singleton-variant(_, _, _) =>
+      cases(Option) data-lookup(c, vn):
+        | none => E.i-ref-null(110)
+        | some(d) =>
+          E.i32-const(d.id).append(emit-str(d.name))
+            .append(E.array-new-fixed(T-FIELDS, 0)).append(E.struct-new(T-VARIANT))
+      end
+    | a-variant(_, _, _, _, _) => ctor-closure(c, v)
   end
 end
 fun variant-name(v) -> String:
@@ -600,6 +683,9 @@ end
 # follows the GC rec-group (NUM-GC-TYPES indices) and one func type per runtime fn.
 fun closure-call-type-idx(): NUM-GC-TYPES + length(RT-FUNS) end
 fun main-type-idx(): NUM-GC-TYPES + length(RT-FUNS) + 1 end
+# the host-import func types follow closure-call + main in the type section.
+fun import-type-base(): NUM-GC-TYPES + length(RT-FUNS) + 2 end
+fun import-type-idx(k :: Number): import-type-base() + k end
 
 LOCAL-BUDGET = 512   # anyref locals declared per function (over-declared; unused are legal)
 
@@ -672,7 +758,8 @@ fun compile-prog(prog) -> List<Number>:
       num-lams = length(lams)
       num-ctors = length(dreg)
       ordered = ctors-by-id(dreg, 0, num-ctors)             # ctors in id order
-      main-funcidx = (num-rt + num-lams) + num-ctors
+      # funcidx space: [imports 0..NUM-IMPORTS-1][runtime][lambdas][ctors][main].
+      main-funcidx = NUM-IMPORTS + (((num-rt + num-lams) + num-ctors))
 
       # ----- main (() -> anyref), the lambda bodies, and the ctor bodies -----
       main-ctx = ctx(empty, 0, empty, empty, lam-map, dreg, gvars, num-lams)
@@ -683,11 +770,13 @@ fun compile-prog(prog) -> List<Number>:
       # would append a second `end`).
       rt-code = RT-FUNS.map(lam(rf): E.byte-vec(E.vec(rf.locals).append(rf.body)) end)
 
-      # ----- type section: GC rec-group ++ a func type per runtime fn ++ closure ++ main -----
+      # ----- type section: GC rec-group ++ a func type per runtime fn ++ closure ++ main
+      #       ++ one func type per host import (referenced by the import section) -----
       rt-types = RT-FUNS.map(lam(rf): E.func-type-vt(rf.params, rf.results) end)
       closure-type = E.func-type-vt([list: E.anyref, E.reftnull(T-FIELDS)], [list: E.anyref])
       main-type = E.func-type-vt(empty, [list: E.anyref])
-      type-c = E.vec(link(gc-rec-group(), rt-types.append([list: closure-type, main-type])))
+      import-types = R.host-imports.map(lam(hi): E.func-type-vt(hi.params, hi.results) end)
+      type-c = E.vec(link(gc-rec-group(), rt-types.append([list: closure-type, main-type]).append(import-types)))
 
       # ----- func section: a type index per function (runtime ++ lambdas ++ ctors ++ main) -----
       rt-func-decls = range(0, num-rt).map(lam(i): E.leb-u(NUM-GC-TYPES + i) end)
@@ -699,8 +788,8 @@ fun compile-prog(prog) -> List<Number>:
       num-slots = num-lams + num-ctors
       table-c = if num-slots == 0: empty
                 else: E.vec([list: E.table-entry([list: 112], num-slots)]) end   # 112 = funcref
-      lam-funcidxs = range(0, num-lams).map(lam(i): num-rt + i end)
-      ctor-funcidxs = range(0, num-ctors).map(lam(j): (num-rt + num-lams) + j end)
+      lam-funcidxs = range(0, num-lams).map(lam(i): NUM-IMPORTS + (num-rt + i) end)
+      ctor-funcidxs = range(0, num-ctors).map(lam(j): NUM-IMPORTS + ((num-rt + num-lams) + j) end)
       all-slots = lam-funcidxs.append(ctor-funcidxs)
       elem-c = if num-slots == 0: empty
                else: E.vec([list: E.elem-active-funcs(E.i32-const(0), all-slots)]) end
@@ -709,12 +798,16 @@ fun compile-prog(prog) -> List<Number>:
       global-c = if num-ctors == 0: empty
                  else: E.vec([list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))]) end
 
+      # ----- import section: host functions, module "host" (occupy the low funcidxs) -----
+      import-c = E.vec(map2(lam(hi, k): E.import-func("host", hi.name, import-type-idx(k)) end,
+                            R.host-imports, range(0, NUM-IMPORTS)))
+
       # ----- export main -----
       export-c = E.vec([list: E.export-entry("main", 0, main-funcidx)])
 
       # ----- code section -----
       code-c = E.vec(rt-code.append(lam-code).append(ctor-code).append([list: main-code]))
 
-      E.wasm-module-of(type-c, empty, func-c, table-c, empty, global-c, export-c, elem-c, code-c)
+      E.wasm-module-of(type-c, import-c, func-c, table-c, empty, global-c, export-c, elem-c, code-c)
   end
 end

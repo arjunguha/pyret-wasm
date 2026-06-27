@@ -51,6 +51,41 @@ fun todo(name :: String, note :: String) -> RtFun:
   rt-fun(name, empty, empty, empty, E.unreachable.append(E.end-instr))
 end
 
+# ===== host imports (provided by src/runtime/run.ts) =====
+# These occupy the LOWEST function indices (imports precede defined functions in the
+# wasm funcidx space), so EVERY internal `call`/table/export funcidx is offset by
+# `num-host-imports`. Names + order + signatures MIRROR src/compiler/runtime.ts's
+# buildImports() exactly, so the host object in run.ts resolves them and the offsets
+# match the seed. (module is "host" for all.)
+data HostImport: host-import(name :: String, params :: List, results :: List) end
+host-imports :: List<HostImport> = [list:
+  host-import("print",                [list: i32t, i32t], empty),
+  host-import("check_stash",          [list: i32t, i32t], empty),
+  host-import("check_fail",           [list: i32t, i32t], empty),
+  host-import("check_fail_isnot",     [list: i32t, i32t], empty),
+  host-import("check_fail_pred",      [list: i32t, i32t], empty),
+  host-import("check_summary",        [list: i32t, i32t], empty),
+  host-import("raise",                [list: i32t, i32t], empty),
+  host-import("check_raises",         [list: i32t, i32t], [list: i32t]),
+  host-import("emit_byte",            [list: i32t],       empty),
+  host-import("do_pause",             empty,              empty),
+  host-import("read_source_into",     [list: i32t],       [list: i32t]),
+  host-import("parse_source",         empty,              [list: i32t]),
+  host-import("parse_node_tag",       [list: i32t],       [list: i32t]),
+  host-import("parse_node_nkids",     [list: i32t],       [list: i32t]),
+  host-import("parse_node_str_into",  [list: i32t, i32t], [list: i32t]) ]
+num-host-imports :: Number = length(host-imports)
+# import funcidx of a host import by name (0-based; imports come first in the space).
+fun host-import-index(name :: String) -> Number: hi-index(host-imports, name, 0) end
+fun hi-index(hs, name :: String, i :: Number) -> Number:
+  cases(List) hs:
+    | empty => raise("runtime: no host import named " + name)
+    | link(f, r) => if f.name == name: i else: hi-index(r, name, i + 1) end
+  end
+end
+# func index of runtime fn at runtime-list position `pos` (after the import block).
+fun rt-funcidx-at(pos :: Number) -> Number: num-host-imports + pos end
+
 # ===== number tower: construction =====
 # $make_fix(i64) -> (ref $Num) : struct.new $Fixnum {TAG-FIX, i64}
 fun emit-make-fix() -> RtFun:
@@ -111,7 +146,7 @@ fun emit-string-length() -> RtFun:
     .append(E.ref-cast(T-STR))
     .append(E.array-len)
     .append([list: 173])              # i64.extend_i32_u
-    .append(E.call(0))                # $make_fix (index 0)
+    .append(E.call(rt-funcidx-at(0))) # $make_fix (runtime pos 0, + import offset)
     .append(E.end-instr)
   rt-fun("$string_length", [list: anyref], [list: E.reft(T-NUM)], empty, body)
 end
