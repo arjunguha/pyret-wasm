@@ -60,6 +60,19 @@
   .error-box { display:block; margin:6px 0; padding:8px 10px; border:1px solid #e6a99f;
     border-left:4px solid var(--err); border-radius:4px; background:#fdecea;
     color:#922b21; white-space:pre-wrap; }
+  /* Clickable source location inside an error message -> jumps the editor cursor. */
+  .err-loc { color:#922b21; font-weight:700; text-decoration:underline; cursor:pointer; }
+  .err-loc:hover { color:var(--err); }
+  /* Debugger buttons (Pause/Step) on the cooperative-stop infra. */
+  #pause { background:#e6a700; color:#3a2e00; }
+  #pause:disabled { background:#f0dca0; cursor:default; }
+  #step { background:#5a6b7a; color:#fff; }
+  #step:disabled { background:#c2cad1; cursor:default; }
+  /* Table values rendered as a real grid. */
+  table.pyret-table { border-collapse:collapse; margin:6px 0; font-size:13px; background:#fff; }
+  table.pyret-table th, table.pyret-table td { border:1px solid var(--border); padding:3px 10px; text-align:left; }
+  table.pyret-table th { background:#eef2f5; font-weight:600; color:#33424f; }
+  table.pyret-table tbody tr:nth-child(even) { background:#f7f9fb; }
   .promptbar { display:flex; align-items:center; border-top:1px solid var(--border); background:var(--panel); padding:0 8px; }
   .promptbar .caret { color:var(--prompt); font-weight:700; padding:0 6px; }
   #repl { flex:1; border:0; outline:none; padding:8px 4px; font-family:"SF Mono", Menlo, Consolas, monospace; font-size:14px; background:transparent; }
@@ -72,6 +85,8 @@
   <span class="sub">on WebAssembly</span>
   <div class="toolbar">
     <button id="run">Run ▶</button>
+    <button id="pause" disabled>Pause ⏸</button>
+    <button id="step" disabled>Step ⏭</button>
     <button id="stop" disabled>Stop ■</button>
   </div>
 </header>
@@ -104,6 +119,7 @@ fact(20)</textarea>
 <script src="./vendor/codemirror.js"></script>
 <script src="./vendor/pyret-mode.js"></script>
 <script src="./image.js"></script>
+<script src="./table.js"></script>
 <script src="./ide.js"></script>
 <script type="module" src="./main.bundle.js"></script>
 </body>
