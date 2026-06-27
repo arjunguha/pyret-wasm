@@ -325,6 +325,15 @@ fun image-height(img):
 end
 
 # ---- raw arrays (primitive: a $Fields cell; get/length/set are intrinsics) ----
+# First-class wrappers: the bodies' calls resolve to the compileApp INTRINSICS (by
+# name, args-arity), so these don't recurse; defining them as globals makes the names
+# resolvable as values (`rag = raw-array-get`, `map(raw-array-get, ...)`) and through
+# the skipped `arrays` module alias (`arrays.raw-array-get`).
+fun raw-array-get(a, i): prim-raw-array-get(a, i) end
+fun raw-array-set(a, i, v): prim-raw-array-set(a, i, v) end
+fun raw-array-length(a): prim-raw-array-length(a) end
+fun raw-array-of(v, n): prim-raw-array-of(v, n) end
+
 fun raw-array-to-list(arr):
   fun ra-loop(i, n): if i >= n: empty else: link(raw-array-get(arr, i), ra-loop(i + 1, n)) end end
   ra-loop(0, raw-array-length(arr))
