@@ -263,6 +263,9 @@ export class Runtime {
     m.addGlobal("$empty_id", I, true, m.i32.const(-1));
     // thunk awaiting a `raises` check (host invokes run_pending_thunk in try/catch)
     m.addGlobal("$pending_thunk", binaryen.anyref, true, m.ref.null(binaryen.anyref));
+    // the most-recently-`raise`d Pyret value, stashed before the throw so that
+    // `raises-satisfies`/`raises-violates` can apply their predicate to it.
+    m.addGlobal("$raised_value", binaryen.anyref, true, m.ref.null(binaryen.anyref));
     // stoppable codegen: gas counter (yield-check decrements; pause at 0),
     // the captured continuation thunk to resume, and the final result.
     m.addGlobal("$gas", I, true, m.i32.const(GAS_RESET));

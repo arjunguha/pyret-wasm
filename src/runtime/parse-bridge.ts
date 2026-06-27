@@ -156,10 +156,18 @@ function checkOpKind(opNode: CstNode): string {
     case "IS": return "is";
     case "ISNOT": return "is-not";
     case "ISEQUALEQUAL": return "is==";
+    case "ISNOTEQUALEQUAL": return "is-not==";
+    case "ISROUGHLY": return "is-roughly";
+    case "ISNOTROUGHLY": return "is-not-roughly";
+    case "ISSPACESHIP": return "is<=>";
+    case "ISNOTSPACESHIP": return "is-not<=>";
     case "SATISFIES": return "satisfies";
     case "SATISFIESNOT": return "satisfies-not";
     case "RAISES": return "raises";
-    default: return "is"; // TODO(grammar): roughly/raises-other/because checks
+    case "RAISESNOT": return "raises-not";
+    case "RAISESSATISFIES": return "raises-satisfies";
+    case "RAISESVIOLATES": return "raises-violates";
+    default: return "is"; // TODO(grammar): raises-other/because checks
   }
 }
 

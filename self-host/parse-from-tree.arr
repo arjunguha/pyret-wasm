@@ -134,9 +134,17 @@ fun check-op(l, s):
   if s == "is": A.s-op-is(l)
   else if s == "is-not": A.s-op-is-not(l)
   else if s == "is==": A.s-op-is-op(l, "op==")
+  else if s == "is-not==": A.s-op-is-not-op(l, "op==")
+  else if s == "is-roughly": A.s-op-is-roughly(l)
+  else if s == "is-not-roughly": A.s-op-is-not-roughly(l)
+  else if s == "is<=>": A.s-op-is-op(l, "op<=>")
+  else if s == "is-not<=>": A.s-op-is-not-op(l, "op<=>")
   else if s == "satisfies": A.s-op-satisfies(l)
   else if s == "satisfies-not": A.s-op-satisfies-not(l)
   else if s == "raises": A.s-op-raises(l)
+  else if s == "raises-not": A.s-op-raises-not(l)
+  else if s == "raises-satisfies": A.s-op-raises-satisfies(l)
+  else if s == "raises-violates": A.s-op-raises-violates(l)
   else: A.s-op-is(l)
   end
 end

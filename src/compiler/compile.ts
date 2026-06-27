@@ -1589,9 +1589,13 @@ class Compiler {
   private compileIntrinsic(name: string, args: number[], ctx: Ctx): number | null {
     const m = this.m;
     if (name === "raise" && args.length === 1) {
+      const v = ctx.addLocal(binaryen.anyref);
       const len = ctx.addLocal(binaryen.i32);
       return m.block(null, [
-        m.local.set(len, m.call("$val_to_string", [args[0]!], binaryen.i32)),
+        m.local.set(v, args[0]!),
+        // stash the raised value so `raises-satisfies`/`raises-violates` can inspect it
+        m.global.set("$raised_value", m.local.get(v, binaryen.anyref)),
+        m.local.set(len, m.call("$val_to_string", [m.local.get(v, binaryen.anyref)], binaryen.i32)),
         m.call("$raise", [m.i32.const(SCRATCH_OFFSET), m.local.get(len, binaryen.i32)], binaryen.none),
         m.unreachable(),
       ], binaryen.anyref);
@@ -2363,6 +2367,37 @@ class Compiler {
         m.local.set(rLoc, this.compileExpr(rhs, ctx, false)),
         m.call(isNeg ? "$check_isnot_refine" : "$check_is_refine",
           [m.local.get(lLoc, binaryen.anyref), m.local.get(rLoc, binaryen.anyref), okI], binaryen.none),
+      ]);
+    }
+    if (op === "ISSPACESHIP" || op === "ISNOTSPACESHIP") {
+      // `a is<=> b` / `a is-not<=> b`: pass iff a and b are equal under the total
+      // order (the spaceship returns Equal) — for our value model that's structural
+      // equality, so route through the same harness as is / is-not.
+      const fn = op === "ISSPACESHIP" ? "$check_is" : "$check_is_not";
+      return m.call(fn, [this.compileExpr(lhs, ctx, false), this.compileExpr(rhs, ctx, false)], binaryen.none);
+    }
+    if (op === "RAISESSATISFIES" || op === "RAISESVIOLATES") {
+      // `lhs raises-satisfies pred`: lhs must raise, AND pred(exn-value) is true.
+      // `raises-violates`: lhs must raise, AND pred(exn-value) is FALSE.
+      const isViolates = op === "RAISESVIOLATES";
+      const thunk = this.buildThunkFromExpr(lhs, ctx, "$rai_");
+      const predLoc = ctx.addLocal(binaryen.anyref);
+      const raised = ctx.addLocal(binaryen.i32);
+      const predOk = this.truthy(this.callClosureValue(
+        m.local.get(predLoc, binaryen.anyref),
+        [m.global.get("$raised_value", binaryen.anyref)], ctx, false));
+      return m.block(null, [
+        m.local.set(predLoc, this.compileExpr(rhs, ctx, false)),
+        m.global.set("$raised_value", m.ref.null(binaryen.anyref)),
+        m.global.set("$pending_thunk", thunk),
+        // len=0 -> host reports whether the thunk raised at all (message ignored)
+        m.local.set(raised, m.call("$check_raises", [m.i32.const(SCRATCH_OFFSET), m.i32.const(0)], binaryen.i32)),
+        m.call("$check_pred", [
+          // only apply the predicate when it actually raised (else $raised_value is null)
+          m.if(m.local.get(raised, binaryen.i32),
+            isViolates ? m.i32.eqz(predOk) : predOk,
+            m.i32.const(0)),
+        ], binaryen.none),
       ]);
     }
     throw new CompileError(`unsupported check operator: ${op}`, opNode);
