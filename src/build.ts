@@ -44,6 +44,20 @@ function stripStr(v: string): string {
   return v;
 }
 
+// Resolve a bare module name (`import NAME as A` / `include NAME`) to an existing
+// .arr path in our front-end tree, or undefined for core/prelude-provided modules.
+function resolveModulePath(name: string, dir: string): string | undefined {
+  if (SKIP_MODULES.has(name)) return undefined;
+  for (const cand of [
+    resolve(dir, name + ".arr"),
+    resolve(SELF_COMPILER, "trove", name + ".arr"),
+    resolve(SELF_COMPILER, "compiler", name + ".arr"),
+  ]) {
+    if (existsSync(cand)) return cand;
+  }
+  return undefined;
+}
+
 // Absolute paths of local modules a program depends on (file imports + trove-name
 // imports/includes resolved against `dir`, self-compiler/trove, self-compiler/compiler).
 // Returns only paths that exist; unknown/core modules are skipped (already global).
@@ -66,15 +80,42 @@ function localImports(program: CstNode, dir: string): string[] {
     // bare module import/include: `import NAME as A` | `include NAME`
     const impName = findDescendant(stmt, "import-name");
     const nm = impName?.kids.find((k) => k.name === "NAME");
-    if (nm?.value && !SKIP_MODULES.has(nm.value)) {
-      for (const cand of [
-        resolve(dir, nm.value + ".arr"),
-        resolve(SELF_COMPILER, "trove", nm.value + ".arr"),
-        resolve(SELF_COMPILER, "compiler", nm.value + ".arr"),
-      ]) {
-        if (existsSync(cand)) { out.push(cand); break; }
+    const p = nm?.value ? resolveModulePath(nm.value, dir) : undefined;
+    if (p) out.push(p);
+  }
+  return out;
+}
+
+// The module ALIASES a program introduces with `import <src> as N`, paired with the
+// absolute path the alias points to (when it's a local module we actually load).
+// Used to make `N.member` access MODULE-AWARE under whole-program flattening — so two
+// modules exporting the same name (e.g. a `fun foo` vs a `data` variant `foo`) are
+// each reachable through their own alias rather than colliding in the flat namespace.
+function moduleAliasTargets(program: CstNode, dir: string): { alias: string; path: string }[] {
+  const prelude = program.kids.find((k) => k.name === "prelude");
+  if (!prelude) return [];
+  const out: { alias: string; path: string }[] = [];
+  for (const stmt of prelude.kids) {
+    if (stmt.name !== "import-stmt") continue;
+    const asTok = stmt.kids.find((k) => k.name === "AS");
+    if (!asTok) continue; // only `import ... as N` makes an alias
+    const aliasNode = stmt.kids[stmt.kids.length - 1];
+    const alias = aliasNode?.name === "NAME" ? aliasNode.value : undefined;
+    if (!alias || alias === "_") continue;
+    const special = findDescendant(stmt, "import-special");
+    if (special) {
+      const nm = special.kids.find((k) => k.name === "NAME");
+      const str = special.kids.find((k) => k.name === "STRING");
+      if (nm?.value === "file" && str?.value) {
+        const rel = stripStr(str.value);
+        out.push({ alias, path: resolve(dir, rel.endsWith(".arr") ? rel : rel + ".arr") });
       }
+      continue;
     }
+    const impName = findDescendant(stmt, "import-name");
+    const nm = impName?.kids.find((k) => k.name === "NAME");
+    const p = nm?.value ? resolveModulePath(nm.value, dir) : undefined;
+    if (p) out.push({ alias, path: p });
   }
   return out;
 }
@@ -133,6 +174,7 @@ async function loadModule(
   absPath: string,
   seen: Map<string, CstNode | null>,
   order: CstNode[],
+  orderPaths: string[],
 ): Promise<void> {
   if (seen.has(absPath)) return; // already loaded (or in progress -> break cycles)
   seen.set(absPath, null);
@@ -140,21 +182,126 @@ async function loadModule(
   const program = await parsePyret(src);
   const dir = dirname(absPath);
   for (const dep of localImports(program, dir)) {
-    await loadModule(dep, seen, order);
+    await loadModule(dep, seen, order, orderPaths);
   }
   order.push(program); // post-order: dependencies precede dependents
+  orderPaths.push(absPath);
   seen.set(absPath, program);
+}
+
+const PRELUDE_PATH = "<prelude>";
+
+// Stmt nodes of `program` (top-level block statements). mergeMany/stripChecks
+// preserve stmt-node IDENTITY, so a WeakMap keyed by these nodes survives the merge —
+// letting the compiler recover which MODULE each top-level statement came from.
+function topStmts(program: CstNode): CstNode[] {
+  const block = program.kids.find((k) => k.name === "block");
+  return block ? block.kids.filter((s) => s.name === "stmt") : [];
+}
+
+// Detect cross-module collisions: a top-level binding NAME (fun / let / var / data
+// type / variant constructor) defined in more than one module. Under flat-namespace
+// merging these silently alias (last-wins for variants, program-order for globals),
+// a latent source of OOB/null-ref. Returned for diagnostics; logged when
+// PYRET_DEBUG_COLLISIONS is set.
+function topLevelNames(program: CstNode): string[] {
+  const out: string[] = [];
+  for (const stmt of topStmts(program)) {
+    const inner = stmt.kids[0];
+    if (!inner) continue;
+    if (inner.name === "fun-expr") {
+      const nm = inner.kids.find((k) => k.name === "NAME");
+      if (nm?.value) out.push(nm.value);
+    } else if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr") {
+      const b = findDescendant(inner, "NAME");
+      if (b?.value) out.push(b.value);
+    } else if (inner.name === "data-expr") {
+      const tn = inner.kids.find((k) => k.name === "NAME");
+      if (tn?.value) out.push(tn.value);
+      for (const kid of inner.kids) {
+        if (kid.name !== "first-data-variant" && kid.name !== "data-variant") continue;
+        const ctor = kid.kids.find((k) => k.name === "variant-constructor");
+        const vn = ctor ? ctor.kids.find((k) => k.name === "NAME") : kid.kids.find((k) => k.name === "NAME");
+        if (vn?.value) out.push(vn.value);
+      }
+    }
+  }
+  return out;
+}
+
+function detectCollisions(modules: { path: string; program: CstNode }[]): Map<string, string[]> {
+  const byName = new Map<string, string[]>();
+  for (const { path, program } of modules) {
+    for (const nm of new Set(topLevelNames(program))) {
+      const arr = byName.get(nm) ?? [];
+      arr.push(path);
+      byName.set(nm, arr);
+    }
+  }
+  const collisions = new Map<string, string[]>();
+  for (const [nm, paths] of byName) if (paths.length > 1) collisions.set(nm, paths);
+  return collisions;
 }
 
 // Build a .arr file, recursively inlining its local-file imports.
 export async function buildSourceFile(path: string): Promise<Uint8Array> {
   const seen = new Map<string, CstNode | null>();
   const order: CstNode[] = [];
-  await loadModule(resolve(path), seen, order);
+  const orderPaths: string[] = [];
+  await loadModule(resolve(path), seen, order, orderPaths);
   if (!_preludeProgram) _preludeProgram = await parsePyret(PRELUDE_SRC);
   // The entry module (loaded last, post-order) keeps its check blocks; all imported
   // modules (and the prelude) have theirs stripped — imports don't run tests.
   const main = order[order.length - 1]!;
   const imports = order.slice(0, -1).map(stripChecks);
-  return compile(mergeMany([stripChecks(_preludeProgram), ...imports, main]));
+  const prelude = stripChecks(_preludeProgram);
+  // The merged module list, in compile order. Index = MODULE id.
+  const programs = [prelude, ...imports, main];
+  const programPaths = [PRELUDE_PATH, ...orderPaths.slice(0, -1), orderPaths[orderPaths.length - 1] ?? resolve(path)];
+  const pathToMod = new Map<string, number>();
+  programPaths.forEach((p, i) => pathToMod.set(p, i));
+
+  // Tag every top-level stmt with its module id (survives the merge via identity).
+  const stmtMod = new WeakMap<CstNode, number>();
+  programs.forEach((prog, modIdx) => {
+    for (const stmt of topStmts(prog)) stmtMod.set(stmt, modIdx);
+  });
+
+  // Per-module alias table: importerMod -> (alias -> targetMod). Lets `N.member`
+  // resolve to the SPECIFIC module N names, instead of a flat first/last-wins guess.
+  const aliasMap = new Map<number, Map<string, number>>();
+  programs.forEach((prog, modIdx) => {
+    const p = programPaths[modIdx]!;
+    const dir = p === PRELUDE_PATH ? resolve(path, "..") : dirname(p);
+    const tbl = new Map<string, number>();
+    for (const { alias, path: tgt } of moduleAliasTargets(prog, dir)) {
+      const tm = pathToMod.get(tgt);
+      if (tm !== undefined) tbl.set(alias, tm);
+    }
+    if (tbl.size > 0) aliasMap.set(modIdx, tbl);
+  });
+
+  if (process.env?.PYRET_DEBUG_COLLISIONS) {
+    const cols = detectCollisions(programs.map((program, i) => ({ path: programPaths[i]!, program })));
+    if (cols.size > 0) {
+      console.error(`[collision] ${cols.size} cross-module top-level name collision(s):`);
+      for (const [nm, paths] of cols) console.error(`  ${nm}: ${paths.map((p) => p.replace(/.*\//, "")).join(", ")}`);
+    }
+  }
+
+  return compile(mergeMany(programs), { stmtMod, aliasMap });
+}
+
+// Exposed for tests: the cross-module top-level name collisions for a .arr entry.
+export async function collisionsFor(path: string): Promise<Map<string, string[]>> {
+  const seen = new Map<string, CstNode | null>();
+  const order: CstNode[] = [];
+  const orderPaths: string[] = [];
+  await loadModule(resolve(path), seen, order, orderPaths);
+  if (!_preludeProgram) _preludeProgram = await parsePyret(PRELUDE_SRC);
+  const main = order[order.length - 1]!;
+  const imports = order.slice(0, -1).map(stripChecks);
+  const programs = [stripChecks(_preludeProgram), ...imports, main];
+  const programPaths = [PRELUDE_PATH, ...orderPaths.slice(0, -1), orderPaths[orderPaths.length - 1] ?? resolve(path)];
+  return detectCollisions(programs.map((program, i) => ({ path: programPaths[i]!, program })));
 }

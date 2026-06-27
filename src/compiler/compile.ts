@@ -102,10 +102,23 @@ class Compiler {
   // This stops a LATER module's `shadow map = lam ...: lst.map(...)` from capturing
   // the prelude's own `map` recursion (which would loop forever). Default Infinity =
   // see everything (last-wins), used for the entry program's own top-level code.
-  globalGens = new Map<string, { order: number; gname: string }[]>();
+  globalGens = new Map<string, { order: number; gname: string; mod: number }[]>();
   resolveOrder = Infinity;   // order of the top-level item currently being compiled
   curOrder = 0;              // order being assigned during pass-1 registration
   stmtOrder = new Map<CstNode, number>(); // top-level stmt node -> its program-order index
+  // ---- module-awareness (whole-program flattening) ----
+  // Two modules can export the SAME top-level name (e.g. a `fun foo` in one, a `data`
+  // variant `foo` in another). The flat namespace would alias them; these tables let
+  // `N.member` resolve to the SPECIFIC module the alias names, and let cross-module
+  // shadowing (a later module's `fun foo` shadowing an earlier module's `foo` variant)
+  // be decided correctly. All optional: empty => legacy first/last-wins behavior.
+  stmtMod = new WeakMap<CstNode, number>();           // top-level stmt node -> module id
+  aliasMap = new Map<number, Map<string, number>>();  // importerMod -> (alias -> targetMod)
+  orderToMod = new Map<number, number>();             // top-level order index -> module id
+  curMod = 0;                                         // module id during pass-1 registration
+  // Every variant generation by name, with its defining module (parallels globalGens;
+  // `variants` itself stays last-wins for the existing arity-based dispatch).
+  variantGens = new Map<string, { info: VariantInfo; mod: number }[]>();
 
   constructor() {
     this.m = new binaryen.Module();
@@ -149,6 +162,8 @@ class Compiler {
     for (let si = 0; si < stmts.length; si++) {
       const stmt = stmts[si]!;
       this.curOrder = si; // program-order index for this top-level statement
+      this.curMod = this.stmtMod.get(stmt) ?? 0; // module this statement came from
+      this.orderToMod.set(si, this.curMod);
       this.stmtOrder.set(stmt, si);
       const inner = this.stmtInner(stmt);
       if (inner.name === "data-expr") { this.registerData(inner); continue; }
@@ -288,9 +303,17 @@ class Compiler {
     this.topScope.set(name, gname);
     if (!this.firstGlobal.has(name)) this.firstGlobal.set(name, gname);
     const gens = this.globalGens.get(name) ?? [];
-    gens.push({ order: this.curOrder, gname });
+    gens.push({ order: this.curOrder, gname, mod: this.curMod });
     this.globalGens.set(name, gens);
     return gname;
+  }
+
+  // The wasm global for `name` defined by MODULE `mod` (module-aware `N.member`).
+  private globalForMod(name: string, mod: number): string | undefined {
+    const gens = this.globalGens.get(name);
+    if (!gens) return undefined;
+    const hit = gens.find((g) => g.mod === mod);
+    return hit?.gname;
   }
 
   // The global for `name` visible to code at `this.resolveOrder`: the most-recent
@@ -305,9 +328,16 @@ class Compiler {
     return best ?? gens[0]!.gname;
   }
 
-  // `N.member` (module-alias access) -> the original (first-registered) global for
-  // `member`, i.e. module N's export, rather than a later same-named local rebind.
-  private resolveModuleMember(name: string, ctx: Ctx): number | null {
+  // `N.member` (module-alias access) -> module N's export of `member`. When we know
+  // which module the alias `N` names (aliasMap), resolve to THAT module's global, so
+  // two modules exporting the same name don't collide. Otherwise fall back to the
+  // first-registered global (the original definition, before any importer's rebind).
+  private resolveModuleMember(name: string, alias: string | null, ctx: Ctx): number | null {
+    const tgt = this.moduleTargetFor(alias);
+    if (tgt !== undefined) {
+      const g = this.globalForMod(name, tgt);
+      if (g !== undefined) return this.m.global.get(g, binaryen.anyref);
+    }
     const fg = this.firstGlobal.get(name);
     if (fg !== undefined) return this.m.global.get(fg, binaryen.anyref);
     return this.resolveName(name, ctx);
@@ -344,15 +374,40 @@ class Compiler {
         const fields = memberNodes.map((vm) => this.bindingName(this.childNamed(vm, "binding")!));
         // a `ref`-annotated member (`bx(ref v, w)`) becomes a MUTABLE field cell.
         const refs = memberNodes.map((vm) => vm.kids.some((k) => k.name === "REF"));
-        this.variants.set(name, { id: this.nextVariantId++, fields, refs, methods, ownVariants, order: this.curOrder });
+        this.setVariant(name, { id: this.nextVariantId++, fields, refs, methods, ownVariants, order: this.curOrder });
       } else {
         const nm = this.childNamed(kid, "NAME");
-        if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods, ownVariants, order: this.curOrder });
+        if (nm) this.setVariant(nm.value!, { id: this.nextVariantId++, fields: [], methods, ownVariants, order: this.curOrder });
       }
     }
     if (typeName && this.nextVariantId > minId) {
       this.dataTypeRanges.set(typeName, { min: minId, max: this.nextVariantId - 1 });
     }
+  }
+
+  // Register a variant by name: `variants` keeps the last-wins entry (used by the
+  // existing arity-based dispatch); `variantGens` keeps EVERY generation with its
+  // defining module, for module-aware `N.member` and cross-module shadowing.
+  private setVariant(name: string, info: VariantInfo) {
+    this.variants.set(name, info);
+    const gens = this.variantGens.get(name) ?? [];
+    gens.push({ info, mod: this.curMod });
+    this.variantGens.set(name, gens);
+  }
+
+  // The variant for `name` defined by MODULE `mod` (module-aware `N.member`).
+  private variantForMod(name: string, mod: number): VariantInfo | undefined {
+    return this.variantGens.get(name)?.find((g) => g.mod === mod)?.info;
+  }
+
+  // The module a `N.member` access targets: importer = the module of the top-level
+  // item currently compiling (orderToMod[resolveOrder]); look its alias up. Undefined
+  // when unknown -> caller falls back to legacy first/last-wins resolution.
+  private moduleTargetFor(alias: string | null): number | undefined {
+    if (alias === null) return undefined;
+    const importer = this.orderToMod.get(this.resolveOrder);
+    if (importer === undefined) return undefined;
+    return this.aliasMap.get(importer)?.get(alias);
   }
 
   // Method fields (`method m(self, ...): ... end`) inside a with:/sharing:/obj block.
@@ -1194,10 +1249,13 @@ class Compiler {
     const objExpr = node.kids[0]!;
     const name = this.childNamed(node, "NAME")!.value!;
     // Module-alias field access: `N.foo` -> module N's exported global `foo`.
-    if (this.moduleAliasName(objExpr)) {
-      const r = this.resolveModuleMember(name, ctx);
-      if (r === null) throw new CompileError(`unbound module member: ${name}`, node);
-      return r;
+    {
+      const alias = this.moduleAliasName(objExpr);
+      if (alias) {
+        const r = this.resolveModuleMember(name, alias, ctx);
+        if (r === null) throw new CompileError(`unbound module member: ${name}`, node);
+        return r;
+      }
     }
     // `_` curry: `_.field` -> `lam($c): $c.field end`.
     const curD = this.curryOver(node, [objExpr], ctx);
@@ -1366,7 +1424,8 @@ class Compiler {
     // `_` curry: `_.m(a)` / `f(_)` / `N.f(_)` -> a lambda over the underscores.
     // For a module-alias call (`N.f(...)`) curry only the ARGS — the object `N` is
     // the alias, not a `_`; otherwise curry the object too.
-    const isModAlias = !!(dot && this.moduleAliasName(dot.objExpr));
+    const modAlias = dot ? this.moduleAliasName(dot.objExpr) : null;
+    const isModAlias = !!modAlias;
     {
       const curOperands = isModAlias ? argExprNodes : [dot ? dot.objExpr : undefined, ...argExprNodes];
       const cur2 = this.curryOver(node, curOperands, ctx);
@@ -1382,11 +1441,16 @@ class Compiler {
       // same-named smart-constructor global alias (`t-name = T.t-name(_, _, ...)`),
       // which would otherwise resolve to itself and recurse forever. A smart
       // constructor used at its OWN (shorter) arity falls through to the global.
-      if (this.variants.has(dot.name)
-          && this.variants.get(dot.name)!.fields.length === args.length) {
-        return this.makeVariant(dot.name, this.variants.get(dot.name)!, args);
+      // When we KNOW the module N names, only build the variant N actually exports —
+      // if N exports a `fun foo` (not a variant), fall through to call it, even if
+      // ANOTHER module happens to define a variant `foo`. Without module info, keep the
+      // legacy last-wins variant (so existing single-namespace behavior is unchanged).
+      const tgt = this.moduleTargetFor(modAlias);
+      const vinfo = tgt !== undefined ? this.variantForMod(dot.name, tgt) : this.variants.get(dot.name);
+      if (vinfo && vinfo.fields.length === args.length) {
+        return this.makeVariant(dot.name, vinfo, args);
       }
-      const g = this.resolveModuleMember(dot.name, ctx);
+      const g = this.resolveModuleMember(dot.name, modAlias, ctx);
       if (g === null) throw new CompileError(`unbound module member: ${dot.name}`, node);
       return this.callClosureValue(g, args, ctx, tail);
     }
@@ -1423,6 +1487,12 @@ class Compiler {
     // smart-constructor arity falls through to the shadowing global. Only a LOCAL
     // binding (param/let) fully overrides the constructor. This is broader than (and
     // subsumes) restricting variant-preference to method bodies.
+    // A BARE same-named variant-vs-`fun` collision ACROSS modules is intentionally NOT
+    // re-disambiguated here: the flat namespace has no per-reference module scope, and
+    // the real front-end relies on this arity rule selecting the variant. Cross-module
+    // disambiguation is instead exact through qualified `N.member` (module-aware; see
+    // resolveModuleMember/variantForMod). See test/module-collision.test.ts + the
+    // analysis in self-host/NAMESPACE-NOTES.md.
     if (name && this.variants.has(name) && !this.isLocallyBound(name, ctx)
         && this.variants.get(name)!.fields.length === args.length) {
       return this.makeVariant(name, this.variants.get(name)!, args);
@@ -2261,9 +2331,17 @@ class Compiler {
   }
 }
 
-export function compile(program: CstNode, opts: { stoppable?: boolean } = {}): Uint8Array {
+export function compile(program: CstNode, opts: {
+  stoppable?: boolean;
+  // Module-awareness for whole-program flattening (build.ts supplies these). Empty =>
+  // legacy first/last-wins resolution (single-string builds, no cross-module info).
+  stmtMod?: WeakMap<CstNode, number>;          // top-level stmt node -> module id
+  aliasMap?: Map<number, Map<string, number>>; // importerMod -> (alias -> targetMod)
+} = {}): Uint8Array {
   const c = new Compiler();
   c.stoppable = opts.stoppable ?? false;
+  if (opts.stmtMod) c.stmtMod = opts.stmtMod;
+  if (opts.aliasMap) c.aliasMap = opts.aliasMap;
   return c.compileProgram(program);
 }
 
