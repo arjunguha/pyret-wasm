@@ -182,6 +182,31 @@ fun map2(f, a, b):
       end
   end
 end
+# multi-list map/each (lockstep; stop at the shortest list)
+fun map3(f, a, b, c):
+  cases(List) a: | empty => empty
+    | link(fa, ra) => cases(List) b: | empty => empty
+      | link(fb, rb) => cases(List) c: | empty => empty
+        | link(fc, rc) => link(f(fa, fb, fc), map3(f, ra, rb, rc)) end end end
+end
+fun map4(f, a, b, c, d):
+  cases(List) a: | empty => empty
+    | link(fa, ra) => cases(List) b: | empty => empty
+      | link(fb, rb) => cases(List) c: | empty => empty
+        | link(fc, rc) => cases(List) d: | empty => empty
+          | link(fd, rd) => link(f(fa, fb, fc, fd), map4(f, ra, rb, rc, rd)) end end end end
+end
+fun each2(f, a, b):
+  cases(List) a: | empty => nothing
+    | link(fa, ra) => cases(List) b: | empty => nothing
+      | link(fb, rb) => block: f(fa, fb) each2(f, ra, rb) end end end
+end
+fun each3(f, a, b, c):
+  cases(List) a: | empty => nothing
+    | link(fa, ra) => cases(List) b: | empty => nothing
+      | link(fb, rb) => cases(List) c: | empty => nothing
+        | link(fc, rc) => block: f(fa, fb, fc) each3(f, ra, rb, rc) end end end end
+end
 
 # indexed-map family (the _n functions) — f receives a running index.
 fun map_n(f, n, lst):
