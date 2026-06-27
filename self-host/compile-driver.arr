@@ -11,7 +11,20 @@ provide *
 import file("../self-compiler/compiler/parse-pyret.arr") as P
 import ast as A
 import anf as ANF
+import srcloc as S
 import file("./wasm-of-pyret.arr") as W
+
+# ── unique lambda locs ───────────────────────────────────────────────────────
+# The JS-GLR surface-parse gives every node `dummy-loc` (S.builtin("dummy location")).
+# The backend keys each lambda's fnIndex/table-slot by tostring(its loc), so two
+# sibling lambdas sharing dummy-loc COLLIDE — both resolve to the first one's slot,
+# so calling the second runs the first's body.  Give every lambda/method a unique
+# synthetic loc during desugar so the keys are distinct.
+var lam-uid :: Number = 0
+fun fresh-loc() -> A.Loc block:
+  lam-uid := lam-uid + 1
+  S.builtin("lam#" + tostring(lam-uid))
+end
 
 # ── op-string → global arithmetic function name ─────────────────────────────
 
@@ -44,7 +57,7 @@ fun desugar-member(m) -> A.Member:
   cases(A.Member) m:
     | s-data-field(l, name, value) => A.s-data-field(l, name, desugar-expr(value))
     | s-method-field(l, name, params, args, ann, doc, body, cl, ck, bl) =>
-      A.s-method-field(l, name, params, args, ann, doc, desugar-expr(body), cl, ck, bl)
+      A.s-method-field(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), cl, ck, bl)
     | else => m
   end
 end
@@ -122,11 +135,11 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         blocky)
 
     | s-lam(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
-      A.s-lam(loc, name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+      A.s-lam(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
 
     | s-fun(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
       # s-fun in non-statement position: turn into a self-named lambda
-      A.s-lam(loc, name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+      A.s-lam(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
 
     | s-let(loc, bind, expr, closure-val) =>
       A.s-let(loc, bind, desugar-expr(expr), closure-val)
@@ -270,7 +283,7 @@ end
 fun fun-to-letrec-bind(fn :: A.Expr) -> A.LetrecBind:
   cases(A.Expr) fn:
     | s-fun(fl, fname, fparams, fargs, fann, fdoc, fbody, fchk-loc, fchk, fblocky) =>
-      lam-val = A.s-lam(fl, fname, fparams, fargs, fann, fdoc, desugar-expr(fbody),
+      lam-val = A.s-lam(fresh-loc(), fname, fparams, fargs, fann, fdoc, desugar-expr(fbody),
                         fchk-loc, fchk, fblocky)
       A.s-letrec-bind(fl, A.s-bind(fl, false, A.s-name(fl, fname), A.a-blank), lam-val)
   end
