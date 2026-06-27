@@ -651,6 +651,32 @@ fun string-split(s, sep):
 end
 fun string-replace(s, find, repl): string-join(string-split-all(s, find), repl) end
 
+# --- numeric tolerance predicates (Pyret within / num-within family) ---
+# Mirrors js-numbers roughlyEquals (abs) and roughlyEqualsRel (rel).
+fun num-truncate(n): if n < 0: num-ceiling(n) else: num-floor(n) end end
+fun num-within-abs(tol):
+  lam(a, b): num-abs(a - b) <= tol end
+end
+fun num-within-rel(tol):
+  lam(a, b):
+    if a == b: true
+    else:
+      err = num-abs(a - b)
+      denom = num-min(num-abs(a), num-abs(b))
+      if tol <= 1: err <= (tol * denom) else: (err / denom) <= tol end
+    end
+  end
+end
+# bare num-within is the RELATIVE version (matches Pyret)
+fun num-within(tol): num-within-rel(tol) end
+# within* are the Any-typed names; here they delegate to the numeric tolerance
+# (NOTE: real Pyret does deep STRUCTURAL tolerance over nested values — not yet).
+fun within-abs(tol): num-within-abs(tol) end
+fun within-rel(tol): num-within-rel(tol) end
+fun within(tol): num-within-rel(tol) end
+# join-str: like string-join but tostrings each element first
+fun join-str(l, sep): string-join(map(lam(e): tostring(e) end, l), sep) end
+
 # take-while: returns a 2-tuple {longest-prefix-where-pred-holds ; the-rest}
 fun take-while(pred, lst):
   cases(List) lst:
