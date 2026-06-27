@@ -81,6 +81,21 @@ fun build-link-chain(loc, vals, no-info):
   end
 end
 
+# If `f` is a reference to an intrinsic builtin function (print/display) handled by a
+# host import, return some(its-name); else none. Lets the s-app case lower it to a prim-app.
+fun builtin-app-name(f) -> Option:
+  cases(A.Expr) f:
+    | s-id(_, id) =>
+      nm = cases(A.Name) id:
+        | s-name(_, s) => s
+        | s-global(s) => s
+        | else => ""
+      end
+      if (nm == "print") or (nm == "display"): some(nm) else: none end
+    | else => none
+  end
+end
+
 # ── cases-based AST desugaring (no visit()) ──────────────────────────────────
 #
 # FUTURE: switch to Pyret's REAL desugar pass (self-compiler/compiler/desugar.arr).
@@ -126,8 +141,15 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         [list: desugar-expr(lhs), desugar-expr(rhs)], no-info)
 
     | s-app(loc, f, args) =>
-      A.s-app-enriched(loc, desugar-expr(f),
-        args.map(desugar-expr), no-info)
+      # `print(x)` / `display(x)` are intrinsics: lower to a prim-app the backend maps to
+      # the host print import (otherwise `print` resolves to an unbound global -> null).
+      app-prim-name = builtin-app-name(f)
+      if is-some(app-prim-name) and (args.length() == 1):
+        A.s-prim-app(loc, app-prim-name.value, [list: desugar-expr(args.first)],
+          A.prim-app-info-c(false))
+      else:
+        A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), no-info)
+      end
 
     | s-app-enriched(loc, f, args, info) =>
       A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), info)
@@ -211,6 +233,15 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-user-block(loc, body) =>
       # strip s-user-block — just keep the inner expression
       desugar-expr(body)
+
+    | s-for(loc, iterator, bindings, _, body, _) =>
+      # `for ITER(b0 from e0, b1 from e1): body end`
+      #   -> ITER(lam(b0, b1): body end, e0, e1)
+      args = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, b, _) => b end end)
+      srcs = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, _, v) => desugar-expr(v) end end)
+      lam-e = A.s-lam(fresh-loc(), "", [list:], args, A.a-blank, "",
+        desugar-expr(body), none, none, false)
+      A.s-app-enriched(loc, desugar-expr(iterator), link(lam-e, srcs), no-info)
 
     | s-instantiate(loc, body, params) =>
       A.s-instantiate(loc, desugar-expr(body), params)
@@ -352,6 +383,8 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
           # top-level `var x = e` → s-let-expr with a var-bind over the rest
           body = stmts-to-body(desugar-stmts(rest))
           [list: A.s-let-expr(ll, [list: A.s-var-bind(ll, bind, desugar-expr(val))], body, false)]
+        | s-type(_, _, _, _) => desugar-stmts(rest)        # type alias: erased
+        | s-newtype(_, _, _) => desugar-stmts(rest)        # newtype: erased
         | else =>
           link(desugar-expr(f), desugar-stmts(rest))
       end
@@ -380,8 +413,34 @@ end
 
 # ── Main compile pipeline ─────────────────────────────────────────────────────
 
+# A minimal `data List` so `[list: ...]` (which lowers to link/empty) resolves when the
+# driver compiles a standalone program with no prelude merged.  Parsed (not hand-built)
+# for fidelity; injected only when the source uses `[list:`.
+fun list-data-stmt():
+  lp = P.surface-parse("data List:\n  | empty\n  | link(first, rest)\nend\n0", "list-prelude")
+  cases(A.Program) lp:
+    | s-program(_, _, _, _, _, _, b) =>
+      cases(A.Expr) b:
+        | s-block(_, sts) => sts.first
+        | else => b
+      end
+  end
+end
+
+fun inject-list-data(prog :: A.Program) -> A.Program:
+  cases(A.Program) prog:
+    | s-program(l, u, p, pt, pv, im, body) =>
+      nb = cases(A.Expr) body:
+        | s-block(bl, sts) => A.s-block(bl, link(list-data-stmt(), sts))
+        | else => A.s-block(l, [list: list-data-stmt(), body])
+      end
+      A.s-program(l, u, p, pt, pv, im, nb)
+  end
+end
+
 fun compile-source(src) -> List<Number>:
-  raw-ast = P.surface-parse(src, "test")
+  parsed = P.surface-parse(src, "test")
+  raw-ast = if string-contains(src, "[list:"): inject-list-data(parsed) else: parsed end
   desugared = desugar-program(raw-ast)
   fixed = fix-provides(desugared)
   aprog = ANF.anf-program(fixed)
