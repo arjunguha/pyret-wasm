@@ -53,6 +53,18 @@ const OP_INTRINSIC: Record<string, string> = {
   "cps-op-lessequal": "LEQ", "cps-op-greaterequal": "GEQ",
 };
 
+// Unary intrinsics that are also valid as FIRST-CLASS values: when referenced as a
+// bare identifier (e.g. `xs.filter(is-function)`, `map(num-sqrt, xs)`) they reify
+// into a one-arg closure wrapping the intrinsic. Direct calls (`is-object(x)`) still
+// go through the faster call-site intrinsic path. All take exactly one argument.
+const UNARY_VALUE_INTRINSICS = new Set([
+  "is-string", "is-number", "is-function", "is-object", "is-raw-array",
+  "is-boolean", "is-nothing", "is-tuple",
+  "num-is-fixnum", "num-is-rational", "num-is-roughnum", "num-is-integer",
+  "num-to-roughnum", "num-sqrt", "num-exp", "num-log", "num-sin", "num-cos",
+  "num-tan", "num-atan", "num-asin", "num-acos",
+]);
+
 // Per-function compilation context.
 class Ctx {
   params = new Map<string, number>();   // name -> index in args array
@@ -791,7 +803,28 @@ class Compiler {
     if (name === "tostring" || name === "to-string" || name === "torepr" || name === "to-repr") {
       return this.makeClosure(this.tostringFnIndex(name), [], ctx);
     }
+    // bare reference to a unary intrinsic (predicate/num fn) -> reify as a closure.
+    if (UNARY_VALUE_INTRINSICS.has(name)) {
+      return this.makeClosure(this.intrinsicValueFnIndex(name), [], ctx);
+    }
     return null;
+  }
+  // Reify a unary intrinsic (see UNARY_VALUE_INTRINSICS) as a first-class function:
+  // a 1-arg closure whose body is exactly the intrinsic applied to arg 0.
+  private intrinsicValueFns = new Map<string, number>();
+  private intrinsicValueFnIndex(name: string): number {
+    if (this.intrinsicValueFns.has(name)) return this.intrinsicValueFns.get(name)!;
+    const m = this.m;
+    const fnIndex = this.fnNames.length;
+    const wasmName = "$intr_" + fnIndex + "_" + name.replace(/[^A-Za-z0-9]/g, "_");
+    this.fnNames.push(wasmName);
+    const fctx = new Ctx(false);
+    const arg = m.array.get(m.local.get(1, this.t.FieldsRefNull), m.i32.const(0), binaryen.anyref, false);
+    const body = this.compileIntrinsic(name, [arg], fctx);
+    if (body === null) throw new Error("intrinsicValueFnIndex: not a unary intrinsic: " + name);
+    m.addFunction(wasmName, this.sig, binaryen.anyref, fctx.localTypes, body);
+    this.intrinsicValueFns.set(name, fnIndex);
+    return fnIndex;
   }
   // Reify tostring/torepr as a first-class function (they all route to $tostring).
   private tostringFnIndex(name: string): number {
