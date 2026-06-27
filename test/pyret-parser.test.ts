@@ -24,6 +24,8 @@ import { run } from "../src/runtime/run.ts";
 import { resolve } from "path";
 
 const PROBE = resolve(import.meta.dir, "../self-host/pyret-parser-probe.arr");
+const PROBE2 = resolve(import.meta.dir, "../self-host/pyret-parser-probe2.arr");
+const PROBE3 = resolve(import.meta.dir, "../self-host/pyret-parser-probe3.arr");
 
 test("pure-Pyret parser compiles clean under the seed (-> valid wasm)", async () => {
   const wasm = await buildSourceFile(PROBE);
@@ -39,4 +41,27 @@ test("pure-Pyret parser: parses fun + app into the real AST", async () => {
   const r = await run(await buildSourceFile(PROBE));
   // output also carries ast.arr's own check-block footer; assert the parse result line
   expect(r.output.trim().startsWith("s-fun s-app")).toBe(true);
+});
+
+// Richer grammar: full annotations (name / app / arrow), `type` aliases, and
+// tuple-binding args — all parsed into the real ast.arr AST end-to-end.
+test("pure-Pyret parser: annotations, type aliases, tuple bindings", async () => {
+  const r = await run(await buildSourceFile(PROBE2));
+  const o = r.output;
+  expect(o).toContain("stmts: s-type s-fun s-fun");
+  expect(o).toContain("ret: a-name");
+  expect(o).toContain("arg0: a-name");
+  expect(o).toContain("arg1: a-arrow");      // (Number -> String)
+  expect(o).toContain("talias: s-type a-app"); // List<Number>
+  expect(o).toContain("hbind: s-tuple-bind"); // fun h({a; b}): ...
+});
+
+// Real source locations: line/column/char offsets + source name thread through
+// (no more dummy-loc on the primary nodes).
+test("pure-Pyret parser: produces real source locations", async () => {
+  const r = await run(await buildSourceFile(PROBE3));
+  const o = r.output;
+  expect(o).toContain("app: test.arr 2:0-2:4 char 20-24"); // f(2) on line 2
+  expect(o).toContain("op: line 1 col 10 char 10");          // x + 1 op
+  expect(o).toContain("is-srcloc: true");                    // not a builtin/dummy loc
 });
