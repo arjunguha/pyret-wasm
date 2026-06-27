@@ -245,4 +245,68 @@ fun image-height(img):
     | image-url(url) => 100
   end
 end
+
+# ---- raw arrays (primitive: a $Fields cell; get/length/set are intrinsics) ----
+fun raw-array-to-list(arr):
+  fun ra-loop(i, n): if i >= n: empty else: link(raw-array-get(arr, i), ra-loop(i + 1, n)) end end
+  ra-loop(0, raw-array-length(arr))
+end
+fun raw-array-each(f, arr):
+  fun ra-eloop(i, n): if i >= n: nothing else: block: f(raw-array-get(arr, i)) ra-eloop(i + 1, n) end end end
+  ra-eloop(0, raw-array-length(arr))
+end
+fun raw-array-fold(f, init, arr, start):
+  fun ra-floop(i, n, acc): if i >= n: acc else: ra-floop(i + 1, n, f(acc, raw-array-get(arr, i), i + start)) end end
+  ra-floop(0, raw-array-length(arr), init)
+end
+
+# ---- string-dict (immutable assoc; latest write wins). Built from a key/value
+# data type (not tuples) so the stoppable CPS transform handles the prelude. ----
+data KV: | kv(kvk, kvv) end
+fun sd-get(entries, k):
+  cases(List) entries:
+    | empty => none
+    | link(p, r) => cases(KV) p: | kv(pk, pv) => if pk == k: some(pv) else: sd-get(r, k) end end
+  end
+end
+fun sd-del(entries, k):
+  cases(List) entries:
+    | empty => empty
+    | link(p, r) => cases(KV) p: | kv(pk, pv) => if pk == k: sd-del(r, k) else: link(p, sd-del(r, k)) end end
+  end
+end
+data StringDict:
+  | s-str-dict(entries)
+sharing:
+  method get(self, k): sd-get(self.entries, k) end,
+  method get-value(self, k):
+    cases(Option) sd-get(self.entries, k): | some(v) => v | none => raise("Key not found: " + k) end
+  end,
+  method set(self, k, v): s-str-dict(link(kv(k, v), sd-del(self.entries, k))) end,
+  method has-key(self, k): cases(Option) sd-get(self.entries, k): | some(v) => true | none => false end end,
+  method remove(self, k): s-str-dict(sd-del(self.entries, k)) end,
+  method keys-list(self): map(lam(p): cases(KV) p: | kv(pk, pv) => pk end end, self.entries) end,
+  method count(self): length(self.entries) end,
+  method to-list(self): self.entries end
+end
+fun sd-from-raw(arr):
+  fun sd-loop(i, n):
+    if i >= n: empty else: link(kv(raw-array-get(arr, i), raw-array-get(arr, i + 1)), sd-loop(i + 2, n)) end
+  end
+  s-str-dict(sd-loop(0, raw-array-length(arr)))
+end
+
+# ---- sets (immutable, dedup) ----
+fun set-mem(l, x): cases(List) l: | empty => false | link(f, r) => (f == x) or set-mem(r, x) end end
+data PSet:
+  | p-set(elems)
+sharing:
+  method member(self, x): set-mem(self.elems, x) end,
+  method add(self, x): if set-mem(self.elems, x): self else: p-set(link(x, self.elems)) end end,
+  method remove(self, x): p-set(filter(lam(e): not(e == x) end, self.elems)) end,
+  method to-list(self): self.elems end,
+  method size(self): length(self.elems) end,
+  method union(self, other): foldl(lam(acc, e): acc.add(e) end, self, other.to-list()) end
+end
+fun set-from-raw(arr): foldl(lam(acc, e): acc.add(e) end, p-set(empty), raw-array-to-list(arr)) end
 `;
