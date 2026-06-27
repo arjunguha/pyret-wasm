@@ -136,9 +136,22 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-ref(_, _) => e
 
     | s-op(loc, op-loc, op-str, lhs, rhs) =>
-      gname = op-to-global(op-str)
-      A.s-app-enriched(loc, A.s-id(loc, A.s-global(gname)),
-        [list: desugar-expr(lhs), desugar-expr(rhs)], no-info)
+      # `and`/`or` are SHORT-CIRCUIT — desugar to `if`, not a strict binary call.
+      #   a and b -> if a: b else: false end
+      #   a or b  -> if a: true else: b end
+      if op-str == "opand":
+        A.s-if-else(loc,
+          [list: A.s-if-branch(loc, desugar-expr(lhs), desugar-expr(rhs))],
+          A.s-bool(loc, false), false)
+      else if op-str == "opor":
+        A.s-if-else(loc,
+          [list: A.s-if-branch(loc, desugar-expr(lhs), A.s-bool(loc, true))],
+          desugar-expr(rhs), false)
+      else:
+        gname = op-to-global(op-str)
+        A.s-app-enriched(loc, A.s-id(loc, A.s-global(gname)),
+          [list: desugar-expr(lhs), desugar-expr(rhs)], no-info)
+      end
 
     | s-app(loc, f, args) =>
       # `print(x)` / `display(x)` are intrinsics: lower to a prim-app the backend maps to
@@ -413,26 +426,32 @@ end
 
 # ── Main compile pipeline ─────────────────────────────────────────────────────
 
-# A minimal `data List` so `[list: ...]` (which lowers to link/empty) resolves when the
-# driver compiles a standalone program with no prelude merged.  Parsed (not hand-built)
-# for fidelity; injected only when the source uses `[list:`.
-fun list-data-stmt():
-  lp = P.surface-parse("data List:\n  | empty\n  | link(first, rest)\nend\n0", "list-prelude")
-  cases(A.Program) lp:
-    | s-program(_, _, _, _, _, _, b) =>
-      cases(A.Expr) b:
-        | s-block(_, sts) => sts.first
-        | else => b
-      end
-  end
+
+# A minimal `data List` so `[list: ...]` (lowered to link/empty) resolves when the driver
+# compiles a standalone program with no prelude merged.  HAND-BUILT as an `ast.arr` node
+# (NOT re-parsed): `surface-parse` parses the host `read-source` buffer and IGNORES its
+# `src` argument, so a second `surface-parse` call can't introduce new source — and it
+# would also clobber the shared host parse state.  So we construct the data node directly
+# and inject it into the already-parsed program.  Distinct (fresh) locs per variant avoid
+# constructor table-slot collisions (the same dummy-loc hazard as lambdas).
+fun list-data-node() -> A.Expr:
+  fun loc(n :: Number): S.srcloc("list-prelude", n, 0, n, n, 0, n) end
+  ml = loc(10)
+  fun mem(nm :: String): A.s-variant-member(ml, A.s-normal, A.s-bind(ml, false, A.s-name(ml, nm), A.a-blank)) end
+  A.s-data(loc(1), "List", [list:], [list:],
+    [list:
+      A.s-singleton-variant(loc(2), "empty", [list:]),
+      A.s-variant(loc(3), loc(4), "link", [list: mem("first"), mem("rest")], [list:]) ],
+    [list:], none, none)
 end
 
 fun inject-list-data(prog :: A.Program) -> A.Program:
   cases(A.Program) prog:
     | s-program(l, u, p, pt, pv, im, body) =>
+      dn = list-data-node()
       nb = cases(A.Expr) body:
-        | s-block(bl, sts) => A.s-block(bl, link(list-data-stmt(), sts))
-        | else => A.s-block(l, [list: list-data-stmt(), body])
+        | s-block(bl, sts) => A.s-block(bl, link(dn, sts))
+        | else => A.s-block(l, [list: dn, body])
       end
       A.s-program(l, u, p, pt, pv, im, nb)
   end
@@ -440,7 +459,11 @@ end
 
 fun compile-source(src) -> List<Number>:
   parsed = P.surface-parse(src, "test")
-  raw-ast = if string-contains(src, "[list:"): inject-list-data(parsed) else: parsed end
+  raw-ast =
+    if string-contains(src, "[list:") and not(string-contains(src, "data List")):
+      inject-list-data(parsed)
+    else: parsed
+    end
   desugared = desugar-program(raw-ast)
   fixed = fix-provides(desugared)
   aprog = ANF.anf-program(fixed)

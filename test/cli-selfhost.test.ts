@@ -30,10 +30,10 @@ test("self-hosted compiler compiles + runs a program in its subset (a literal)",
 });
 
 test("self-hosted compiler rejects programs outside its subset (triggers the CLI's seed fallback)", async () => {
-  // `or`/`and` boolean ops aren't handled by the self-hosted driver yet -> throws.
-  // (NB: `[list: ...]`, `var`/`:=`, `check:` blocks, `for` loops, `print`, and `type`
-  // aliases now DO compile self-hosted.)
-  await expect(buildSelfHosted("true or false")).rejects.toThrow();
+  // The self-hosted check harness only supports is/is-not, so `is-roughly` throws.
+  // (NB: `[list: ...]`, `var`/`:=`, `check:` blocks, `for` loops, `print`, `type`
+  // aliases, and `or`/`and` now DO compile self-hosted.)
+  await expect(buildSelfHosted("check:\n  4 is-roughly 4\nend")).rejects.toThrow();
   // ...and the seed handles a program, so the fallback always works
   const seed = await buildSource("print(1 + 1)");
   const r = await run(seed);
