@@ -131,7 +131,7 @@ export function buildTypes(): RtTypes {
   // $Names (array (ref $Str)), $Object, $Method rec group.
   const ob = new binaryen.TypeBuilder(3);
   ob.createRecGroup(0, 3);
-  ob.setArrayType(0, strRef, binaryen.notPacked, false);
+  ob.setArrayType(0, strRef, binaryen.notPacked, true); // mutable: $obj_extend assembles names via array.copy
   ob.setStructType(1, [
     { type: ob.getTempRefType(ob.getTempHeapType(0), false), packedType: binaryen.notPacked, mutable: false }, // names
     { type: fieldsRef, packedType: binaryen.notPacked, mutable: false },  // values
