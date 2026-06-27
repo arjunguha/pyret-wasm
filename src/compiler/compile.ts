@@ -1838,9 +1838,35 @@ class Compiler {
     const stmts = block.kids.filter((k) => k.name === "stmt");
     const parts: number[] = [];
     let hasValue = false;
+    // HOIST local `fun` names: pre-allocate a boxed cell per local fun in this block
+    // so forward AND mutual references resolve (e.g. a sibling fun used before its
+    // definition). The cell is captured by every sibling closure; we fill it when the
+    // fun statement is compiled (letrec-style). Self-recursion falls out for free.
+    const inners = stmts.map((s) => this.stmtInner(s));
+    const hoisted = new Set<string>();
+    for (const inner of inners) {
+      if (inner.name !== "fun-expr") continue;
+      const nm = this.childNamed(inner, "NAME")?.value;
+      if (!nm) continue;
+      const idx = ctx.addLocal(binaryen.anyref);
+      ctx.locals.set(nm, idx);
+      ctx.boxed.add(nm);
+      hoisted.add(nm);
+      parts.push(m.local.set(idx, this.makeBox(m.ref.i31(m.i32.const(2)))));
+    }
     stmts.forEach((stmt, i) => {
+      const inner = inners[i]!;
       const isLast = i === stmts.length - 1;
-      if (this.emitStmt(this.stmtInner(stmt), ctx, tail, isLast, parts)) hasValue = true;
+      const fnNm = inner.name === "fun-expr" ? this.childNamed(inner, "NAME")?.value : undefined;
+      if (fnNm && hoisted.has(fnNm)) {
+        // fill the pre-allocated cell with the closure (all siblings already in scope)
+        const closure = this.buildClosureFromParts(
+          this.headerParamBindings(inner), this.childNamed(inner, "block")!, ctx, "$lfn_");
+        parts.push(this.setBox(m.local.get(ctx.locals.get(fnNm)!, binaryen.anyref), closure));
+        if (isLast) { parts.push(m.ref.i31(m.i32.const(2))); hasValue = true; }
+      } else if (this.emitStmt(inner, ctx, tail, isLast, parts)) {
+        hasValue = true;
+      }
     });
     if (!hasValue) parts.push(m.ref.i31(m.i32.const(2)));
     return m.block(null, parts, binaryen.anyref);
