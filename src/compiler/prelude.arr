@@ -538,6 +538,18 @@ fun partition(pred, l):
 end
 fun list-to-set(l): set-from-list(l) end
 fun list-to-tree-set(l): set-from-list(l) end
+fun list-to-list-set(l): set-from-list(l) end
+# Some front-end code refers to the sets module by NAME (e.g. `sets.list-to-list-set`)
+# rather than via its `import sets as S` alias; expose a global `sets` object so those
+# qualified references resolve to the prelude-provided set API.
+sets = {
+  list-to-set: list-to-set,
+  list-to-tree-set: list-to-tree-set,
+  list-to-list-set: list-to-list-set,
+  empty-set: empty-set,
+  empty-list-set: empty-list-set,
+  empty-tree-set: empty-tree-set
+}
 fun string-join(l, sep):
   cases(List) l:
     | empty => ""
