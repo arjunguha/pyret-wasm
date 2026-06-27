@@ -88,6 +88,29 @@ fun string-repeat(s, n): if n <= 0: "" else: s + string-repeat(s, n - 1) end end
 fun is-nothing(x): x == nothing end
 fun all(pred, l): cases(List) l: | empty => true | link(f, r) => pred(f) and all(pred, r) end end
 fun any(pred, l): cases(List) l: | empty => false | link(f, r) => pred(f) or any(pred, r) end end
+
+# ---- string library (built on string-from-code-point + string-to-code-points) ----
+fun list-take(l, n): if n <= 0: empty else: cases(List) l: | empty => empty | link(f, r) => link(f, list-take(r, n - 1)) end end end
+fun list-drop(l, n): if n <= 0: l else: cases(List) l: | empty => empty | link(f, r) => list-drop(r, n - 1) end end end
+fun cps-prefix(pre, l): cases(List) pre: | empty => true | link(pf, pr) => cases(List) l: | empty => false | link(lf, lr) => (pf == lf) and cps-prefix(pr, lr) end end end
+fun cps-contains(scp, sub): if cps-prefix(sub, scp): true else: cases(List) scp: | empty => false | link(f, r) => cps-contains(r, sub) end end end
+fun cps-index(scp, sub, i): if cps-prefix(sub, scp): i else: cases(List) scp: | empty => 0 - 1 | link(f, r) => cps-index(r, sub, i + 1) end end end
+fun cps-tonum(cp, acc, seen): cases(List) cp: | empty => if seen: some(acc) else: none end | link(f, r) => if (f >= 48) and (f <= 57): cps-tonum(r, (acc * 10) + (f - 48), true) else: none end end end
+fun string-from-code-points(cps): foldl(lam(acc, c): acc + string-from-code-point(c) end, "", cps) end
+fun string-append(a, b): a + b end
+fun string-substring(s, a, b): string-from-code-points(list-take(list-drop(string-to-code-points(s), a), b - a)) end
+fun string-char-at(s, i): string-from-code-points(list-take(list-drop(string-to-code-points(s), i), 1)) end
+fun string-explode(s): map(lam(c): string-from-code-point(c) end, string-to-code-points(s)) end
+fun string-to-lower(s): string-from-code-points(map(lam(c): if (c >= 65) and (c <= 90): c + 32 else: c end end, string-to-code-points(s))) end
+fun string-to-upper(s): string-from-code-points(map(lam(c): if (c >= 97) and (c <= 122): c - 32 else: c end end, string-to-code-points(s))) end
+fun string-tolower(s): string-to-lower(s) end
+fun string-toupper(s): string-to-upper(s) end
+fun string-contains(s, sub): cps-contains(string-to-code-points(s), string-to-code-points(sub)) end
+fun string-index-of(s, sub): cps-index(string-to-code-points(s), string-to-code-points(sub), 0) end
+fun string-to-number(s): cps-tonum(string-to-code-points(s), 0, false) end
+fun string-tonumber(s): string-to-number(s) end
+fun num-to-string(n): tostring(n) end
+fun num-tostring(n): tostring(n) end
 fun num-abs(n): if n < 0: 0 - n else: n end end
 fun num-min(a, b): if a < b: a else: b end end
 fun num-max(a, b): if a > b: a else: b end end

@@ -961,6 +961,11 @@ class Compiler {
     if (name === "string-to-code-points" && args.length === 1) {
       return m.call("$str_to_codepoints", [m.ref.cast(args[0]!, this.t.StrRef)], binaryen.anyref);
     }
+    // 1-char string from a code point (byte). The plural form + the rest of the
+    // string library are built on this in the Pyret prelude.
+    if (name === "string-from-code-point" && args.length === 1) {
+      return m.array.new_fixed(this.t.Str, [m.call("$num_to_i32", [args[0]!], binaryen.i32)]);
+    }
     if (name === "num-modulo" && args.length === 2) {
       return m.call("$num_modulo", [this.asNum(args[0]!), this.asNum(args[1]!)], this.t.NumRef);
     }

@@ -214,6 +214,23 @@ test("strings", async () => {
   expect(await evalPyret('fun greet(w): "Hi, " + w + "!" end\ngreet("world")')).toBe("Hi, world!");
 });
 
+test("string + number builtin library", async () => {
+  expect(await evalPyret('string-substring("hello world", 0, 5)')).toBe("hello");
+  expect(await evalPyret('string-substring("hello world", 6, 11)')).toBe("world");
+  expect(await evalPyret('string-char-at("hello", 1)')).toBe("e");
+  expect(await evalPyret('tostring(string-contains("hello", "ell"))')).toBe("true");
+  expect(await evalPyret('tostring(string-contains("hello", "xyz"))')).toBe("false");
+  expect(await evalPyret('tostring(string-index-of("hello", "l"))')).toBe("2");
+  expect(await evalPyret('tostring(string-index-of("hello", "z"))')).toBe("-1");
+  expect(await evalPyret('string-to-upper("aBc1")')).toBe("ABC1");
+  expect(await evalPyret('string-to-lower("aBcD")')).toBe("abcd");
+  expect(await evalPyret('string-from-code-points([list: 104, 105])')).toBe("hi");
+  expect(await evalPyret('tostring(string-explode("abc"))')).toBe("[list: a, b, c]");
+  expect(await evalPyret('string-to-number("042")')).toBe("some(42)");
+  expect(await evalPyret('tostring(string-to-number("4x2"))')).toBe("none");
+  expect(await evalPyret('num-to-string(255)')).toBe("255");
+});
+
 test("prelude builtins (not, num-abs, range, map2, find)", async () => {
   expect(await evalPyret("not(false)")).toBe("true");
   expect(await evalPyret("num-abs(0 - 7)")).toBe("7");

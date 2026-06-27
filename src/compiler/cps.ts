@@ -47,7 +47,8 @@ const OP_SRC: Record<string, string> = {
 // constructors and `is-<ctor>` predicates are added dynamically (see collectData).
 const INTRINSICS = new Set([
   "raise", "tostring", "to-string", "torepr", "to-repr",
-  "string-length", "string-to-code-points", "num-modulo", "num-quotient",
+  "string-length", "string-to-code-points", "string-from-code-point",
+  "num-modulo", "num-quotient",
   "emit-byte", "identical", "print", "display", "print-error",
 ]);
 
