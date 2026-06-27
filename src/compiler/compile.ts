@@ -1160,7 +1160,11 @@ class Compiler {
       const br = branches[i]!;
       const vname = this.childNamed(br, "NAME")!.value!;
       const info = this.variants.get(vname);
-      if (!info) throw new CompileError(`unknown variant in cases: ${vname}`, br);
+      // Real Pyret tolerates a cases branch naming a variant that isn't a
+      // constructor of the scrutinee's type — a dead branch that can never match
+      // (e.g. ast-anf.arr's `cases(ALettable) ... | a-array` where ALettable has
+      // no a-array variant). Drop it (never-matching) instead of erroring.
+      if (!info) continue;
       const argsNode = this.childNamed(br, "cases-args");
       const bindings = argsNode ? argsNode.kids.filter((k) => k.name === "cases-binding") : [];
       // Branch-local bindings must not leak to other branches or the outer scope.
