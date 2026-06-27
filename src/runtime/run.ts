@@ -1,6 +1,8 @@
 // Host harness: instantiate a compiled Pyret module and run its `main`.
 // The JS glue is intentionally minimal — only the I/O boundary lives here.
 
+import type { SerNode } from "./parse-bridge.ts";
+
 export interface RunResult {
   output: string;
   error?: string;
@@ -36,6 +38,10 @@ export interface HostState {
   // program source bytes, written into WASM memory on demand by the
   // `read_source_into` import (the self-hosted compiler's input). Empty otherwise.
   sourceBytes: Uint8Array;
+  // Flat pre-order parse-tree (CST lowered by parse-bridge.serializeCst), exposed
+  // to the self-hosted parser via the `parse_*` imports. Precomputed by the caller
+  // (see setSourceForParsing); empty until then.
+  parseNodes: SerNode[];
 }
 
 // Build the `host` import object. The same set is used by `run` and the
@@ -78,6 +84,17 @@ export function buildHostImports(state: HostState) {
         new Uint8Array(state.memory!.buffer, addr, state.sourceBytes.length).set(state.sourceBytes);
         return state.sourceBytes.length;
       },
+      // Self-hosted parser bridge (Option B): the CST is precomputed into
+      // state.parseNodes (flat pre-order); these four imports let the Pyret side
+      // walk it with a cursor (no in-WASM string-stream parsing). See parse-bridge.ts.
+      parse_source: (): number => state.parseNodes.length,
+      parse_node_tag: (i: number): number => state.parseNodes[i]!.tag,
+      parse_node_nkids: (i: number): number => state.parseNodes[i]!.nkids,
+      parse_node_str_into: (i: number, addr: number): number => {
+        const bytes = new TextEncoder().encode(state.parseNodes[i]!.str);
+        new Uint8Array(state.memory!.buffer, addr, bytes.length).set(bytes);
+        return bytes.length;
+      },
       check_summary: (passed: number, total: number) => {
         if (total === 0) return;
         if (passed === total) {
@@ -97,6 +114,7 @@ export function newHostState(stdout?: (s: string) => void): HostState {
     memory: null, instance: null, captured: "", failures: 0, emitted: [],
     stdout: stdout ?? ((s: string) => { state.captured += s; }),
     sourceBytes: new Uint8Array(0),
+    parseNodes: [],
   };
   return state;
 }
