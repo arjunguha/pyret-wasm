@@ -294,6 +294,10 @@ end
 fun pack-fields(vs, c :: Ctx) -> List<Number>:
   compile-avals(vs, c).append(E.array-new-fixed(T-FIELDS, length(vs)))
 end
+# pack a list of already-compiled instruction sequences into a $Fields array.
+fun pack-instrs(parts :: List<List<Number>>) -> List<Number>:
+  E.concat-bytes(parts).append(E.array-new-fixed(T-FIELDS, length(parts)))
+end
 # a $Names array of $Str from field records (each with .name)
 fun emit-names(flds) -> List<Number>:
   E.concat-bytes(flds.map(lam(f): emit-str(f.name) end)).append(E.array-new-fixed(T-NAMES, length(flds)))
@@ -486,7 +490,18 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(E.i-call(idx-obj-extend()))
     | a-update(l, supe, fields) => compile-aval(supe, c)                    # TODO(port): mutable update
     | a-dot(l, obj, field) =>
-      compile-aval(obj, c).append(emit-str(field)).append(E.i-call(idx-obj-get()))
+      # field access dispatches on the value: a data VARIANT reads its field by name
+      # ($variant_field_by_name); any other value (an object) uses $obj_get. (self.x in a
+      # variant method needs the variant path.)
+      ol = c.next-local
+      c2 = ctx(c.locals, c.next-local + 1, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+      compile-aval(obj, c2).append(E.local-set(ol))
+        .append(E.local-get(ol)).append(E.ref-test-null(T-VARIANT))
+        .append(E.i-if(ANYREF-BT))
+        .append(E.local-get(ol)).append(emit-str(field)).append(E.i-call(idx-variant-field-by-name()))
+        .append(E.i-else)
+        .append(E.local-get(ol)).append(emit-str(field)).append(E.i-call(idx-obj-get()))
+        .append(E.i-end)
     | a-colon(l, obj, field) => compile-aval(obj, c)                        # TODO(port): method/field colon
     | a-get-bang(l, obj, field) =>
       # read the ref-cell field by name, then unbox the cell. TODO(port): unbox.
@@ -519,7 +534,37 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(compile-aval(value, c))
         .append(E.array-set(T-FIELDS))
         .append(E.i32-const(2)).append(E.ref-i31)
-    | a-method-app(l, obj, meth, args) => compile-aval(obj, c)              # TODO(port): method dispatch
+    | a-method-app(l, obj, meth, args) =>
+      # method dispatch: stash obj in a temp, look up the method via $lookup_method
+      # (variant -> $variant_methods[id]; object -> itself), then if the field is a
+      # $Method call its closure with [self, ...args]; else call the plain field-closure
+      # with [args].  Mirrors the seed's compileMethodOnValue.
+      objl = c.next-local
+      fldl = c.next-local + 1
+      cll  = c.next-local + 2
+      c2 = ctx(c.locals, c.next-local + 3, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+      tyidx = closure-call-type-idx()
+      arg-instrs = args.map(lam(a): compile-aval(a, c2) end)
+      # $Method path: closure = (cast field $Method).0 ; call [closure, $Fields(self,...args), sel]
+      method-path =
+        E.local-get(fldl).append(E.ref-cast(T-METHOD)).append(E.struct-get(T-METHOD, 0)).append(E.local-set(cll))
+          .append(E.local-get(cll))
+          .append(pack-instrs(link(E.local-get(objl), arg-instrs)))
+          .append(E.local-get(cll)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))
+          .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+      # plain path: the field is itself a closure ; call [field, $Fields(args), sel]
+      plain-path =
+        E.local-get(fldl).append(E.ref-cast(T-CLOSURE)).append(E.local-set(cll))
+          .append(E.local-get(cll))
+          .append(pack-instrs(arg-instrs))
+          .append(E.local-get(cll)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))
+          .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+      compile-aval(obj, c2)
+        .append(E.local-set(objl))
+        .append(E.local-get(objl)).append(emit-str(meth)).append(E.i-call(rt-funcidx("$lookup_method")))
+        .append(E.local-set(fldl))
+        .append(E.local-get(fldl)).append(E.ref-test-null(T-METHOD))
+        .append(E.i-if(ANYREF-BT)).append(method-path).append(E.i-else).append(plain-path).append(E.i-end)
     | a-data-expr(l, name, namet, variants, shared) =>
       # the variant registry (id/arity/fields) is collected up front (collect-data, in
       # Ctx.dreg); the per-variant constructor FUNCTIONS are emitted by the assembler into
@@ -531,8 +576,12 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # constructor closure (see data-field-value). TODO(port): is-<variant> predicates and
       # binding the constructor names that the front-end's ANF references directly (needs
       # the top-level/global id resolution that a-id still leaves as null).
+      # First, populate $variant_methods[id] for each variant that has `with:`/`sharing:`
+      # methods (a methods $Object: name -> the let-bound $Method/closure value, in scope
+      # here).  These side-effects leave nothing on the stack; the data $Object follows.
       this-names = variants.map(variant-name)
-      emit-names-of(this-names)
+      set-all-variant-methods(c, variants, shared)
+        .append(emit-names-of(this-names))
         .append(E.concat-bytes(variants.map(lam(vv): data-field-value(c, vv) end)))
         .append(E.array-new-fixed(T-FIELDS, length(variants)))
         .append(E.i-call(idx-make-object()))
@@ -577,6 +626,45 @@ fun variant-name(v) -> String:
     | a-variant(_, _, nm, _, _) => nm
     | a-singleton-variant(_, nm, _) => nm
   end
+end
+fun variant-with-members(v):
+  cases(N.AVariant) v:
+    | a-variant(_, _, _, _, wm) => wm
+    | a-singleton-variant(_, _, wm) => wm
+  end
+end
+# a variant's methods = its `with:` members ++ the data's `sharing:` members not
+# overridden by name (with-members win), each an a-field whose value is the let-bound
+# method ($Method) reference.
+fun merged-methods(v, shared):
+  wm = variant-with-members(v)
+  wm-names = wm.map(lam(f): f.name end)
+  wm + shared.filter(lam(s): not(wm-names.member(s.name)) end)
+end
+# instructions building a methods $Object (name -> method value) for a field list.
+fun methods-object-instrs(c :: Ctx, fields) -> List<Number>:
+  emit-names-of(fields.map(lam(f): f.name end))
+    .append(pack-fields(fields.map(lam(f): f.value end), c))
+    .append(E.i-call(idx-make-object()))
+end
+# instructions setting $variant_methods[id] := methods-object for one variant (or empty
+# if it has no methods).
+fun set-one-variant-methods(c :: Ctx, v, shared) -> List<Number>:
+  methods = merged-methods(v, shared)
+  if is-empty(methods): empty
+  else:
+    cases(Option) data-lookup(c, variant-name(v)):
+      | none => empty
+      | some(d) =>
+        E.global-get(R.GI-VARIANT-METHODS).append(E.ref-cast(T-FIELDS))
+          .append(E.i32-const(d.id))
+          .append(methods-object-instrs(c, methods))
+          .append(E.array-set(T-FIELDS))
+    end
+  end
+end
+fun set-all-variant-methods(c :: Ctx, variants, shared) -> List<Number>:
+  E.concat-bytes(variants.map(lam(v): set-one-variant-methods(c, v, shared) end))
 end
 
 # prim-app -> runtime index. (kept for reference; the dispatch lives inline in a-prim-app.)
@@ -728,7 +816,8 @@ end
 # a-data-expr constructors, and the $variant_names global.
 fun variant-member-name(m) -> String:
   cases(N.AVariantMember) m:
-    | a-variant-member(_, _, bind) => name-key(bind.id)
+    # SURFACE name (what `.x` / $variant_field_by_name look up), not the A.Name key.
+    | a-variant-member(_, _, bind) => bind.id.toname()
   end
 end
 fun collect-data-expr(e, acc):
@@ -904,7 +993,9 @@ fun compile-prog(prog) -> List<Number>:
       # $variant_names is ALWAYS emitted at GI-VARIANT-NAMES (empty $Fields when no
       # variants) because the $variant_field_by_name kernel references it
       # unconditionally; top-level globals follow it (gbase = NUM-RT-GLOBALS + 1).
-      gbase = R.NUM-RT-GLOBALS + 1
+      # globals: [runtime block][$variant_names @ NUM-RT-GLOBALS][$variant_methods @ +1]
+      # [top-level globals @ +2 ...].
+      gbase = R.NUM-RT-GLOBALS + 2
       tl-keys = collect-toplevel(body, empty).reverse()
       num-tl = length(tl-keys)
       gmap = map2(lam(k, gi): {k: k, gi: gbase + gi} end, tl-keys, range(0, num-tl))
@@ -919,6 +1010,14 @@ fun compile-prog(prog) -> List<Number>:
       main-ctx = ctx(empty, 0, empty, gmap, lam-map, dreg, gvars, num-lams)
       # set $link_id/$empty_id from the data registry before running the program body.
       list-id-init = gid-init(dreg, "link", R.GI-LINK-ID).append(gid-init(dreg, "empty", R.GI-EMPTY-ID))
+      # allocate $variant_methods = array of `num-ctors` nulls (each a-data-expr fills its
+      # variants' slots in scope). Skip when there are no variants.
+      vm-init = if num-ctors == 0: empty
+                else:
+                  E.concat-bytes(range(0, num-ctors).map(lam(_): E.i-ref-null(110) end))
+                    .append(E.array-new-fixed(T-FIELDS, num-ctors))
+                    .append(E.global-set(R.GI-VARIANT-METHODS))
+                end
       # Body is compiled NON-tail so we can run the check summary after it and still
       # return the program value. If any `check:` ran ($total > 0), call the host
       # check_summary($passed,$total); otherwise (normal programs) skip it (no spurious
@@ -930,7 +1029,7 @@ fun compile-prog(prog) -> List<Number>:
           .append(E.i-call(host-funcidx("check_summary")))
           .append(E.end-instr)
       main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)],
-        list-id-init.append(compile-aexpr(body, main-ctx, false)).append(check-summary-instrs))
+        list-id-init.append(vm-init).append(compile-aexpr(body, main-ctx, false)).append(check-summary-instrs))
       lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry
@@ -968,9 +1067,12 @@ fun compile-prog(prog) -> List<Number>:
       #       variants), then one mutable anyref global per top-level binding
       #       (null-init; set in main) -----
       vn-global = [list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))]
+      # $variant_methods: mutable (ref null $Fields), null-init; main allocates it (vm-init)
+      # and each a-data-expr fills its variants' slots.
+      vm-global = [list: E.global-entry(E.reftnull(T-FIELDS), 1, E.i-ref-null(T-FIELDS))]
       tl-globals = range(0, num-tl).map(lam(_): E.global-entry(E.anyref, 1, E.i-ref-null(110)) end)
       # runtime globals ($link_id/$empty_id/$passed/$total) occupy the lowest indices.
-      all-globals = R.rt-globals().append(vn-global.append(tl-globals))
+      all-globals = R.rt-globals().append(vn-global.append(vm-global.append(tl-globals)))
       global-c = if is-empty(all-globals): empty else: E.vec(all-globals) end
 
       # ----- import section: host functions, module "host" (occupy the low funcidxs) -----

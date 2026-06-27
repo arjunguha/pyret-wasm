@@ -65,6 +65,8 @@ GI-PASSED = 2
 GI-TOTAL = 3
 NUM-RT-GLOBALS = 4
 GI-VARIANT-NAMES = 4    # first global after the runtime block (when variants exist)
+GI-VARIANT-METHODS = 5  # (ref null $Fields): per-variant-id methods object, set at each
+                        # a-data-expr; consumed by $lookup_method for method dispatch.
 
 # fixed scratch region in linear memory for marshalling strings to the host (runtime.ts).
 SCRATCH-OFFSET = 1024
@@ -660,6 +662,21 @@ fun emit-make-method() -> RtFun:
   body = E.local-get(0).append(E.struct-new(T-METHOD)).append(E.end-instr)
   rt-fun("$make_method", [list: E.reft(T-CLOSURE)], [list: E.reft(T-METHOD)], empty, body)
 end
+# $lookup_method(obj :: anyref, name :: $Str) -> anyref : find the method named `name`
+# on `obj`.  A data VARIANT routes through the per-id method registry
+# ($variant_methods[$variant_id(obj)]); any other value (a plain object) holds its
+# methods directly.  Returns the field ($Method or plain closure), or null if absent.
+# Mirrors the seed's compileMethodOnValue methodsSource lookup.
+fun emit-lookup-method() -> RtFun:
+  body = E.local-get(0).append(E.ref-test-null(T-VARIANT))
+    .append(ifel-bt(anyref,
+        [list: E.global-get(GI-VARIANT-METHODS), E.ref-cast(T-FIELDS),
+               E.local-get(0), rt-call("$variant_id"), E.array-get(T-FIELDS) ],   # $variant_methods[id]
+        [list: E.local-get(0) ]))                                                  # else obj itself
+    .append(E.local-get(1)).append(rt-call("$obj_get"))
+    .append(E.end-instr)
+  rt-fun("$lookup_method", [list: anyref, E.reft(T-STR)], [list: anyref], empty, body)
+end
 # $empty_list() -> $Variant : the List `empty` (id = $empty_id global, null fields).
 # (Correct once main sets $empty_id to List's empty variant id; -1 until then.)
 fun emit-empty-list() -> RtFun:
@@ -891,7 +908,7 @@ all-runtime-funs :: List<String> = [list:
   "$mag_add","$mag_sub","$mag_mul","$mag_cmp","$mag_divmod","$mag_gcd",
   "$string_length","$str_concat","$str_equal","$str_from_mem","$str_to_codepoints",
   "$make_variant","$variant_id","$variant_field","$variant_field_by_name","$variant_equal",
-  "$make_object","$obj_get","$obj_equal","$obj_extend","$make_method","$cons","$empty_list",
+  "$make_object","$obj_get","$obj_equal","$obj_extend","$make_method","$lookup_method","$cons","$empty_list",
   "$equal","$render","$val_to_string",
   "$check_is","$check_is_not","$check_pred","$yield",
   # renderer helpers + decimal writer + str-copy (appended; order parallels build-runtime)
@@ -910,7 +927,7 @@ fun build-runtime() -> List<RtFun>:
     emit-mag-add(), emit-mag-sub(), emit-mag-mul(), emit-mag-cmp(), emit-mag-divmod(), emit-mag-gcd(),
     emit-string-length(), emit-str-concat(), emit-str-equal(), emit-str-from-mem(), emit-str-to-codepoints(),
     emit-make-variant(), emit-variant-id(), emit-variant-field(), emit-variant-field-by-name(), emit-variant-equal(),
-    emit-make-object(), emit-obj-get(), emit-obj-equal(), emit-obj-extend(), emit-make-method(), emit-cons(), emit-empty-list(),
+    emit-make-object(), emit-obj-get(), emit-obj-equal(), emit-obj-extend(), emit-make-method(), emit-lookup-method(), emit-cons(), emit-empty-list(),
     emit-equal(), emit-render(), emit-val-to-string(),
     emit-check-is(), emit-check-is-not(), emit-check-pred(), emit-yield(),
     emit-render-num(), emit-write-i64(), emit-str-copy(),
