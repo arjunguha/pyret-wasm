@@ -569,7 +569,11 @@ fun t-stmts(stmts :: List<CstNode>, i :: Number, k :: Cont) -> String:
         cont = if last: k else: k-fn(lam(_v): t-stmts(stmts, i + 1, k) end) end
         t-check-block(s, cont)
       | last then: t(s, k)
-      | otherwise: t(s, k-fn(lam(_v): t-stmts(stmts, i + 1, k) end))
+      | otherwise:
+        # Non-last expression statement: its computed value must still be EMITTED (as a
+        # statement) so side effects like `print(...)` run before continuing. Discarding v
+        # here drops the call's source entirely — the dropped-non-last-print bug.
+        t(s, k-fn(lam(v): "block: " + v + " " + t-stmts(stmts, i + 1, k) + " end" end))
     end
   end
 end

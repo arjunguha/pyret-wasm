@@ -63,6 +63,19 @@ test("stoppable: matches the direct compiler", async () => {
   }
 });
 
+// Regression: a NON-LAST statement's side effects (e.g. print) must run, in order.
+// Previously the non-last expression continuation discarded its value, dropping the
+// emitted call entirely → only the final value showed.
+test("stoppable: non-last statement side effects (print) run in order", async () => {
+  for (const src of [
+    'print("a")\nprint("b")\n5',
+    'print("hi")\nnothing',
+    'print(1)\nprint(2)\nprint(3)',
+  ]) {
+    expect(await evalStoppable(src)).toBe(await evalDirect(src));
+  }
+});
+
 // The prelude is CPS-transformed TOGETHER with user code, so built-in higher-order
 // functions are themselves interruptible. Verify they still compute correctly through
 // the CPS pipeline (parity with the direct compiler).
