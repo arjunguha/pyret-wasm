@@ -1,1 +1,1 @@
-print([list: 5])
+print(num-max(5, 3))
