@@ -5,7 +5,7 @@ import { ParseError } from "./parser/pyret-parser.ts";
 import { CompileError } from "./compiler/compile.ts";
 import { buildSource, buildSourceFile } from "./build.ts";
 import { run } from "./runtime/run.ts";
-import { buildSelfHosted, runSelfHostedModule } from "./build-selfhost.ts";
+import { buildSourceSelfHosted, runSelfHostedModule } from "./build-selfhosted.ts";
 
 function usage(): never {
   console.error("usage: pyretc run [--self-hosted] <file.arr>");
@@ -26,9 +26,8 @@ async function main() {
     if (selfHosted) {
       try {
         const src = await Bun.file(file).text();
-        const wasm = await buildSelfHosted(src);
-        const result = await runSelfHostedModule(wasm);
-        process.stdout.write(result + "\n");
+        const wasm = await buildSourceSelfHosted(src);
+        await runSelfHostedModule(wasm, { stdout: (s) => process.stdout.write(s) });
         return;
       } catch (e) {
         console.error(`[self-hosted compiler can't handle this program; falling back to seed: ${(e as Error).message ?? e}]`);
