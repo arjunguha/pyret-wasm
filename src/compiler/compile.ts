@@ -1072,7 +1072,11 @@ class Compiler {
   private compileConstruct(node: CstNode, ctx: Ctx): number {
     const m = this.m;
     const ctorNode = node.kids.find((k) => k.name === "binop-expr")!;
-    const ctorName = this.simpleName(ctorNode);
+    // The ctor may be a bare name (`[list: ..]`) or module-qualified (`[SD.string-dict: ..]`,
+    // common in the real front-end). For the built-in collections, the member name alone
+    // selects the desugaring (list/string-dict/set/...), so look through a module alias.
+    const ctorDot = this.asDot(ctorNode);
+    const ctorName = (ctorDot && this.moduleAliasName(ctorDot.objExpr)) ? ctorDot.name : this.simpleName(ctorNode);
     const trailing = this.childNamed(node, "trailing-opt-comma-binops");
     const cb = trailing && this.childNamed(trailing, "comma-binops");
     const elems = cb ? cb.kids.filter((k) => k.name === "binop-expr") : [];
