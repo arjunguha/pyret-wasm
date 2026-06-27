@@ -6,7 +6,7 @@
 #
 # ===== PORT NOTES =====
 # binaryen builds an expression TREE; the encoder builds a stack-machine BYTE STREAM.
-# So every `m.call("$f", [a, b])` becomes  <bytes a> ++ <bytes b> ++ E.call(rt("$f")):
+# So every `m.call("$f", [a, b])` becomes  <bytes a> ++ <bytes b> ++ E.i-call(rt("$f")):
 # operands are emitted first, then the op. compile-expr returns List<Number> = the
 # bytes that leave the expr's value on the operand stack. `tail` enables
 # return_call_indirect for proper tail calls.
@@ -53,7 +53,9 @@ fun closure-sig() -> Number: 0 end   # function-type index for (closure, fields)
 runtime-names :: List<String> = [list:
   "$make_fix", "$make_rough", "$make_rat", "$plus", "$equal", "$num_compare",
   "$num_add", "$num_sub", "$num_mul", "$num_divide", "$tostring",
-  "$raise", "$print", "$num_to_string", "$no_branch" ]
+  "$raise", "$print", "$num_to_string", "$no_branch",
+  "$make_variant", "$variant_field", "$variant_id", "$variant_field_by_name",
+  "$cons", "$empty_list", "$obj_extend", "$make_object", "$make_method" ]
 fun rt(name :: String) -> Number:
   fun loop(l, i): cases(List) l: | empty => 0 | link(f, r) => if f == name: i else: loop(r, i + 1) end end end
   loop(runtime-names, 0)   # TODO(port): offset by the import count in the assembled module
@@ -134,7 +136,7 @@ fun compile-expr(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>:
     | node.name == "tuple-get" then: compile-tuple-get(node, c)
     | node.name == "assign-expr" then: compile-assign(node, c)
     | node.name == "extend-expr" then: compile-extend(node, c)
-    | node.name == "template-expr" then: E.call(rt("$raise"))
+    | node.name == "template-expr" then: E.i-call(rt("$raise"))
     | otherwise: raise("unsupported expression: " + node.name)
   end
 end
@@ -144,14 +146,14 @@ fun compile-number(text :: String) -> List<Number>:
   s = if string-char-at(text, 0) == "~": string-substring(text, 1, string-length(text)) else: text end
   rough = not(text == s) or has-decimal(s)
   if rough:
-    E.f64-const-bits(f64-bits(string-to-num-or(s, 0))).append(E.call(rt("$make_rough")))
+    E.f64-const(string-to-num-or(s, 0)).append(E.i-call(rt("$make_rough")))
   else:
     int-literal(string-to-num-or(s, 0))
   end
 end
 fun int-literal(v :: Number) -> List<Number>:
   # Fixnum path: i64.const v ; call $make_fix. TODO(port): bignum when |v| >= 2^63.
-  E.i64-const(v).append(E.call(rt("$make_fix")))
+  E.i64-const(v).append(E.i-call(rt("$make_fix")))
 end
 fun compile-rational(text :: String, rough :: Boolean) -> List<Number>:
   s = if string-char-at(text, 0) == "~": string-substring(text, 1, string-length(text)) else: text end
@@ -159,9 +161,9 @@ fun compile-rational(text :: String, rough :: Boolean) -> List<Number>:
   n = string-to-num-or(parts.first, 0)
   d = string-to-num-or(parts.rest.first, 1)
   if rough:
-    E.f64-const-bits(f64-bits(n / d)).append(E.call(rt("$make_rough")))
+    E.f64-const(n / d).append(E.i-call(rt("$make_rough")))
   else:
-    int-literal(n).append(int-literal(d)).append(E.call(rt("$make_rat")))
+    int-literal(n).append(int-literal(d)).append(E.i-call(rt("$make_rat")))
   end
 end
 fun compile-string(text :: String) -> List<Number>:
@@ -190,13 +192,13 @@ fun compile-binop(node :: CstNode, c :: Ctx) -> List<Number>:
 end
 fun apply-binop(op :: String, left :: List<Number>, right :: List<Number>) -> List<Number>:
   ask:
-    | op == "PLUS" then: left.append(right).append(E.call(rt("$plus")))
+    | op == "PLUS" then: left.append(right).append(E.i-call(rt("$plus")))
     | is-some(arith-fn(op)) then:
-      as-num(left).append(as-num(right)).append(E.call(rt(arith-fn(op).value)))
+      as-num(left).append(as-num(right)).append(E.i-call(rt(arith-fn(op).value)))
     | is-some(cmp-pred(op)) then:
-      cmp-to-bool(cmp-pred(op).value, as-num(left).append(as-num(right)).append(E.call(rt("$num_compare"))))
-    | op == "EQUALEQUAL" then: mk-bool(left.append(right).append(E.call(rt("$equal"))))
-    | op == "NEQ" then: mk-bool(left.append(right).append(E.call(rt("$equal"))).append(I32-EQZ))
+      cmp-to-bool(cmp-pred(op).value, as-num(left).append(as-num(right)).append(E.i-call(rt("$num_compare"))))
+    | op == "EQUALEQUAL" then: mk-bool(left.append(right).append(E.i-call(rt("$equal"))))
+    | op == "NEQ" then: mk-bool(left.append(right).append(E.i-call(rt("$equal"))).append(I32-EQZ))
     | op == "AND" then: mk-bool(truthy(left).append(truthy(right)).append(I32-AND))
     | op == "OR" then: mk-bool(truthy(left).append(truthy(right)).append(I32-OR))
     | otherwise: raise("unsupported binop: " + op)
@@ -219,7 +221,7 @@ fun compile-if(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>:
   has-else = is-some(find(lam(k): k.name == "ELSECOLON" end, kids))
   else-expr =
     if has-else: compile-block(blocks.get(blocks.length() - 1), c, tail)
-    else: E.call(rt("$no_branch")) end
+    else: E.i-call(rt("$no_branch")) end
   fun fold-eis(eis :: List<CstNode>, acc :: List<Number>) -> List<Number>:
     cases(List) eis:
       | empty => acc
@@ -227,7 +229,7 @@ fun compile-if(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>:
         ec = child-named(ei, "binop-expr").value
         eb = child-named(ei, "block").value
         nested = truthy(compile-expr(ec, c, false))
-          .append(E.if-instr(ANYREF-BT)).append(compile-block(eb, c, tail))
+          .append(E.i-if(ANYREF-BT)).append(compile-block(eb, c, tail))
           .append(ELSE-B).append(acc).append(END)
         fold-eis(rest, nested)
     end
@@ -235,7 +237,7 @@ fun compile-if(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>:
   chained-else = fold-eis(elseifs.reverse(), else-expr)
   then-expr = compile-block(blocks.first, c, tail)
   truthy(compile-expr(cond, c, false))
-    .append(E.if-instr(ANYREF-BT)).append(then-expr).append(ELSE-B).append(chained-else).append(END)
+    .append(E.i-if(ANYREF-BT)).append(then-expr).append(ELSE-B).append(chained-else).append(END)
 end
 
 # ===== application: intrinsics vs closure call (mirror compileApp) =====
@@ -260,10 +262,10 @@ end
 fun compile-intrinsic(name :: String, args :: List<CstNode>, c :: Ctx, tail :: Boolean) -> List<Number>:
   ab = concat-bytes(map(lam(a): compile-expr(a, c, false) end, args))
   ask:
-    | name == "raise" then: ab.append(E.call(rt("$raise")))
-    | (name == "print") or (name == "display") then: ab.append(E.call(rt("$print")))
-    | (name == "tostring") or (name == "torepr") then: ab.append(E.call(rt("$tostring")))
-    | name == "num-to-string" then: ab.append(E.call(rt("$num_to_string")))
+    | name == "raise" then: ab.append(E.i-call(rt("$raise")))
+    | (name == "print") or (name == "display") then: ab.append(E.i-call(rt("$print")))
+    | (name == "tostring") or (name == "torepr") then: ab.append(E.i-call(rt("$tostring")))
+    | name == "num-to-string" then: ab.append(E.i-call(rt("$num_to_string")))
     | name == "raw-array-get" then: ab.append(E.array-get(t-fields()))
     | name == "raw-array-set" then: ab.append(E.array-set(t-fields()))
     | name == "raw-array-length" then: ab.append([list: 251, 15])  # array.len
@@ -280,9 +282,9 @@ fun tail-of(c :: Ctx, tail :: Boolean) -> Boolean: tail end
 # variant taking already-compiled arg byte-lists (used by `^` and the CstNode path).
 fun call-closure-bytes(closure-bytes :: List<Number>, arg-byte-lists :: List<List<Number>>, tail :: Boolean) -> List<Number>:
   n = arg-byte-lists.length()
-  packed = if n == 0: E.ref-null(t-fields())
+  packed = if n == 0: E.i-ref-null(t-fields())
     else: concat-bytes(arg-byte-lists).append(E.array-new-fixed(t-fields(), n)) end
-  call-instr = if tail: E.return-call-indirect(closure-sig(), 0) else: E.call-indirect(closure-sig(), 0) end
+  call-instr = if tail: E.i-return-call-indirect(closure-sig(), 0) else: E.i-call-indirect(closure-sig(), 0) end
   # TODO(port): bind the closure to a local to avoid emitting closure-bytes twice
   # (compile.ts uses a closureLocal). Here we push closure, args, then fnIndex via a
   # second read of the closure -> needs the local. Sketch keeps the shape.
@@ -320,7 +322,7 @@ fun set-box(cell :: List<Number>, value :: List<Number>) -> List<Number>:
   cell.append(E.ref-cast(t-fields())).append(E.i32-const(0)).append(value).append(E.array-set(t-fields()))
 end
 fun make-closure(fn-index :: Number, capture-names :: List<String>, enclosing :: Ctx) -> List<Number>:
-  caps = if capture-names.length() == 0: E.ref-null(t-fields())
+  caps = if capture-names.length() == 0: E.i-ref-null(t-fields())
     else: concat-bytes(map(lam(nm): resolve-name(nm, enclosing) end, capture-names))
            .append(E.array-new-fixed(t-fields(), capture-names.length())) end
   E.i32-const(fn-index).append(caps).append(E.struct-new(t-closure()))
@@ -358,9 +360,17 @@ end
 fun stmt-inner(s :: CstNode) -> CstNode: only(s) end
 fun emit-stmt(inner :: CstNode, c :: Ctx, tail :: Boolean, is-last :: Boolean) -> List<Number>:
   ask:
-    | inner.name == "let-expr" then: raise("TODO(port): let -> local.set (+box if captured-mutated)")
-    | inner.name == "var-expr" then: raise("TODO(port): var -> boxed local.set")
-    | inner.name == "fun-expr" then: raise("TODO(port): local fun -> compileLocalFun")
+    # NB(port): compile-block must thread an EXTENDED Ctx (this name appended to
+    # c.locals, boxed if captured-and-mutated) to subsequent statements — the seed
+    # mutates ctx; this immutable-Ctx port needs emit-stmt to also return the new Ctx.
+    # Bytes below are the faithful local.set shape; the threading is the debug-phase fix.
+    | inner.name == "let-expr" then:
+      idx = c.locals.length()
+      compile-expr(inner.kids.get(inner.kids.length() - 1), c, false).append(E.local-set(idx))
+    | inner.name == "var-expr" then:
+      idx = c.locals.length()
+      make-box(compile-expr(inner.kids.get(inner.kids.length() - 1), c, false)).append(E.local-set(idx))
+    | inner.name == "fun-expr" then: raise("TODO(port): local fun -> register-fn + hoist (function table)")
     | otherwise:
       bytes = compile-expr(inner, c, tail)
       if is-last: bytes else: bytes.append(DROP) end
@@ -368,15 +378,122 @@ fun emit-stmt(inner :: CstNode, c :: Ctx, tail :: Boolean, is-last :: Boolean) -
 end
 
 # ===== still-TODO expression compilers (faithful signatures; bodies at debug time) =====
-fun compile-cases(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>: raise("TODO(port): cases -> variant-id dispatch + field binds") end
-fun compile-construct(node :: CstNode, c :: Ctx) -> List<Number>: raise("TODO(port): [ctor: ...] -> ctor.make([raw-array: ...])") end
-fun compile-object(node :: CstNode, c :: Ctx) -> List<Number>: raise("TODO(port): $Object {names, values}") end
-fun compile-dot(node :: CstNode, c :: Ctx) -> List<Number>: raise("TODO(port): field access by name / method") end
-fun compile-extend(node :: CstNode, c :: Ctx) -> List<Number>: raise("TODO(port): obj.{f:v} -> $obj_extend") end
-fun compile-for(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>: raise("TODO(port): for -> HOF call") end
-fun compile-tuple(node :: CstNode, c :: Ctx) -> List<Number>: raise("TODO(port): tuple variant id 0") end
-fun compile-tuple-get(node :: CstNode, c :: Ctx) -> List<Number>: raise("TODO(port): tuple .{n}") end
-fun compile-assign(node :: CstNode, c :: Ctx) -> List<Number>: raise("TODO(port): := local/global/box set") end
+fun str-lit(s :: String) -> List<Number>:
+  cps = string-to-code-points(s)
+  concat-bytes(map(lam(cp): E.i32-const(cp) end, cps)).append(E.array-new-fixed(t-str(), cps.length()))
+end
+
+# cases(Type) scrut: | v(binds) => body | ... | else => eb end  (mirror compileCases)
+# Faithful structure: scrutinee -> nested if on $variant_id per branch. The variant
+# NAME->id map and field binds need the compile-program variant registry (TODO).
+fun compile-cases(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>:
+  scrut = cases(Option) child-named(node, "binop-expr"): | some(s) => compile-expr(s, c, false) | none => raise("cases: no scrutinee") end
+  branches = filter(lam(k): k.name == "cases-branch" end, node.kids)
+  else-bytes = cases(Option) find(lam(k): k.name == "block" end, node.kids.reverse()):
+    | some(b) => compile-block(b, c, tail) | none => E.i-call(rt("$no_branch")) end
+  fun fold-br(brs :: List<CstNode>, acc :: List<Number>) -> List<Number>:
+    cases(List) brs:
+      | empty => acc
+      | link(br, rest) =>
+        body = cases(Option) find(lam(k): k.name == "block" end, br.kids): | some(b) => compile-block(b, c, tail) | none => acc end
+        # TODO(port): variant-id(br-name) from registry; bind cases-args via $variant_field.
+        fold-br(rest, scrut.append(E.i-call(rt("$variant_id"))).append(E.i-if(ANYREF-BT))
+          .append(body).append(ELSE-B).append(acc).append(END))
+    end
+  end
+  fold-br(branches.reverse(), else-bytes)
+end
+
+# [list: e1, e2, ...] -> link(e1, link(e2, ... empty)) via runtime $cons/$empty_list.
+fun compile-construct(node :: CstNode, c :: Ctx) -> List<Number>:
+  ctor = cases(Option) child-named(node, "binop-expr"):
+    | some(cn) => cases(Option) simple-name(cn): | some(n) => n | none => "?" end | none => "?" end
+  elems = construct-elems(node)
+  if ctor == "list":
+    foldr(lam(e :: CstNode, acc :: List<Number>):
+        compile-expr(e, c, false).append(acc).append(E.i-call(rt("$cons")))
+      end, E.i-call(rt("$empty_list")), elems)
+  else: raise("TODO(port): construct [" + ctor + ": ...] (set/string-dict/sequence)")
+  end
+end
+
+# { f: v, method m(self,...): ... } -> $make_object(names, values)  (mirror compileObject)
+fun compile-object(node :: CstNode, c :: Ctx) -> List<Number>:
+  fields = obj-field-nodes(node)
+  names = concat-bytes(map(lam(f): str-lit(field-name(f)) end, fields)).append(E.array-new-fixed(t-str(), fields.length()))
+  values = concat-bytes(map(lam(f): compile-field-value(f, c) end, fields)).append(E.array-new-fixed(t-fields(), fields.length()))
+  names.append(values).append(E.i-call(rt("$make_object")))   # TODO(port): $Names type idx vs $Str array
+end
+
+# obj.field -> runtime field-access-by-name (variant-layout or object dispatch).
+fun compile-dot(node :: CstNode, c :: Ctx) -> List<Number>:
+  fname = cases(Option) child-named(node, "NAME"): | some(n) => n.value.or-else("_") | none => "_" end
+  compile-expr(node.kids.first, c, false).append(str-lit(fname)).append(E.i-call(rt("$variant_field_by_name")))
+end
+
+# e.{f: v, ...} -> $obj_extend(e, names, values)  (mirror compileExtend)
+fun compile-extend(node :: CstNode, c :: Ctx) -> List<Number>:
+  fields = obj-field-nodes(node)
+  names = concat-bytes(map(lam(f): str-lit(field-name(f)) end, fields)).append(E.array-new-fixed(t-str(), fields.length()))
+  values = concat-bytes(map(lam(f): compile-field-value(f, c) end, fields)).append(E.array-new-fixed(t-fields(), fields.length()))
+  compile-expr(node.kids.first, c, false).append(names).append(values).append(E.i-call(rt("$obj_extend")))
+end
+
+# for ITER(b from e, ...): body end -> ITER(lam(b, ...): body end, e, ...)
+fun compile-for(node :: CstNode, c :: Ctx, tail :: Boolean) -> List<Number>:
+  # TODO(port): build lam(for-bind names): body end (a closure) + call the iterator
+  # with (that-lambda, from-exprs...). Needs register-fn (function table) — debug-phase.
+  raise("TODO(port): for desugar (lambda from for-binds + iterator call)")
+end
+
+# {e1; e2; ...} -> $make_variant(0, "tuple", [e1, e2, ...])  (reserved variant id 0)
+fun compile-tuple(node :: CstNode, c :: Ctx) -> List<Number>:
+  fields = cases(Option) child-named(node, "tuple-fields"):
+    | none => empty | some(tf) => filter(lam(k): k.name == "binop-expr" end, tf.kids) end
+  arr = if fields.length() == 0: E.i-ref-null(t-fields())
+    else: concat-bytes(map(lam(e): compile-expr(e, c, false) end, fields)).append(E.array-new-fixed(t-fields(), fields.length())) end
+  E.i32-const(0).append(str-lit("tuple")).append(arr).append(E.i-call(rt("$make_variant")))
+end
+
+# expr.{n} -> $variant_field(expr-as-variant, n)
+fun compile-tuple-get(node :: CstNode, c :: Ctx) -> List<Number>:
+  idx = cases(Option) child-named(node, "NUMBER"): | some(n) => string-to-num-or(n.value.or-else("0"), 0) | none => 0 end
+  compile-expr(node.kids.first, c, false).append(E.ref-cast(t-variant())).append(E.i32-const(idx)).append(E.i-call(rt("$variant_field")))
+end
+
+# NAME := expr  (local / boxed-local; global+capture are debug-phase)
+fun compile-assign(node :: CstNode, c :: Ctx) -> List<Number>:
+  nm = node.kids.first.value.or-else("_")
+  val = compile-expr(node.kids.get(node.kids.length() - 1), c, false)
+  store = ask:
+    | (idx-of(c.locals, nm) >= 0) and c.boxed.member(nm) then: set-box(E.local-get(idx-of(c.locals, nm)), val)
+    | idx-of(c.locals, nm) >= 0 then: val.append(E.local-set(idx-of(c.locals, nm)))
+    | otherwise: raise("TODO(port): assign to global/captured var " + nm)
+  end
+  store.append(E.i32-const(2)).append(ref-i31())   # := returns nothing
+end
+
+# ---- CST extraction helpers for the above (shapes mirror compile.ts) ----
+fun construct-elems(node :: CstNode) -> List<CstNode>:
+  cases(Option) child-named(node, "trailing-opt-comma-binops"):
+    | none => empty
+    | some(t) => cases(Option) child-named(t, "comma-binops"):
+        | none => empty | some(cb) => filter(lam(k): k.name == "binop-expr" end, cb.kids) end
+  end
+end
+fun obj-field-nodes(node :: CstNode) -> List<CstNode>:
+  cases(Option) child-named(node, "fields"):
+    | none => empty | some(fs) => filter(lam(k): k.name == "field" end, fs.kids) end
+end
+fun field-name(f :: CstNode) -> String:
+  cases(Option) child-named(f, "key"):
+    | some(k) => k.value.or-else("_")
+    | none => cases(Option) child-named(f, "NAME"): | some(n) => n.value.or-else("_") | none => "_" end
+  end
+end
+fun compile-field-value(f :: CstNode, c :: Ctx) -> List<Number>:
+  cases(Option) child-named(f, "binop-expr"): | some(e) => compile-expr(e, c, false) | none => E.i32-const(2).append(ref-i31()) end
+end
 
 # ===== free-var analysis (mirror freeVars; sketch covers id/lambda) =====
 fun free-vars(node :: CstNode, bound :: List<String>) -> List<String>:
@@ -426,8 +543,16 @@ fun f64-bits(x :: Number) -> List<Number>: [list: 0, 0, 0, 0, 0, 0, 0, 0] end  #
 
 # ===== top level: 3 passes (mirror compileProgram) =====
 fun compile-program(program :: CstNode) -> List<Number>:
-  # TODO(port): the integration driver — emit runtime (runtime.arr build-runtime),
-  # prelude, user code; lay out type/import/func/table/global/export/code sections;
-  # assemble via E.wasm-module. Here is where rt()/t-* placeholders get fixed up.
-  E.wasm-module(empty)
+  # The integration driver (mirror compileProgram's 3 passes). The runtime
+  # (runtime.arr build-runtime) + the prelude + the user program share ONE module:
+  #   pass 1: register top-level funs (function-table slots) + data variants as globals
+  #   pass 2: compile each top-level fun body into the code section
+  #   pass 3: build $main (init fun globals, run statements, print last value)
+  # then assemble the sections in order via E.wasm-module-of. The rt()/t-* index
+  # placeholders get their real values from this layout (the keystone TODO).
+  #
+  # TODO(port): wire runtime.arr's build-runtime + the prelude + user passes here and
+  # fill the 9 sections. For now assemble an empty (but structurally valid) module so
+  # the encoder API + section order are exercised.
+  E.wasm-module-of(empty, empty, empty, empty, empty, empty, empty, empty, empty)
 end
