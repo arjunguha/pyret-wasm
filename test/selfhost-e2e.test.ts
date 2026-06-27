@@ -221,3 +221,32 @@ test("self-hosted: recursive sum over a [list:] (== 60)", async () => {
   const { result } = await selfHostRun(LIST_SUM + "if lsum([list: 10, 20, 30]) == 60: 0 else: 1 / 0 end");
   expect(result.error).toBeUndefined();
 });
+
+// ─── Level 8: `check:` blocks ───────────────────────────────────────────────────
+// `check: lhs is rhs end` desugars (driver) to a `check-is` prim-app -> the runtime
+// $check_is harness (bumps $passed/$total, reports failures); main emits a guarded
+// check_summary($passed,$total) host call so the Pyret-style summary prints.
+test("self-hosted: a passing check: block prints the shipshape summary", async () => {
+  const { result } = await selfHostRun("check: 1 is 1 end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("Looks shipshape");
+});
+
+test("self-hosted: a failing check: block reports the failure + results line", async () => {
+  const { result } = await selfHostRun("check: 1 is 2 end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("test failed");
+  expect(result.output).toContain("0 passed, 1 failed");
+});
+
+test("self-hosted: is-not + multiple tests in one check: block", async () => {
+  const { result } = await selfHostRun("check:\n  2 + 3 is 5\n  4 is-not 5\nend");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("all 2 tests passed");
+});
+
+test("self-hosted: a program with no check: blocks prints no test summary", async () => {
+  const { result } = await selfHostRun("2 + 3");
+  expect(result.error).toBeUndefined();
+  expect(result.output).not.toContain("test");
+});

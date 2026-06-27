@@ -195,6 +195,29 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-check-expr(loc, expr, ann) =>
       A.s-check-expr(loc, desugar-expr(expr), ann)
 
+    | s-check(loc, name, body, kw) =>
+      # a `check:`/`examples:` block — keep only its body (the s-check-tests),
+      # which desugar to check-harness prim-apps below.
+      desugar-expr(body)
+
+    | s-check-test(loc, op, refinement, left, right, cause) =>
+      # `lhs is rhs` / `lhs is-not rhs` -> a prim-app the backend maps to the
+      # runtime check harness ($check_is / $check_is_not), which bumps $passed/$total.
+      dleft = desugar-expr(left)
+      cases(Option) right:
+        | none =>
+          # postfix ops (does-not-raise, etc.) not yet supported self-hosted
+          raise("self-hosted check: unsupported postfix check op")
+        | some(r) =>
+          dright = desugar-expr(r)
+          pname = cases(A.CheckOp) op:
+            | s-op-is(_) => "check-is"
+            | s-op-is-not(_) => "check-is-not"
+            | else => raise("self-hosted check: unsupported check op " + op.label())
+          end
+          A.s-prim-app(loc, pname, [list: dleft, dright], A.prim-app-info-c(false))
+      end
+
     | s-prim-app(loc, fname, args, info) =>
       A.s-prim-app(loc, fname, args.map(desugar-expr), info)
 

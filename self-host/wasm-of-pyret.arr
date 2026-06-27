@@ -354,6 +354,13 @@ fun compile-prim-app(fname :: String, args, c :: Ctx) -> List<Number>:
     | fname == "is-function" then: prim-type-test(args, c, T-CLOSURE)
     | fname == "is-object" then: prim-type-test(args, c, T-OBJECT)
     | fname == "is-raw-array" then: prim-type-test(args, c, T-FIELDS)
+    # ---- check harness: bump $passed/$total, report failures to the host ----
+    # $check_is/$check_is_not take (lhs, rhs) and return nothing; push a nothing
+    # (null anyref) so the lettable leaves exactly one value.
+    | fname == "check-is" then:
+      compile-avals(args, c).append(E.i-call(rt-funcidx("$check_is"))).append(E.i-ref-null(110))
+    | fname == "check-is-not" then:
+      compile-avals(args, c).append(E.i-call(rt-funcidx("$check_is_not"))).append(E.i-ref-null(110))
     # ---- control-flow aborts + the unmapped tail -> $raise host import ----
     | throw-prims.member(fname) then: raise-instr()
     | otherwise: raise-instr()   # TODO(port): makeArrayN, getMaker*, getColonField, getBracket, makeSome/None, run-task...
@@ -903,8 +910,18 @@ fun compile-prog(prog) -> List<Number>:
       main-ctx = ctx(empty, 0, empty, gmap, lam-map, dreg, gvars, num-lams)
       # set $link_id/$empty_id from the data registry before running the program body.
       list-id-init = gid-init(dreg, "link", R.GI-LINK-ID).append(gid-init(dreg, "empty", R.GI-EMPTY-ID))
+      # Body is compiled NON-tail so we can run the check summary after it and still
+      # return the program value. If any `check:` ran ($total > 0), call the host
+      # check_summary($passed,$total); otherwise (normal programs) skip it (no spurious
+      # "0 tests passed" line). The program value V stays on the stack across the `if`.
+      check-summary-instrs =
+        E.global-get(R.GI-TOTAL).append(E.i32-const(0)).append(E.i32-gt-s)
+          .append(E.i-if(E.bt-empty))
+          .append(E.global-get(R.GI-PASSED)).append(E.global-get(R.GI-TOTAL))
+          .append(E.i-call(host-funcidx("check_summary")))
+          .append(E.end-instr)
       main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)],
-        list-id-init.append(compile-aexpr(body, main-ctx, true)))
+        list-id-init.append(compile-aexpr(body, main-ctx, false)).append(check-summary-instrs))
       lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry
