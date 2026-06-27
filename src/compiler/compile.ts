@@ -743,6 +743,13 @@ class Compiler {
         return this.compileApp(node, ctx, tail);
       case "lambda-expr":
         return this.compileLambda(node, ctx);
+      case "method-expr": {
+        // A standalone first-class method value: `method(self, ...): body end`.
+        // Same representation as an object/variant method field — a $Method wrapping
+        // a closure whose first param is `self` — so it round-trips with dispatch.
+        const closure = this.buildClosureFromParts(this.headerParamBindings(node), this.childNamed(node, "block")!, ctx, "$mthx_");
+        return m.struct.new([m.ref.cast(closure, this.t.ClosureRef)], this.t.Method);
+      }
       case "id-expr": {
         const name = this.only(node).value!;
         const r = this.resolveName(name, ctx);
