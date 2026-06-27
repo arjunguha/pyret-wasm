@@ -216,6 +216,36 @@ test("self-hosted: non-recursive cases over a [list: ...] (head -> 7)", async ()
   expect(result.error).toBeUndefined();
 });
 
+// ─── Level 6b: the INJECTED [list:] path + value RENDERING ───────────────────────
+// These use `[list: ...]` WITHOUT a user `data List`, so the driver INJECTS the List
+// data node and `link`/`empty` resolve via name-key (which must be loc-INDEPENDENT —
+// the injected node's loc differs from the [list:] reference loc).  They also exercise
+// the renderer: lists -> `[list: a, b]`, the empty list -> `[list: ]`, and tuples ->
+// `{a; b}` (the tuple sentinel id is -1, distinct from a real variant's id 0).
+test("self-hosted: injected [list:] renders as [list: 1, 2, 3]", async () => {
+  const { result } = await selfHostRun("print([list: 1, 2, 3])");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("[list: 1, 2, 3]");
+});
+
+test("self-hosted: injected empty [list: ] renders as [list: ] (not a tuple)", async () => {
+  const { result } = await selfHostRun("print([list: ])");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("[list: ]");
+});
+
+test("self-hosted: tuple renders as {1; 2; 3} (sentinel id -1, no collision with variant 0)", async () => {
+  const { result } = await selfHostRun("print({1; 2; 3})");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("{1; 2; 3}");
+});
+
+test("self-hosted: a singleton variant (id 0) renders as its name, not a tuple", async () => {
+  const { result } = await selfHostRun("data D:\n  | mt\n  | c(v)\nend\nprint(mt)");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("mt");
+});
+
 // ─── Level 7: recursion over lists (length / sum) ───────────────────────────────
 // A self-recursive function over a `[list: ...]` — recursing on the variant's `rest`
 // field — compiles and runs with the CORRECT value.  We verify with an inline `if`
@@ -410,5 +440,20 @@ test("self-hosted: ask: with no otherwise (s-if-pipe) takes a matching branch", 
 test("self-hosted: when (false guard skips its body, no trap)", async () => {
   // body would `1 / 0` if run; a false `when` must skip it and yield nothing.
   const { result } = await selfHostRun("when false: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+
+// Regression: `a-app` type-application annotations (List<Number>, Option<a>) — pervasive
+// in real modules — used to null-ref during compilation (the dummy-loc `.visit()` shim
+// trapped on them). surface-parse now returns the parser AST directly (name-key uses
+// A.Name.key(), loc-independent) and the driver blanks bind/return annotations, so they
+// compile + run. (This was the dominant "module-init null-ref ×35" self-compile blocker.)
+test("self-hosted: a-app annotations (List<Number>) compile and run", async () => {
+  const { result } = await selfHostRun("fun f(x :: List<Number>): x end\nif f(5) == 5: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: annotated let + annotated variant member compile", async () => {
+  const { result } = await selfHostRun(
+    "data D: | a(n :: Number) end\nx :: Option<Number> = a(7)\nif x.n == 7: 0 else: 1 / 0 end");
   expect(result.error).toBeUndefined();
 });

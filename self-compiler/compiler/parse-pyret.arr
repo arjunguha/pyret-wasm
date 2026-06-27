@@ -27,13 +27,10 @@ fun surface-parse(src-in, uri):
   # empty string — some callers/tests prime the runtime source and pass "" (the old
   # JS-GLR bridge ignored `src` entirely and always read the host buffer).
   src = if string-length(src-in) == 0: read-source() else: src-in end
-  # `.visit(dummy-loc-visitor)` normalizes ALL locs to dummy. We must dummy not just
-  # `s-name` uses but every loc the DRIVER later copies into a freshly-created `s-name`
-  # (e.g. desugaring `fun f` → an `s-letrec-bind` whose binder name reuses the s-fun's
-  # loc): otherwise the driver-made binder name (real loc) ≠ the canonicalized use name
-  # (dummy loc) and the backend's `tostring`-keyed free-var analysis mis-binds it.
-  # pyret-parser still produces REAL srclocs (its own tests rely on them); this shim
-  # only normalizes the AST handed to the backend, until the backend keys names by
-  # `A.Name.key()` instead of `tostring`.
-  PP.parse-named(src, uri).visit(A.dummy-loc-visitor)
+  # Return the pure-Pyret parser's AST directly, with REAL srclocs — no JS, no shim.
+  # (We used to `.visit(A.dummy-loc-visitor)` to canonicalize `s-name` locs because the
+  # backend's free-var `name-key` keyed on `tostring(name)` (loc-sensitive). The backend
+  # now keys on `A.Name.key()` (loc-independent), so the shim is unnecessary — and it
+  # was itself trapping on `a-app` annotation nodes in the large compiler modules.)
+  PP.parse-named(src, uri)
 end

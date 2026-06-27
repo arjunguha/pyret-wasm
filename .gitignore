@@ -11,6 +11,7 @@ dist/
 web/main.bundle.js
 web/worker.bundle.js
 web/parser-bundle.js
+web/*.map
 
 # agent worktrees / local state
 .claude/

@@ -97,7 +97,12 @@ throw-prims :: List<String> = [list:
 # resolve-scope) so capture knows to grab the BOX. nlams: lambda count, so a-data-expr can
 # compute a ctor's table slot (= nlams + variant.id).
 data Ctx: ctx(locals, next-local :: Number, vars, fenv, lams, dreg, gvars, nlams :: Number) end
-fun name-key(n): n.key() end          # loc-independent Name identity (was tostring(n))
+# loc-independent identity. Only s-name carries a loc (the reason the dummy-loc shim
+# existed); other Names + non-Name values are already loc-free under tostring. Guard with
+# is-s-name (null-safe) so a non-Name (e.g. a tuple-bind's absent .id) falls back like the
+# old tostring instead of crashing on a missing .key(). (Loc-independent for s-name, which
+# is what the injected-List link/empty resolution needs.)
+fun name-key(n): if A.is-s-name(n): "name#" + n.s else: tostring(n) end end
 fun bind-local(c :: Ctx, key, idx :: Number) -> Ctx:
   ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
@@ -507,8 +512,9 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # read the ref-cell field by name, then unbox the cell. TODO(port): unbox.
       compile-aval(obj, c).append(emit-str(field)).append(E.i-call(idx-variant-field-by-name()))
     | a-tuple(l, fields) =>
-      # tuple = $Variant SENTINEL id -1 (distinct from real variant ids 0,1,2,… so the
-      # first data variant no longer renders/compares as a tuple), name "tuple", fields.
+      # tuple = $Variant SENTINEL id -1 (distinct from real variant ids 0,1,2,… which
+      # collect-data assigns 0-based — so the first data variant, e.g. `empty`, is no longer
+      # mis-rendered/compared as a tuple). $render_variant dispatches tuples on id == -1.
       E.i32-const(-1).append(emit-str("tuple")).append(pack-fields(fields, c)).append(E.struct-new(T-VARIANT))
     | a-tuple-get(l, tup, index) =>
       compile-aval(tup, c)

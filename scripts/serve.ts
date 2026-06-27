@@ -56,6 +56,11 @@ Bun.serve({
     let path = url.pathname === "/" ? "/index.html" : url.pathname;
     const file = Bun.file(resolve(WEB, "." + path));
     if (!(await file.exists())) return new Response("not found", { status: 404 });
+    // Serve sourcemaps with a correct JSON content-type so devtools loads them
+    // (Bun.file would otherwise label .map as octet-stream); enables original-TS debugging.
+    if (path.endsWith(".map")) {
+      return new Response(file, { headers: { "Content-Type": "application/json" } });
+    }
     return new Response(file);
   },
 });
