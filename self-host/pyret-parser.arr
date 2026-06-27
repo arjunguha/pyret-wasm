@@ -911,8 +911,59 @@ fun parse-postfix(st :: PState) -> A.Expr:
   parse-postfix-rest(st, start, parse-atom(st))
 end
 
+### Generic INSTANTIATION lookahead: `name<Ann, ...>(...)`.  `<`/`>` lex as OP
+### tokens (comparison ops), so we only treat `<` as a type application when it has
+### NO whitespace before it AND its matching `>` is immediately followed by `(` (an
+### application / for-binds).  That shape never matches a real comparison, so this is
+### the safe LANGLE-vs-LT disambiguation (mirrors the real tokenizer's distinction).
+fun inst-tok-ok(t :: Token) -> Boolean:
+  k = t.kind
+  (k == "NAME") or (k == "COMMA") or (k == "DOT") or (k == "COLONCOLON")
+    or (k == "THINARROW") or (k == "PERCENT") or (k == "SEMI")
+    or (k == "LPAREN") or (k == "RPAREN") or (k == "LBRACE") or (k == "RBRACE")
+    or ((k == "OP") and ((t.value == "<") or (t.value == ">")))
+end
+### scan from the opening `<` (head of `toks`) for the matching `>`; return true iff
+### the closing `>` is followed by `(`.  Bail (false = it's a comparison) on any token
+### that cannot appear inside a type application.
+fun inst-scan(toks :: List<Token>, depth :: Number) -> Boolean:
+  cases(List) toks:
+    | empty => false
+    | link(t, r) =>
+      if (t.kind == "OP") and (t.value == "<"): inst-scan(r, depth + 1)
+      else if (t.kind == "OP") and (t.value == ">"):
+        if depth == 1:
+          cases(List) r:
+            | empty => false
+            | link(n, _) => n.kind == "LPAREN"
+          end
+        else: inst-scan(r, depth - 1)
+        end
+      else if inst-tok-ok(t): inst-scan(r, depth)
+      else: false
+      end
+  end
+end
+fun inst-ahead(st :: PState) -> Boolean:
+  t0 = p-peek(st)
+  if (t0.kind == "OP") and (t0.value == "<") and not(t0.ws-before):
+    inst-scan(tok-stream, 0)   # tok-stream head is the `<`
+  else: false
+  end
+end
+### consume `< Ann (, Ann)* >` (cursor at `<`) and return the annotation params.
+fun parse-inst-args(st :: PState) -> List<A.Ann>:
+  p-advance(st)            # consume `<`
+  args = parse-ann-app-args(st)
+  expect-gt(st)            # consume `>`
+  args
+end
+
 fun parse-postfix-rest(st :: PState, start :: Token, e :: A.Expr) -> A.Expr:
-  if at-kind(st, "LPAREN") and not(p-peek(st).ws-before):
+  if inst-ahead(st):
+    params = parse-inst-args(st)
+    parse-postfix-rest(st, start, A.s-instantiate(node-loc(start), e, params))
+  else if at-kind(st, "LPAREN") and not(p-peek(st).ws-before):
     args = parse-app-args(st)
     parse-postfix-rest(st, start, A.s-app(node-loc(start), e, args))
   else if at-kind(st, "DOT"):
@@ -989,7 +1040,13 @@ fun forbinds-scan(toks :: List<Token>, depth :: Number) -> Boolean:
   end
 end
 fun parse-postfix-noapp-rest(st :: PState, start :: Token, e :: A.Expr) -> A.Expr:
-  if at-kind(st, "LPAREN") and not(p-peek(st).ws-before) and not(forbinds-ahead(st)):
+  if inst-ahead(st):
+    # generic instantiation on the `for` iterator, e.g.
+    # `for raw-array-fold2<Number, Number, Number>(acc from ..., ...)` — the `<...>`
+    # is type params; the following `(` is the for-binds, left for parse-for.
+    params = parse-inst-args(st)
+    parse-postfix-noapp-rest(st, start, A.s-instantiate(node-loc(start), e, params))
+  else if at-kind(st, "LPAREN") and not(p-peek(st).ws-before) and not(forbinds-ahead(st)):
     # an application within the `for` iterator (`f(x)(...binds)`); the for-binds
     # paren is recognized by `forbinds-ahead` and left for `parse-for`.
     args = parse-app-args(st)

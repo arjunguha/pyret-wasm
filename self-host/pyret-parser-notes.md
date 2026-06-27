@@ -132,16 +132,26 @@ masking.  All of these are now closed:
 
 **Status: 83 of 84 real `self-compiler/**.arr` + `self-host/*.arr` files parse.** Every CORE
 compiler file parses (ast / lists / compile-structs / checker / anf / desugar / well-formed /
-resolve-scope / …).  Exactly ONE file remains:
+resolve-scope / …).
 
-## TODO(grammar) — the one remaining gap + unexercised forms
+## COVERAGE: the ENTIRE self-hosted closure parses (96/96)
 
-- **`matrices.arr`** — generic **instantiation** in expression / for-iterator position:
-  `for raw-array-fold2<Number, Number, Number>(acc from ..., ...): ...`.  Needs `s-instantiate`
-  parsing of `name<ann, ...>`, which is the genuinely-ambiguous LANGLE-vs-LT case (`<`/`>`
-  also lex as comparison ops; the real tokenizer uses a whitespace distinction).  Tractable
-  in the for-iterator (gated on `<` with no `ws-before`), but a peripheral trove file (matrix
-  ops), not used by the compiler core — deferred to avoid the ambiguity risk for one file.
+Every `.arr` in `self-compiler/{compiler,trove}/**` + `self-host/*.arr` (96 files, incl
+`compiler/locators/*`) now parses with the pure-Pyret parser — verified by a scan + by
+`test/parser-closure.test.ts`.  The last grammar gap (generic instantiation) is CLOSED.
+
+## RESOLVED — generic instantiation (LANGLE-vs-LT)
+
+`name<Ann, ...>(...)` (e.g. `for raw-array-fold2<Number, Number, Number>(acc from ..., ...)`
+in `matrices.arr`, and `f<T>(x)` in expression position) now parses to `s-instantiate`.
+`<`/`>` lex as comparison OPs, so the disambiguation is a lookahead (`inst-ahead`/`inst-scan`
+in pyret-parser.arr): a `<` with NO `ws-before` whose matching `>` is immediately followed by
+`(` is a type application; anything else stays an `s-op` comparison.  This shape never matches
+a real comparison, so no whitespace-tokenizer change was needed.  Wired into both
+`parse-postfix-rest` (expression position → app of the instantiation) and
+`parse-postfix-noapp-rest` (the `for` iterator → the following `(` is the for-binds).
+
+## TODO(grammar) — unexercised forms (NOT in the compiler closure)
 - The other **table operations** (`select`/`sieve`/`order`/`extract`/`transform`/`extend`/
   `update`/`load-table`) and `reactor` — only `table:` is used by the compiler source.
 - **Decimal exponents** (`3.14e5`), full string escapes (`\u`, `\x`, octal) — unexercised;
