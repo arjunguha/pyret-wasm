@@ -94,6 +94,9 @@ class Compiler {
     if (!block) throw new CompileError("no block in program");
     // Registry of data-variant methods, indexed by variant id (filled in $main).
     this.m.addGlobal("$variant_methods", this.t.FieldsRefNull, true, this.m.ref.null(this.t.FieldsRefNull));
+    // Registry of data-variant field NAMES (a $Names array per variant id), for
+    // runtime field-access-by-name (filled in $main).
+    this.m.addGlobal("$variant_names", this.t.FieldsRefNull, true, this.m.ref.null(this.t.FieldsRefNull));
     const m = this.m;
     const stmts = block.kids.filter((k) => k.name === "stmt");
 
@@ -140,6 +143,8 @@ class Compiler {
     }
     // Build the data-variant method registry: $variant_methods[id] = methods object.
     this.initVariantMethods(ctx, body);
+    // Build the data-variant field-name registry: $variant_names[id] = $Names array.
+    this.initVariantNames(ctx, body);
     const skipTop = new Set(["fun-expr", "data-expr", "type-expr", "newtype-expr", "contract-stmt"]);
     const runnable = stmts.filter((s) => !skipTop.has(this.stmtInner(s).name));
     let printed = false;
@@ -261,6 +266,20 @@ class Compiler {
     const reg = () => m.ref.cast(m.global.get("$variant_methods", this.t.FieldsRefNull), this.t.FieldsRef);
     for (const v of withMethods) {
       body.push(m.array.set(reg(), m.i32.const(v.id), this.makeMethodsObject(v.methods!, ctx)));
+    }
+  }
+  // Populate $variant_names[id] with the variant's field-name list ($Names array),
+  // for every variant that has fields (emitted into $main's body).
+  private initVariantNames(ctx: Ctx, body: number[]) {
+    const m = this.m;
+    const withFields = [...this.variants.values()].filter((v) => v.fields.length > 0);
+    if (withFields.length === 0) return;
+    const nulls = Array.from({ length: this.nextVariantId }, () => m.ref.null(binaryen.anyref));
+    body.push(m.global.set("$variant_names", m.array.new_fixed(this.t.Fields, nulls)));
+    const reg = () => m.ref.cast(m.global.get("$variant_names", this.t.FieldsRefNull), this.t.FieldsRef);
+    for (const v of withFields) {
+      const names = v.fields.map((f) => this.strLiteralRaw(f));
+      body.push(m.array.set(reg(), m.i32.const(v.id), m.array.new_fixed(this.t.Names, names)));
     }
   }
   // An $Object holding a variant's methods (name -> $Method closure), self-bound.
@@ -733,17 +752,22 @@ class Compiler {
     // `_` curry: `_.field` -> `lam($c): $c.field end`.
     const curD = this.curryOver(node, [objExpr], ctx);
     if (curD !== null) return curD;
-    // Field access by name on a data variant (`n.v`): if `v` names a variant field
-    // at an unambiguous index, read it positionally; dispatch at runtime so the
-    // same `.v` still works on plain objects.
-    const vidx = this.variantFieldIndex(name);
-    if (vidx !== null) {
+    // Field access by name on a data variant (`n.v`): if any variant has a field
+    // named `v`, resolve the index at RUNTIME from the value's actual variant layout
+    // (variants of one type can share a name at different indices), via
+    // $variant_field_by_name; plain objects still use $obj_get.
+    if (this.variantHasField(name)) {
       const tmp = ctx.addLocal(binaryen.anyref);
       const get = () => m.local.get(tmp, binaryen.anyref);
+      const vcast = () => m.ref.cast(get(), this.t.VariantRef);
+      const names = () => m.ref.cast(
+        m.array.get(m.ref.cast(m.global.get("$variant_names", this.t.FieldsRefNull), this.t.FieldsRef),
+          m.call("$variant_id", [vcast()], binaryen.i32), binaryen.anyref, false),
+        this.t.NamesRef);
       return m.block(null, [
         m.local.set(tmp, this.compileExpr(objExpr, ctx, false)),
         m.if(m.ref.test(get(), this.t.VariantRefNull),
-          m.call("$variant_field", [m.ref.cast(get(), this.t.VariantRef), m.i32.const(vidx)], binaryen.anyref),
+          m.call("$variant_field_by_name", [vcast(), names(), this.strLiteralRaw(name)], binaryen.anyref),
           m.call("$obj_get", [m.ref.cast(get(), this.t.ObjectRef), this.strLiteralRaw(name)], binaryen.anyref),
           binaryen.anyref),
       ], binaryen.anyref);
@@ -786,15 +810,11 @@ class Compiler {
     return this.buildClosureFromParts(params, block, ctx, "$cur_");
   }
 
-  // The unambiguous positional index of a data-variant field named `name`, or null
-  // if no variant has it (or variants disagree on its index).
-  private variantFieldIndex(name: string): number | null {
-    let idx: number | null = null;
-    for (const v of this.variants.values()) {
-      const i = v.fields.indexOf(name);
-      if (i >= 0) { if (idx === null) idx = i; else if (idx !== i) return null; }
-    }
-    return idx;
+  // Whether any data variant has a field named `name` (so `.name` should attempt
+  // runtime variant field-access-by-name).
+  private variantHasField(name: string): boolean {
+    for (const v of this.variants.values()) if (v.fields.includes(name)) return true;
+    return false;
   }
 
   // Process prelude import/include statements (see compileProgram).
@@ -1055,6 +1075,10 @@ class Compiler {
           m.call("$num_to_i32", [args[1]!], binaryen.i32), args[2]!),
         m.local.get(a, binaryen.anyref),
       ], binaryen.anyref);
+    }
+    // raw-array-of(elt, n) -> a fresh $Fields of length n, every slot = elt.
+    if (name === "raw-array-of" && args.length === 2) {
+      return m.array.new(this.t.Fields, m.call("$num_to_i32", [args[1]!], binaryen.i32), args[0]!);
     }
     if ((name === "print" || name === "display" || name === "print-error") && args.length === 1) {
       const argLocal = ctx.addLocal(binaryen.anyref);

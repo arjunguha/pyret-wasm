@@ -272,6 +272,30 @@ export class Runtime {
       ], binaryen.anyref);
       m.addFunction("$obj_get", binaryen.createType([t.ObjectRef, t.StrRef]), binaryen.anyref, [t.NamesRef, I, I], body);
     }
+    // $variant_field_by_name(v, names, name) -> anyref. Resolves a data-variant field
+    // by NAME at runtime (scan the variant's field-name list, return the field at the
+    // matching index). Needed because variants of one type can share field names at
+    // DIFFERENT positional indices, so the index can't be picked at compile time.
+    {
+      const v = () => m.local.get(0, t.VariantRef);
+      const names = () => m.local.get(1, t.NamesRef);
+      const name = () => m.local.get(2, t.StrRef);
+      const i = () => m.local.get(3, I), n = () => m.local.get(4, I);
+      const body = m.block("ret", [
+        m.local.set(4, m.array.len(names())),
+        m.local.set(3, m.i32.const(0)),
+        m.block("done", [m.loop("lp", m.block(null, [
+          m.if(m.i32.ge_s(i(), n()), m.br("done")),
+          m.if(m.call("$str_equal", [m.array.get(names(), i(), t.StrRef, false), name()], I),
+            m.br("ret", undefined, m.call("$variant_field", [v(), i()], binaryen.anyref))),
+          m.local.set(3, m.i32.add(i(), m.i32.const(1))),
+          m.br("lp"),
+        ]))]),
+        m.call("$err_no_field", [], binaryen.anyref),
+      ], binaryen.anyref);
+      m.addFunction("$variant_field_by_name",
+        binaryen.createType([t.VariantRef, t.NamesRef, t.StrRef]), binaryen.anyref, [I, I], body);
+    }
     // $obj_equal(a, b) -> i32  (same field names in order, values equal)
     {
       const a = () => m.local.get(0, t.ObjectRef), b = () => m.local.get(1, t.ObjectRef);

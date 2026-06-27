@@ -37,3 +37,34 @@ test("sets: member / size (dedup) / add / union", async () => {
   expect(await result(`[set: 1, 2, 3].union([set: 3, 4, 5]).size()`)).toBe("5");
   expect(await result(`[set: ].size()`)).toBe("0");
 });
+
+test("field access by name dispatches on the value's actual variant (shared name, different index)", async () => {
+  // `x` is index 0 in circ but index 2 in rect; reading `.x` through a common-typed
+  // binding must resolve at runtime, not pick one compile-time index.
+  const prog = `
+data Shape:
+  | circ(x, y, r)
+  | rect(w, h, x, y)
+end
+fun get-x(s): s.x end
+get-x(circ(1, 2, 3)) + get-x(rect(10, 20, 7, 8))`;
+  expect(await result(prog)).toBe("8"); // 1 + 7
+});
+
+test("field access by name: same field across all variants", async () => {
+  const prog = `
+data Tree:
+  | leaf(value)
+  | node(value, left, right)
+end
+fun val(t): t.value end
+val(leaf(5)) + val(node(9, leaf(1), leaf(2)))`;
+  expect(await result(prog)).toBe("14"); // 5 + 9
+});
+
+test("raw-array builders: raw-array-of / from-list / map", async () => {
+  expect(await result(`raw-array-length(raw-array-of(7, 5))`)).toBe("5");
+  expect(await result(`raw-array-get(raw-array-of(7, 5), 3)`)).toBe("7");
+  expect(await result(`sum(raw-array-to-list(raw-array-from-list([list: 4, 5, 6])))`)).toBe("15");
+  expect(await result(`sum(raw-array-to-list(raw-array-map(lam(x): x * x end, [raw-array: 2, 3, 4])))`)).toBe("29");
+});

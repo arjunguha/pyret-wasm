@@ -49,7 +49,7 @@ const INTRINSICS = new Set([
   "raise", "tostring", "to-string", "torepr", "to-repr",
   "string-length", "string-to-code-points", "string-from-code-point",
   "num-modulo", "num-quotient",
-  "raw-array-get", "raw-array-length", "raw-array-set",
+  "raw-array-get", "raw-array-length", "raw-array-set", "raw-array-of",
   "emit-byte", "identical", "print", "display", "print-error",
 ]);
 

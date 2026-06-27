@@ -259,6 +259,17 @@ fun raw-array-fold(f, init, arr, start):
   fun ra-floop(i, n, acc): if i >= n: acc else: ra-floop(i + 1, n, f(acc, raw-array-get(arr, i), i + start)) end end
   ra-floop(0, raw-array-length(arr), init)
 end
+fun raw-array-from-list(l):
+  arr = raw-array-of(0, length(l))
+  fun ra-fill(i, xs): cases(List) xs: | empty => arr | link(f, r) => block: raw-array-set(arr, i, f) ra-fill(i + 1, r) end end end
+  ra-fill(0, l)
+end
+fun raw-array-map(f, arr):
+  n = raw-array-length(arr)
+  res = raw-array-of(0, n)
+  fun ra-mloop(i): if i >= n: res else: block: raw-array-set(res, i, f(raw-array-get(arr, i))) ra-mloop(i + 1) end end end
+  ra-mloop(0)
+end
 
 # ---- string-dict (immutable assoc; latest write wins). Built from a key/value
 # data type (not tuples) so the stoppable CPS transform handles the prelude. ----
