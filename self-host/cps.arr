@@ -1,9 +1,9 @@
 #lang pyret
-# PORT of src/compiler/cps.ts — the Pyret->Pyret CPS transform for STOPPABLE codegen.
+# PORT of src/compiler/cps.ts — the Pyret->Pyret CPS cps-transform for STOPPABLE codegen.
 # Written in Pyret so the self-hosted compiler can produce stoppable code itself.
 #
 # SKETCH STATUS: faithful 1:1 port of cps.ts. Not yet run end-to-end (no parser
-# binding here yet — `transform` takes an already-parsed CstNode). Mirrors cps.ts
+# binding here yet — `cps-transform` takes an already-parsed CstNode). Mirrors cps.ts
 # function-for-function so a side-by-side diff is legible. TODO(port) marks the few
 # spots that need wiring (gensym state, CstNode provider).
 #
@@ -19,7 +19,7 @@ data Cont:
   | k-fn(apply :: (String -> String))
 end
 
-# ---- transform state (mirrors the Cps class fields) ----
+# ---- cps-transform state (mirrors the Cps class fields) ----
 var g :: Number = 0
 var ctors :: List<String> = empty           # data constructor names (primitive calls)
 var fun-defs :: List<String> = empty         # names defined by `fun` (shadow ctors)
@@ -54,13 +54,26 @@ intrinsics :: List<String> = [list:
   "emit-byte", "identical", "print", "display", "print-error" ]
 
 # ---- CstNode helpers (mirror only/child) ----
+# NB: the shared prelude's `find` returns the bare element (or `false`), NOT an
+# Option like standard Pyret. cps.ts/cps.arr were written against an Option-returning
+# find, so we provide local Option/raise variants here and route every find through them.
+fun find-opt<a>(f :: (a -> Boolean), l :: List<a>) -> Option<a>:
+  cases(List) l:
+    | empty => none
+    | link(fst, r) => if f(fst): some(fst) else: find-opt(f, r) end
+  end
+end
+fun find-bang<a>(f :: (a -> Boolean), l :: List<a>) -> a:
+  cases(Option) find-opt(f, l): | some(x) => x | none => raise("find-bang: not found") end
+end
+
 fun only(n :: CstNode) -> CstNode:
   cases(List) n.kids: | link(f, r) => f | empty => raise("expected single child of " + n.name) end
 end
 fun child(n :: CstNode, nm :: String) -> Option<CstNode>:
-  find(lam(k): k.name == nm end, n.kids)
+  find-opt(lam(k): k.name == nm end, n.kids)
 end
-fun child!(n :: CstNode, nm :: String) -> CstNode:
+fun child-bang(n :: CstNode, nm :: String) -> CstNode:
   cases(Option) child(n, nm): | some(c) => c | none => raise("missing child " + nm) end
 end
 
@@ -117,7 +130,7 @@ fun as-dot(node :: CstNode) -> DotR:
         ((cur.name == "expr") or (cur.name == "binop-expr") or (cur.name == "prim-expr")):
       loop(cur.kids.first)
     else if cur.name == "dot-expr":
-      a-dot(cur.kids.first, child!(cur, "NAME").value.or-else("_"))
+      a-dot(cur.kids.first, child-bang(cur, "NAME").value.or-else("_"))
     else: no-dot
     end
   end
@@ -165,7 +178,7 @@ fun reifyk(k :: Cont) -> String:
   end
 end
 
-# ---- the core transform: emit source that computes `node` and feeds it to k ----
+# ---- the core cps-transform: emit source that computes `node` and feeds it to k ----
 fun t(node :: CstNode, k :: Cont) -> String:
   ask:
     | (node.name == "expr") or (node.name == "prim-expr") then: t(only(node), k)
@@ -173,7 +186,7 @@ fun t(node :: CstNode, k :: Cont) -> String:
       if node.kids.length() == 1: t(node.kids.first, k) else: raise("check-test not supported in CPS") end
     | node.name == "binop-expr" then:
       if node.kids.length() == 1: t(node.kids.first, k) else: t-binop(node, k) end
-    | node.name == "paren-expr" then: t(child!(node, "binop-expr"), k)
+    | node.name == "paren-expr" then: t(child-bang(node, "binop-expr"), k)
     | (node.name == "num-expr") or (node.name == "frac-expr") or (node.name == "rfrac-expr") then:
       applyk(k, only(node).value.or-else("0"))
     | node.name == "string-expr" then: applyk(k, only(node).value.or-else(""))
@@ -185,9 +198,9 @@ fun t(node :: CstNode, k :: Cont) -> String:
     | node.name == "for-expr" then: t-for(node, k)
     | node.name == "construct-expr" then: t-construct(node, k)
     | node.name == "dot-expr" then:
-      t(node.kids.first, k-fn(lam(vo): applyk(k, vo + "." + child!(node, "NAME").value.or-else("_")) end))
+      t(node.kids.first, k-fn(lam(vo): applyk(k, vo + "." + child-bang(node, "NAME").value.or-else("_")) end))
     | node.name == "lambda-expr" then: applyk(k, cps-lambda(node))
-    | node.name == "user-block-expr" then: t-block(child!(node, "block"), k)
+    | node.name == "user-block-expr" then: t-block(child-bang(node, "block"), k)
     | otherwise: raise("unsupported expression in CPS: " + node.name)
   end
 end
@@ -258,7 +271,7 @@ end
 fun join-args(vs :: List<String>) -> String: string-join(vs, ", ") end
 
 fun t-construct(node :: CstNode, k :: Cont) -> String:
-  ctor-node = child!(node, "binop-expr")
+  ctor-node = child-bang(node, "binop-expr")
   ctor-name = cases(Option) simple-name(ctor-node): | some(n) => n | none => "list" end
   elems = cases(Option) child(node, "trailing-opt-comma-binops"):
     | none => empty
@@ -270,16 +283,16 @@ end
 
 fun t-if(node :: CstNode, k :: Cont) -> String:
   kids = node.kids
-  cond = find(lam(x): x.name == "binop-expr" end, kids).value
+  cond = find-bang(lam(x): x.name == "binop-expr" end, kids)
   blocks = filter(lam(x): x.name == "block" end, kids)
   elseifs = filter(lam(x): x.name == "else-if" end, kids)
-  has-else = is-some(find(lam(x): x.name == "ELSECOLON" end, kids))
+  has-else = is-some(find-opt(lam(x): x.name == "ELSECOLON" end, kids))
   when not(has-else): raise("if without else not supported in CPS") end
   fun if-expr(vc :: String, kf :: Cont) -> String:
     base = "if " + vc + ": " + t-block(blocks.first, kf)
     mid = for fold(acc from base, ei from elseifs):
-      ec = find(lam(x): x.name == "binop-expr" end, ei.kids).value
-      eb = find(lam(x): x.name == "block" end, ei.kids).value
+      ec = find-bang(lam(x): x.name == "binop-expr" end, ei.kids)
+      eb = find-bang(lam(x): x.name == "block" end, ei.kids)
       acc + " else if " + render-pure(ec) + ": " + t-block(eb, kf)
     end
     mid + " else: " + t-block(blocks.get(blocks.length() - 1), kf) + " end"
@@ -311,21 +324,21 @@ end
 
 fun t-cases(node :: CstNode, k :: Cont) -> String:
   ty = render-ann(child(node, "ann"))
-  scrut = find(lam(x): x.name == "binop-expr" end, node.kids).value
+  scrut = find-bang(lam(x): x.name == "binop-expr" end, node.kids)
   branches = filter(lam(x): x.name == "cases-branch" end, node.kids)
   # else block (after the ELSE token) — TODO(port): index-based slice as in tCases
   else-block = find-else-block(node)
   fun emit(vscrut :: String, kf :: Cont) -> String:
     base = "cases(" + ty + ") " + vscrut + ":"
     body = for fold(acc from base, br from branches):
-      vname = child!(br, "NAME").value.or-else("_")
+      vname = child-bang(br, "NAME").value.or-else("_")
       binds = cases(Option) child(br, "cases-args"):
         | none => empty
         | some(an) => map(lam(cb): binding-name(cases(Option) child(cb, "binding"): | some(b) => b | none => cb end) end,
                           filter(lam(x): x.name == "cases-binding" end, an.kids))
       end
       hd = if is-empty(binds): vname else: vname + "(" + join-args(binds) + ")" end
-      acc + " | " + hd + " => " + t-block(child!(br, "block"), kf)
+      acc + " | " + hd + " => " + t-block(child-bang(br, "block"), kf)
     end
     full = cases(Option) else-block: | some(eb) => body + " | else => " + t-block(eb, kf) | none => body end
     full + " end"
@@ -343,11 +356,11 @@ fun find-else-block(node :: CstNode) -> Option<CstNode>: none end
 
 # for ITER(p from e, ...): body end  ==>  ITER(lam(p,...,KG): yield-check(...) end, e..., reify k)
 fun t-for(node :: CstNode, k :: Cont) -> String:
-  iter-expr = find(lam(x): x.name == "expr" end, node.kids).value
+  iter-expr = find-bang(lam(x): x.name == "expr" end, node.kids)
   binds = filter(lam(x): x.name == "for-bind" end, node.kids)
-  params = map(lam(b): binding-name(child!(b, "binding")) end, binds)
-  from-exprs = map(lam(b): find(lam(x): x.name == "binop-expr" end, b.kids).value end, binds)
-  body = child!(node, "block")
+  params = map(lam(b): binding-name(child-bang(b, "binding")) end, binds)
+  from-exprs = map(lam(b): find-bang(lam(x): x.name == "binop-expr" end, b.kids) end, binds)
+  body = child-bang(node, "block")
   kg = gensym("k")
   lam-body = t-block(body, k-var(kg))
   lam-src = "lam(" + join-args(params + [list: kg]) + "): yield-check(lam(): " + lam-body + " end) end"
@@ -370,8 +383,8 @@ fun render-pure(node :: CstNode) -> String:
         end
         loop(1, render-pure(node.kids.first))
       end
-    | node.name == "paren-expr" then: "(" + render-pure(child!(node, "binop-expr")) + ")"
-    | node.name == "dot-expr" then: render-pure(node.kids.first) + "." + child!(node, "NAME").value.or-else("_")
+    | node.name == "paren-expr" then: "(" + render-pure(child-bang(node, "binop-expr")) + ")"
+    | node.name == "dot-expr" then: render-pure(node.kids.first) + "." + child-bang(node, "NAME").value.or-else("_")
     | (node.name == "num-expr") or (node.name == "frac-expr") or (node.name == "rfrac-expr") or (node.name == "string-expr") then:
       only(node).value.or-else("0")
     | node.name == "bool-expr" then: if only(node).name == "TRUE": "true" else: "false" end
@@ -408,47 +421,47 @@ fun t-stmts(stmts :: List<CstNode>, i :: Number, k :: Cont) -> String:
 end
 
 fun cps-fun-def(fn-expr :: CstNode) -> String:
-  name = child!(fn-expr, "NAME").value.or-else("_")
+  name = child-bang(fn-expr, "NAME").value.or-else("_")
   params = header-params(fn-expr)
   kg = gensym("k")
-  body = t-block(child!(fn-expr, "block"), k-var(kg))
+  body = t-block(child-bang(fn-expr, "block"), k-var(kg))
   "fun " + name + "(" + join-args(params + [list: kg]) + "): yield-check(lam(): " + body + " end) end"
 end
 
 fun cps-lambda(node :: CstNode) -> String:
   params = header-params(node)
   kg = gensym("k")
-  body = t-block(child!(node, "block"), k-var(kg))
+  body = t-block(child-bang(node, "block"), k-var(kg))
   "lam(" + join-args(params + [list: kg]) + "): yield-check(lam(): " + body + " end) end"
 end
 
 fun render-data(node :: CstNode) -> String:
-  ty-name = child!(node, "NAME").value.or-else("_")
+  ty-name = child-bang(node, "NAME").value.or-else("_")
   variants = filter(lam(k): (k.name == "data-variant") or (k.name == "first-data-variant") end, node.kids)
   parts = map(lam(v):
       cases(Option) child(v, "variant-constructor"):
         | some(ctor) =>
-          nm = child!(ctor, "NAME").value.or-else("_")
+          nm = child-bang(ctor, "NAME").value.or-else("_")
           fields = cases(Option) child(ctor, "variant-members"):
             | none => empty
-            | some(m) => map(lam(vm): binding-name(child!(vm, "binding")) end,
+            | some(m) => map(lam(vm): binding-name(child-bang(vm, "binding")) end,
                              filter(lam(k): k.name == "variant-member" end, m.kids))
           end
           nm + "(" + join-args(fields) + ")"
-        | none => child!(v, "NAME").value.or-else("_")
+        | none => child-bang(v, "NAME").value.or-else("_")
       end
     end, variants)
   "data " + ty-name + ": " + string-join(map(lam(p): "| " + p end, parts), " ") + " end"
 end
 
 # ---- top level ----
-fun transform(program :: CstNode) -> String block:
+fun cps-transform(program :: CstNode) -> String block:
   g := 0
   ctors := empty
   fun-defs := empty
   collect-data(program)
   collect-fun-defs(program)
-  block = child!(program, "block")
+  block = child-bang(program, "block")
   stmts = map(only, filter(lam(x): x.name == "stmt" end, block.kids))
   decls = for fold(acc from empty, s from stmts):
     ask: | s.name == "data-expr" then: acc + [list: render-data(s)]

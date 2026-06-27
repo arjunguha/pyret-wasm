@@ -26,6 +26,8 @@ const SKIP_MODULES = new Set([
   "arrays", "sets", "string-dict", "s-exp", "s-exp-structs", "ffi",
   "contracts", "checker", "tables", "table", "render-error-display",
 ]);
+// NB: `either` is skipped — Either/left/right are prelude-provided so the prelude's
+// fold-while can use them; equality/error are NOT skipped (loaded as real modules).
 
 function findDescendant(node: CstNode, name: string): CstNode | undefined {
   if (node.name === name) return node;

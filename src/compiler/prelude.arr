@@ -2,6 +2,7 @@ data List:
   | empty
   | link(first, rest)
 sharing:
+  method _plus(self, other): append(self, other) end,
   method map(self, f): map(f, self) end,
   method filter(self, p): filter(p, self) end,
   method foldl(self, f, init): foldl(f, init, self) end,
@@ -243,6 +244,31 @@ fun map2(f, a, b):
       end
   end
 end
+# multi-list map/each (lockstep; stop at the shortest list)
+fun map3(f, a, b, c):
+  cases(List) a: | empty => empty
+    | link(fa, ra) => cases(List) b: | empty => empty
+      | link(fb, rb) => cases(List) c: | empty => empty
+        | link(fc, rc) => link(f(fa, fb, fc), map3(f, ra, rb, rc)) end end end
+end
+fun map4(f, a, b, c, d):
+  cases(List) a: | empty => empty
+    | link(fa, ra) => cases(List) b: | empty => empty
+      | link(fb, rb) => cases(List) c: | empty => empty
+        | link(fc, rc) => cases(List) d: | empty => empty
+          | link(fd, rd) => link(f(fa, fb, fc, fd), map4(f, ra, rb, rc, rd)) end end end end
+end
+fun each2(f, a, b):
+  cases(List) a: | empty => nothing
+    | link(fa, ra) => cases(List) b: | empty => nothing
+      | link(fb, rb) => block: f(fa, fb) each2(f, ra, rb) end end end
+end
+fun each3(f, a, b, c):
+  cases(List) a: | empty => nothing
+    | link(fa, ra) => cases(List) b: | empty => nothing
+      | link(fb, rb) => cases(List) c: | empty => nothing
+        | link(fc, rc) => block: f(fa, fb, fc) each3(f, ra, rb, rc) end end end end
+end
 
 # index of first element satisfying pred, or -1.
 fun find-index(pred, lst):
@@ -279,6 +305,24 @@ fun each_n(f, num, lst):
 end
 fun fold_n(f, num, base, lst):
   cases(List) lst: | empty => base | link(fst, rst) => fold_n(f, num + 1, f(num, base, fst), rst) end
+end
+# fold from the left while f returns left(acc); stop with right(v). (lists.fold-while)
+fun fold-while(f, base, lst):
+  cases(List) lst:
+    | empty => base
+    | link(elt, r) =>
+      cases(Either) f(base, elt):
+        | left(v) => fold-while(f, v, r)
+        | right(v) => v
+      end
+  end
+end
+# index of the first element satisfying pred (or -1); and Option variants used by the front-end.
+fun find-index(pred, lst):
+  fun helper(i, l):
+    cases(List) l: | empty => 0 - 1 | link(fst, rst) => if pred(fst): i else: helper(i + 1, rst) end end
+  end
+  helper(0, lst)
 end
 
 fun find(f, l):
@@ -380,13 +424,16 @@ fun image-height(img):
   end
 end
 
-# ---- raw arrays (primitive: a $Fields cell; get/length/set/of are intrinsics) ----
-# First-class wrappers so these names can be passed as VALUES (e.g. `rag = raw-array-get`),
-# not just called. The bodies call the `prim-` intrinsics so they don't recurse.
-fun raw-array-get(arr, i): prim-raw-array-get(arr, i) end
-fun raw-array-set(arr, i, v): prim-raw-array-set(arr, i, v) end
-fun raw-array-length(arr): prim-raw-array-length(arr) end
-fun raw-array-of(elt, n): prim-raw-array-of(elt, n) end
+# ---- raw arrays (primitive: a $Fields cell; get/length/set are intrinsics) ----
+# First-class wrappers: the bodies' calls resolve to the compileApp INTRINSICS (by
+# name, args-arity), so these don't recurse; defining them as globals makes the names
+# resolvable as values (`rag = raw-array-get`, `map(raw-array-get, ...)`) and through
+# the skipped `arrays` module alias (`arrays.raw-array-get`).
+fun raw-array-get(a, i): prim-raw-array-get(a, i) end
+fun raw-array-set(a, i, v): prim-raw-array-set(a, i, v) end
+fun raw-array-length(a): prim-raw-array-length(a) end
+fun raw-array-of(v, n): prim-raw-array-of(v, n) end
+
 fun raw-array-to-list(arr):
   fun ra-loop(i, n): if i >= n: empty else: link(raw-array-get(arr, i), ra-loop(i + 1, n)) end end
   ra-loop(0, raw-array-length(arr))
@@ -566,6 +613,18 @@ fun partition(pred, l):
 end
 fun list-to-set(l): set-from-list(l) end
 fun list-to-tree-set(l): set-from-list(l) end
+fun list-to-list-set(l): set-from-list(l) end
+# Some front-end code refers to the sets module by NAME (e.g. `sets.list-to-list-set`)
+# rather than via its `import sets as S` alias; expose a global `sets` object so those
+# qualified references resolve to the prelude-provided set API.
+sets = {
+  list-to-set: list-to-set,
+  list-to-tree-set: list-to-tree-set,
+  list-to-list-set: list-to-list-set,
+  empty-set: empty-set,
+  empty-list-set: empty-list-set,
+  empty-tree-set: empty-tree-set
+}
 fun string-join(l, sep):
   cases(List) l:
     | empty => ""
@@ -591,3 +650,42 @@ fun string-split(s, sep):
   end
 end
 fun string-replace(s, find, repl): string-join(string-split-all(s, find), repl) end
+
+# take-while: returns a 2-tuple {longest-prefix-where-pred-holds ; the-rest}
+fun take-while(pred, lst):
+  cases(List) lst:
+    | empty => { empty; empty }
+    | link(f, r) =>
+      if pred(f):
+        tw = take-while(pred, r)
+        { link(f, tw.{0}); tw.{1} }
+      else: { empty; lst }
+      end
+  end
+end
+
+# split-at: returns a record with .prefix (first n) and .suffix (the rest)
+data SplitAtResult: | split-at-result(prefix, suffix) end
+fun split-at(n, lst):
+  if n <= 0: split-at-result(empty, lst)
+  else:
+    cases(List) lst:
+      | empty => split-at-result(empty, empty)
+      | link(f, r) =>
+        sub = split-at(n - 1, r)
+        split-at-result(link(f, sub.prefix), sub.suffix)
+    end
+  end
+end
+
+# fold2: fold over two lists in lockstep; f(acc, e1, e2). Stops at the shorter list.
+fun fold2(f, base, l1, l2):
+  cases(List) l1:
+    | empty => base
+    | link(a, ra) =>
+      cases(List) l2:
+        | empty => base
+        | link(b, rb) => fold2(f, f(base, a, b), ra, rb)
+      end
+  end
+end
