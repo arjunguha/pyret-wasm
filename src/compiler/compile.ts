@@ -1236,6 +1236,12 @@ class Compiler {
     if (name === "string-length" && args.length === 1) {
       return m.call("$string_length", [m.ref.cast(args[0]!, this.t.StrRef)], this.t.FixnumRef);
     }
+    // time-now(): wall-clock ms. Only used for timing/telemetry in the compiler
+    // (elapsed-time diffs), so a deterministic 0 stub is sufficient and avoids a
+    // nondeterministic host import.
+    if (name === "time-now" && args.length === 0) {
+      return m.call("$make_fix", [m.i64.const(0n)], this.t.FixnumRef);
+    }
     if (name === "string-to-code-points" && args.length === 1) {
       return m.call("$str_to_codepoints", [m.ref.cast(args[0]!, this.t.StrRef)], binaryen.anyref);
     }
