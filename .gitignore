@@ -1,0 +1,11 @@
+node_modules/
+*.wasm
+.DS_Store
+dist/
+# Vendored upstream Pyret checkout (~943MB: parser, baseline compiler, corpus source).
+# Large; obtained separately. Our editable copies live in self-compiler/ and test-corpus/.
+pyret/
+# generated web bundles (build with: bun run build:web)
+web/main.bundle.js
+web/worker.bundle.js
+web/parser-bundle.js

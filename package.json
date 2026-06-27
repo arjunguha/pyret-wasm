@@ -1,0 +1,31 @@
+{
+  "name": "pyret-wasm",
+  "version": "0.0.1",
+  "description": "A WebAssembly-based compiler and runtime for the Pyret programming language",
+  "type": "module",
+  "module": "src/cli.ts",
+  "bin": {
+    "pyretc": "src/cli.ts"
+  },
+  "scripts": {
+    "pyretc": "bun run src/cli.ts",
+    "test": "bun test ./test",
+    "build:parser": "bun scripts/gen-parser-bundle.ts",
+    "build:web": "bun scripts/gen-parser-bundle.ts && bun build web/main.ts --target=browser --outfile=web/main.bundle.js",
+    "serve": "bun scripts/serve.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "binaryen": "^130.0.0",
+    "command-line-args": "^6.0.2",
+    "js-md5": "^0.8.3",
+    "js-sha256": "^0.11.1",
+    "node-uuid": "^1.4.8",
+    "puppeteer-core": "^25.2.1",
+    "requirejs": "^2.3.8",
+    "s-expression": "^3.1.1",
+    "seedrandom": "^3.0.5",
+    "sha.js": "^2.4.12",
+    "wabt": "^1.0.39"
+  }
+}

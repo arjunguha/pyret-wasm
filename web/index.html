@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pyret (WebAssembly)</title>
+<link rel="stylesheet" href="./vendor/codemirror.css" />
+<style>
+  :root { --hdr:#317bcf; --bg:#f4f6f8; --panel:#fff; --border:#d4dbe0; --muted:#7a8a99; --err:#c0392b; --ok:#1e8449; --prompt:#3b78c3; }
+  /* box-sizing: border-box for our chrome only — NOT a universal rule, which
+     breaks CodeMirror's gutter/line-number positioning (it assumes content-box). */
+  header, .toolbar, button, main, .pane, .pane-title, .editor-wrap,
+  #interactions, .promptbar, #repl, .status { box-sizing: border-box; }
+  html, body { margin:0; height:100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); }
+  header { background:var(--hdr); color:#fff; padding:8px 16px; display:flex; align-items:center; gap:14px; box-shadow:0 1px 4px rgba(0,0,0,.2); }
+  header h1 { font-size:17px; margin:0; font-weight:600; letter-spacing:.3px; }
+  header .sub { font-size:12px; opacity:.85; }
+  .toolbar { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  button { font-size:14px; padding:6px 16px; border:0; border-radius:5px; cursor:pointer; font-weight:600; }
+  #run { background:#27ae60; color:#fff; }
+  #run:disabled { background:#9bd3b2; cursor:default; }
+  #stop { background:#e74c3c; color:#fff; }
+  #stop:disabled { background:#f0b0a8; cursor:default; }
+  main { display:flex; height:calc(100% - 50px); }
+  .pane { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
+  .pane.left { border-right:1px solid var(--border); }
+  .pane-title { font-size:12px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding:6px 12px; background:#eef2f5; border-bottom:1px solid var(--border); display:flex; }
+  .pane-title .hint { margin-left:auto; text-transform:none; letter-spacing:0; opacity:.8; }
+  /* Editor fills the pane all the way to the bottom regardless of content. */
+  .editor-wrap { flex:1; min-height:0; position:relative; background:var(--panel); }
+  .editor-wrap .CodeMirror { position:absolute; top:0; left:0; right:0; bottom:0; height:auto; }
+  .CodeMirror { font-family:"SF Mono", Menlo, Consolas, monospace; font-size:14px; line-height:1.5; }
+  /* The gutter background/border only spans content height by default; make the
+     line-number column run the full editor height (so it doesn't look truncated). */
+  .editor-wrap .CodeMirror-gutters { height: 100% !important; border-right:1px solid var(--border); }
+  /* A little gap so line numbers don't touch the leading edge of each line. */
+  .CodeMirror-linenumber { padding: 0 8px 0 5px; }
+  /* The vendored codemirror.css is MISSING this rule, so the per-line gutter
+     wrapper stayed position:static and its left:-Npx offset was ignored — line
+     numbers rendered on top of the code. Restore CodeMirror's stock rule. */
+  .CodeMirror-gutter-wrapper { position: absolute !important; z-index: 4; background: none !important; border: none !important; }
+  #interactions { flex:1; margin:0; padding:8px 12px; overflow:auto; font-family:"SF Mono", Menlo, Consolas, monospace; font-size:14px; line-height:1.5; white-space:pre-wrap; background:var(--panel); }
+  .out-err { color:var(--err); }
+  .out-muted { color:var(--muted); }
+  canvas.pyret-image { display:inline-block; vertical-align:top; margin:4px 0; background:#fff; }
+  .out-ok { color:var(--ok); }
+  .repl-echo { color:var(--prompt); font-weight:600; }
+  .promptbar { display:flex; align-items:center; border-top:1px solid var(--border); background:var(--panel); padding:0 8px; }
+  .promptbar .caret { color:var(--prompt); font-weight:700; padding:0 6px; }
+  #repl { flex:1; border:0; outline:none; padding:8px 4px; font-family:"SF Mono", Menlo, Consolas, monospace; font-size:14px; background:transparent; }
+  .status { font-size:12px; color:var(--muted); padding:4px 12px; border-top:1px solid var(--border); background:#eef2f5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pyret</h1>
+  <span class="sub">on WebAssembly</span>
+  <div class="toolbar">
+    <button id="run">Run ▶</button>
+    <button id="stop" disabled>Stop ■</button>
+  </div>
+</header>
+<main>
+  <section class="pane left">
+    <div class="pane-title">Definitions <span class="hint">⌘/Ctrl-Enter to run</span></div>
+    <div class="editor-wrap">
+    <textarea id="editor" spellcheck="false">fun fact(n):
+  if n <= 1: 1 else: n * fact(n - 1) end
+end
+
+check "factorial":
+  fact(5) is 120
+  map(lam(x): x * x end, [list: 1, 2, 3]) is [list: 1, 4, 9]
+end
+
+fact(20)</textarea>
+    </div>
+  </section>
+  <section class="pane">
+    <div class="pane-title">Interactions</div>
+    <div id="interactions"></div>
+    <div class="promptbar">
+      <span class="caret">›</span>
+      <input id="repl" spellcheck="false" autocomplete="off" placeholder="type an expression and press Enter" disabled />
+    </div>
+    <div class="status" id="status">loading…</div>
+  </section>
+</main>
+<script src="./vendor/codemirror.js"></script>
+<script src="./vendor/pyret-mode.js"></script>
+<script src="./image.js"></script>
+<script src="./ide.js"></script>
+<script type="module" src="./main.bundle.js"></script>
+</body>
+</html>
