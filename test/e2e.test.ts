@@ -245,6 +245,16 @@ test("var + assignment (:=) and tostring", async () => {
   expect(await evalPyret('tostring([list: 1, 2])')).toBe("[list: 1, 2]");
 });
 
+test("data variant methods (with: per-variant, sharing: shared, self-bound dispatch)", async () => {
+  expect(await evalPyret(
+    "data T:\n  | v(a) with: method m(self): self.a + 1 end\n  | w(b) with: method m(self): self.b * 10 end\nsharing:\n  method tag(self): 99 end\nend\n(v(5).m() + w(3).m()) + v(0).tag()")).toBe("135");
+  // method with args that calls another method on self
+  expect(await evalPyret(
+    "data Pt:\n  | pt(x, y) with:\n    method dist-sq(self): (self.x * self.x) + (self.y * self.y) end,\n    method scaled(self, k): pt(self.x * k, self.y * k) end\nend\npt(3, 4).scaled(2).dist-sq()")).toBe("100");
+  // torepr/tostring usable as first-class values
+  expect(await evalPyret("map(torepr, [list: 1, 2, 3])")).toBe("[list: 1, 2, 3]");
+});
+
 test("variant field access by name, ask, ^, _ curry, all/any (real-compiler features)", async () => {
   // data field access by dot name
   expect(await evalPyret("data Tree: | leaf | node(v, l, r) end\nt = node(5, leaf, node(7, leaf, leaf))\nt.v + t.r.v")).toBe("12");

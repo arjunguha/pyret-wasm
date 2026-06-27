@@ -23,7 +23,7 @@ export class CompileError extends Error {
   }
 }
 
-interface VariantInfo { id: number; fields: string[]; }
+interface VariantInfo { id: number; fields: string[]; methods?: { name: string; node: CstNode }[]; }
 
 const ARITH_FN: Record<string, string> = {
   PLUS: "$num_add", DASH: "$num_sub", TIMES: "$num_mul", SLASH: "$num_divide",
@@ -64,6 +64,7 @@ class Compiler {
   fnNames: string[] = [];               // table entries (index = position)
   ctorFns = new Map<string, number>();  // variant name -> table index of its constructor wrapper
   predFns = new Map<string, number>();  // variant name -> table index of its is-<v> predicate wrapper
+  tostringFns = new Map<string, number>(); // tostring/torepr reified as first-class fns
   sig: binaryen.Type;
   gcount = 0;                            // for unique global names
   stoppable = false;                    // stoppable codegen (CPS-transformed input)
@@ -91,6 +92,8 @@ class Compiler {
     if (program.name !== "program") throw new CompileError("expected program", program);
     const block = this.childNamed(program, "block");
     if (!block) throw new CompileError("no block in program");
+    // Registry of data-variant methods, indexed by variant id (filled in $main).
+    this.m.addGlobal("$variant_methods", this.t.FieldsRefNull, true, this.m.ref.null(this.t.FieldsRefNull));
     const m = this.m;
     const stmts = block.kids.filter((k) => k.name === "stmt");
 
@@ -135,6 +138,8 @@ class Compiler {
     for (const tf of topFuns) {
       body.push(m.global.set(tf.gname, this.makeClosure(tf.fnIndex, [], ctx)));
     }
+    // Build the data-variant method registry: $variant_methods[id] = methods object.
+    this.initVariantMethods(ctx, body);
     const skipTop = new Set(["fun-expr", "data-expr", "type-expr", "newtype-expr", "contract-stmt"]);
     const runnable = stmts.filter((s) => !skipTop.has(this.stmtInner(s).name));
     let printed = false;
@@ -206,8 +211,17 @@ class Compiler {
 
   // ---- data ----
   private registerData(dataExpr: CstNode) {
+    // `sharing:` methods apply to every variant of this data type; per-variant
+    // `with:` methods override them by name.
+    const sharing = this.childNamed(dataExpr, "data-sharing");
+    const shared = sharing ? this.collectMethods(sharing) : [];
     for (const kid of dataExpr.kids) {
       if (kid.name !== "first-data-variant" && kid.name !== "data-variant") continue;
+      const own = this.collectMethods(this.childNamed(kid, "data-with"));
+      const byName = new Map<string, { name: string; node: CstNode }>();
+      for (const s of shared) byName.set(s.name, s);
+      for (const o of own) byName.set(o.name, o);
+      const methods = [...byName.values()];
       const ctor = this.childNamed(kid, "variant-constructor");
       if (ctor) {
         const name = this.childNamed(ctor, "NAME")!.value!;
@@ -215,12 +229,49 @@ class Compiler {
         const fields = members
           ? members.kids.filter((k) => k.name === "variant-member").map((vm) => this.bindingName(this.childNamed(vm, "binding")!))
           : [];
-        this.variants.set(name, { id: this.nextVariantId++, fields });
+        this.variants.set(name, { id: this.nextVariantId++, fields, methods });
       } else {
         const nm = this.childNamed(kid, "NAME");
-        if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [] });
+        if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods });
       }
     }
+  }
+
+  // Method fields (`method m(self, ...): ... end`) inside a with:/sharing:/obj block.
+  private collectMethods(container: CstNode | undefined): { name: string; node: CstNode }[] {
+    const fieldsNode = container && this.childNamed(container, "fields");
+    if (!fieldsNode) return [];
+    return fieldsNode.kids
+      .filter((k) => k.name === "field" && k.kids.some((c) => c.name === "METHOD"))
+      .map((f) => {
+        const key = this.childNamed(f, "key");
+        const name = key ? this.childNamed(key, "NAME")!.value! : this.childNamed(f, "NAME")!.value!;
+        return { name, node: f };
+      });
+  }
+
+  // Populate $variant_methods[id] with a methods object for each variant that has
+  // with:/sharing: methods (emitted into $main's body).
+  private initVariantMethods(ctx: Ctx, body: number[]) {
+    const m = this.m;
+    const withMethods = [...this.variants.values()].filter((v) => v.methods && v.methods.length > 0);
+    if (withMethods.length === 0) return;
+    const nulls = Array.from({ length: this.nextVariantId }, () => m.ref.null(binaryen.anyref));
+    body.push(m.global.set("$variant_methods", m.array.new_fixed(this.t.Fields, nulls)));
+    const reg = () => m.ref.cast(m.global.get("$variant_methods", this.t.FieldsRefNull), this.t.FieldsRef);
+    for (const v of withMethods) {
+      body.push(m.array.set(reg(), m.i32.const(v.id), this.makeMethodsObject(v.methods!, ctx)));
+    }
+  }
+  // An $Object holding a variant's methods (name -> $Method closure), self-bound.
+  private makeMethodsObject(methods: { name: string; node: CstNode }[], ctx: Ctx): number {
+    const m = this.m;
+    const names = methods.map((meth) => this.strLiteralRaw(meth.name));
+    const values = methods.map((meth) => {
+      const closure = this.buildClosureFromParts(this.headerParams(meth.node), this.childNamed(meth.node, "block")!, ctx, "$vmth_");
+      return m.struct.new([m.ref.cast(closure, this.t.ClosureRef)], this.t.Method);
+    });
+    return m.call("$make_object", [m.array.new_fixed(this.t.Names, names), m.array.new_fixed(this.t.Fields, values)], this.t.ObjectRef);
   }
 
   private strLiteralRaw(s: string): number {
@@ -379,7 +430,23 @@ class Compiler {
     if (name.startsWith("is-") && this.variants.has(name.slice(3))) {
       return this.makeClosure(this.predicateFnIndex(name.slice(3)), [], ctx);
     }
+    // bare reference to a unary string-rendering builtin -> a first-class function.
+    if (name === "tostring" || name === "to-string" || name === "torepr" || name === "to-repr") {
+      return this.makeClosure(this.tostringFnIndex(name), [], ctx);
+    }
     return null;
+  }
+  // Reify tostring/torepr as a first-class function (they all route to $tostring).
+  private tostringFnIndex(name: string): number {
+    if (this.tostringFns.has(name)) return this.tostringFns.get(name)!;
+    const m = this.m;
+    const fnIndex = this.fnNames.length;
+    const wasmName = "$intr_" + fnIndex + "_" + name;
+    this.fnNames.push(wasmName);
+    const arg = m.array.get(m.local.get(1, this.t.FieldsRefNull), m.i32.const(0), binaryen.anyref, false);
+    m.addFunction(wasmName, this.sig, binaryen.anyref, [], m.call("$tostring", [arg], this.t.StrRef));
+    this.tostringFns.set(name, fnIndex);
+    return fnIndex;
   }
   // A boxed (captured-and-mutated) var lives in a 1-element $Fields array, shared
   // by reference so a closure's assignment is visible to the enclosing scope.
@@ -940,8 +1007,20 @@ class Compiler {
     const argLocals = argNodes.map(() => ctx.addLocal(binaryen.anyref));
     const prelude: number[] = [m.local.set(objLocal, this.compileExpr(objExpr, ctx, false))];
     argNodes.forEach((a, i) => prelude.push(m.local.set(argLocals[i]!, this.compileExpr(a, ctx, false))));
+    // Where to look up the method: a data variant routes through the per-id method
+    // registry; a plain object holds its methods directly.
+    const obj = () => m.local.get(objLocal, binaryen.anyref);
+    const methodsSource = m.if(
+      m.ref.test(obj(), this.t.VariantRefNull),
+      m.ref.cast(
+        m.array.get(m.ref.cast(m.global.get("$variant_methods", this.t.FieldsRefNull), this.t.FieldsRef),
+          m.call("$variant_id", [m.ref.cast(obj(), this.t.VariantRef)], binaryen.i32),
+          binaryen.anyref, false),
+        this.t.ObjectRef),
+      m.ref.cast(obj(), this.t.ObjectRef),
+      this.t.ObjectRef);
     prelude.push(m.local.set(fieldLocal,
-      m.call("$obj_get", [m.ref.cast(m.local.get(objLocal, binaryen.anyref), this.t.ObjectRef), this.strLiteralRaw(name)], binaryen.anyref)));
+      m.call("$obj_get", [methodsSource, this.strLiteralRaw(name)], binaryen.anyref)));
     const field = () => m.local.get(fieldLocal, binaryen.anyref);
     const argGets = argLocals.map((l) => m.local.get(l, binaryen.anyref));
     const methodClosure = m.call("$method_closure", [m.ref.cast(field(), this.t.MethodRef)], this.t.ClosureRef);
