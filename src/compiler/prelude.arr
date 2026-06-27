@@ -117,6 +117,27 @@ sharing:
   method and-then(self, f): cases(Option) self: | none => none | some(x) => some(f(x)) end end
 end
 
+# Either — `either` is treated as prelude-provided (SKIP_MODULES), so left/right and
+# the Either type live here. left = "keep going" / right = "result" in fold-while etc.
+data Either:
+  | left(v)
+  | right(v)
+sharing:
+  method or-else(self, default): cases(Either) self: | left(_) => default | right(x) => x end end
+end
+
+# fold from the left while f returns left(acc); stop with right(v). (lists.fold-while)
+fun fold-while(f, base, lst):
+  cases(List) lst:
+    | empty => base
+    | link(elt, r) =>
+      cases(Either) f(base, elt):
+        | left(v) => fold-while(f, v, r)
+        | right(v) => v
+      end
+  end
+end
+
 # ---- boolean / numeric builtins (pure Pyret) ----
 fun not(b): if b: false else: true end end
 fun identity(x): x end
@@ -162,6 +183,46 @@ fun repeat(n, e):
   if n <= 0: empty else: link(e, repeat(n - 1, e)) end
 end
 
+# numbers start..stop in steps of delta (stop exclusive).
+fun range-by(start, stop, delta):
+  if delta == 0:
+    if start == stop: empty else: raise("range-by: an interval of 0 would produce an infinite list") end
+  else:
+    len = num-max(num-ceiling((stop - start) / delta), 0)
+    raw-array-to-list(raw-array-build(lam(i): start + (i * delta) end, len))
+  end
+end
+
+# parallel each/map/fold families (stop at the shortest list).
+fun each2(f, l1, l2):
+  if is-empty(l1) or is-empty(l2): nothing
+  else: block: f(l1.first, l2.first) each2(f, l1.rest, l2.rest) end end
+end
+fun each3(f, l1, l2, l3):
+  if is-empty(l1) or is-empty(l2) or is-empty(l3): nothing
+  else: block: f(l1.first, l2.first, l3.first) each3(f, l1.rest, l2.rest, l3.rest) end end
+end
+fun each4(f, l1, l2, l3, l4):
+  if is-empty(l1) or is-empty(l2) or is-empty(l3) or is-empty(l4): nothing
+  else: block: f(l1.first, l2.first, l3.first, l4.first) each4(f, l1.rest, l2.rest, l3.rest, l4.rest) end end
+end
+fun fold2(f, base, l1, l2):
+  if is-empty(l1) or is-empty(l2): base
+  else: fold2(f, f(base, l1.first, l2.first), l1.rest, l2.rest) end
+end
+fun fold3(f, base, l1, l2, l3):
+  if is-empty(l1) or is-empty(l2) or is-empty(l3): base
+  else: fold3(f, f(base, l1.first, l2.first, l3.first), l1.rest, l2.rest, l3.rest) end
+end
+fun map3(f, l1, l2, l3):
+  if is-empty(l1) or is-empty(l2) or is-empty(l3): empty
+  else: link(f(l1.first, l2.first, l3.first), map3(f, l1.rest, l2.rest, l3.rest)) end
+end
+fun map4(f, l1, l2, l3, l4):
+  if is-empty(l1) or is-empty(l2) or is-empty(l3) or is-empty(l4): empty
+  else: link(f(l1.first, l2.first, l3.first, l4.first), map4(f, l1.rest, l2.rest, l3.rest, l4.rest)) end
+end
+
 fun each(f, l):
   cases(List) l:
     | empty => nothing
@@ -179,6 +240,28 @@ fun map2(f, a, b):
       cases(List) b:
         | empty => empty
         | link(fb, rb) => link(f(fa, fb), map2(f, ra, rb))
+      end
+  end
+end
+
+# index of first element satisfying pred, or -1.
+fun find-index(pred, lst):
+  fun helper(i, l):
+    cases(List) l: | empty => 0 - 1 | link(fst, rst) => if pred(fst): i else: helper(i + 1, rst) end end
+  end
+  helper(0, lst)
+end
+
+# longest prefix of lst satisfying pred; returns the tuple { taken; rest }.
+fun take-while(pred, lst):
+  cases(List) lst:
+    | empty => { empty; empty }
+    | link(fst, rst) =>
+      if pred(fst):
+        split = take-while(pred, rst)
+        { link(fst, split.{0}); split.{1} }
+      else:
+        { empty; lst }
       end
   end
 end
@@ -297,7 +380,13 @@ fun image-height(img):
   end
 end
 
-# ---- raw arrays (primitive: a $Fields cell; get/length/set are intrinsics) ----
+# ---- raw arrays (primitive: a $Fields cell; get/length/set/of are intrinsics) ----
+# First-class wrappers so these names can be passed as VALUES (e.g. `rag = raw-array-get`),
+# not just called. The bodies call the `prim-` intrinsics so they don't recurse.
+fun raw-array-get(arr, i): prim-raw-array-get(arr, i) end
+fun raw-array-set(arr, i, v): prim-raw-array-set(arr, i, v) end
+fun raw-array-length(arr): prim-raw-array-length(arr) end
+fun raw-array-of(elt, n): prim-raw-array-of(elt, n) end
 fun raw-array-to-list(arr):
   fun ra-loop(i, n): if i >= n: empty else: link(raw-array-get(arr, i), ra-loop(i + 1, n)) end end
   ra-loop(0, raw-array-length(arr))

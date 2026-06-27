@@ -34,6 +34,12 @@ const CMP: Record<string, (c: number, m: binaryen.Module) => number> = {
   LEQ: (c, m) => m.i32.le_s(c, m.i32.const(0)),
   GEQ: (c, m) => m.i32.ge_s(c, m.i32.const(0)),
 };
+// Operators overloadable by user data via a magic method (Pyret semantics): when
+// the left operand is a variant/object, `a <op> b` dispatches to `a._<m>(b)`.
+const OP_METHOD: Record<string, string> = {
+  PLUS: "_plus", DASH: "_minus", TIMES: "_times", SLASH: "_divide",
+  LT: "_lessthan", GT: "_greaterthan", LEQ: "_lessequal", GEQ: "_greaterequal",
+};
 
 // Per-function compilation context.
 class Ctx {
@@ -41,6 +47,7 @@ class Ctx {
   captures = new Map<string, number>(); // name -> index in caps array
   locals = new Map<string, number>();   // name -> wasm local index
   boxed = new Set<string>();            // names held in a 1-cell mutable box (var captured by a closure)
+  hoistedFuns = new Set<string>();      // block-level `fun`s pre-declared (boxed) for forward/mutual reference
   localTypes: binaryen.Type[] = [];
   base: number;                         // first free wasm local index
   constructor(public isMain: boolean) {
@@ -68,6 +75,21 @@ class Compiler {
   sig: binaryen.Type;
   gcount = 0;                            // for unique global names
   stoppable = false;                    // stoppable codegen (CPS-transformed input)
+  // Top-level `let`s that re-bind an already-global name -> the prior global, so the
+  // RHS resolves to it (non-recursive let; see pass 1). Keyed by the let-expr node.
+  topLetPrior = new Map<CstNode, string>();
+  // The global each top-level let allocated for ITS binding. With duplicate names
+  // across modules, topScope only holds the last, so the assignment target must come
+  // from here (else an earlier same-named binding writes to a later binding's global,
+  // leaving its own global null).
+  topLetGlobal = new Map<CstNode, string>();
+  // FIRST global allocated for each top-level name. A module-alias member access
+  // `N.foo` refers to module N's export of `foo` — the original definition, which
+  // (since imports are loaded before the importing module) is the first-registered
+  // global. Using topScope (last-wins) would instead pick up an importing module's
+  // same-named local rebind (e.g. `t-string = T.t-string(...)`), which is defined
+  // later in program order and thus still null at earlier use sites.
+  firstGlobal = new Map<string, string>();
 
   constructor() {
     this.m = new binaryen.Module();
@@ -119,7 +141,17 @@ class Compiler {
         this.fnNames.push(wasmName);
         topFuns.push({ node: inner, gname, fnIndex, wasmName });
       } else if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr") {
-        this.freshGlobal(this.bindingName(this.letBinding(inner)));
+        const nm = this.bindingName(this.letBinding(inner));
+        // Whole-program flattening puts every module's top-level names in one global
+        // scope, so a module re-binding a name the prelude/another module already
+        // defines (e.g. `fold_n = LISTS.fold_n`, `string-dict = SD.string-dict`)
+        // collides. Pyret `let` is non-recursive: such a binding's RHS must see the
+        // PRIOR binding (the real lists/string-dict export), not the new global it is
+        // defining (which is still null at that point -> a self-referential crash).
+        const prior = this.topScope.get(nm);
+        const gname = this.freshGlobal(nm);
+        this.topLetGlobal.set(inner, gname);
+        if (prior !== undefined) this.topLetPrior.set(inner, prior);
       }
     }
 
@@ -158,8 +190,15 @@ class Compiler {
       const inner = this.stmtInner(stmt);
       if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr") {
         const name = this.bindingName(this.letBinding(inner));
-        const gname = this.topScope.get(name)!;
-        body.push(m.global.set(gname, this.compileExpr(inner.kids[inner.kids.length - 1]!, ctx, false)));
+        // Assign to THIS binding's own global (not topScope's last-wins entry).
+        const gname = this.topLetGlobal.get(inner) ?? this.topScope.get(name)!;
+        // Non-recursive let: a re-binding's RHS sees the prior global (see pass 1).
+        const prior = this.topLetPrior.get(inner);
+        const saved = this.topScope.get(name);
+        if (prior !== undefined) this.topScope.set(name, prior);
+        const rhs = this.compileExpr(inner.kids[inner.kids.length - 1]!, ctx, false);
+        if (prior !== undefined && saved !== undefined) this.topScope.set(name, saved);
+        body.push(m.global.set(gname, rhs));
       } else if (inner.name === "check-expr") {
         body.push(this.compileCheckExpr(inner, ctx));
       } else if (inner.name === "check-test" && inner.kids.length > 1) {
@@ -217,7 +256,16 @@ class Compiler {
     const gname = "$g" + (this.gcount++) + "_" + name;
     this.m.addGlobal(gname, binaryen.anyref, true, this.m.ref.null(binaryen.anyref));
     this.topScope.set(name, gname);
+    if (!this.firstGlobal.has(name)) this.firstGlobal.set(name, gname);
     return gname;
+  }
+
+  // `N.member` (module-alias access) -> the original (first-registered) global for
+  // `member`, i.e. module N's export, rather than a later same-named local rebind.
+  private resolveModuleMember(name: string, ctx: Ctx): number | null {
+    const fg = this.firstGlobal.get(name);
+    if (fg !== undefined) return this.m.global.get(fg, binaryen.anyref);
+    return this.resolveName(name, ctx);
   }
 
   // ---- data ----
@@ -335,10 +383,29 @@ class Compiler {
     return null;
   }
 
+  // `{a; b} as name` -> the whole-value name bound alongside the components.
+  private tupleAsName(binding: CstNode): string | null {
+    let n: CstNode | undefined = binding;
+    while (n && (n.name === "toplevel-binding" || n.name === "binding")) {
+      const tb = this.childNamed(n, "tuple-binding");
+      if (tb) {
+        const nb = tb.kids.find((k) => k.name === "name-binding");
+        return nb ? this.bindingName(nb) : null;
+      }
+      if (this.childNamed(n, "name-binding")) break;
+      n = n.kids[0];
+    }
+    return null;
+  }
+
   // All names introduced by a binding (recursively flattening tuple bindings).
   private bindingNames(binding: CstNode): string[] {
     const comps = this.tupleComponents(binding);
-    if (comps) return comps.flatMap((c) => this.bindingNames(c));
+    if (comps) {
+      const names = comps.flatMap((c) => this.bindingNames(c));
+      const asName = this.tupleAsName(binding);
+      return asName ? [...names, asName] : names;
+    }
     return [this.bindingName(binding)];
   }
 
@@ -366,9 +433,17 @@ class Compiler {
     if (comps) {
       const tmp = ctx.addLocal(binaryen.anyref);
       parts.push(m.local.set(tmp, value));
+      const whole = () => m.local.get(tmp, binaryen.anyref);
+      // `{a; b} as name` also binds the whole tuple value to `name`.
+      const asName = this.tupleAsName(binding);
+      if (asName) {
+        const idx = ctx.addLocal(binaryen.anyref);
+        ctx.locals.set(asName, idx);
+        parts.push(m.local.set(idx, ctx.boxed.has(asName) ? this.makeBox(whole()) : whole()));
+      }
       comps.forEach((c, i) => {
         const field = m.call("$variant_field",
-          [m.ref.cast(m.local.get(tmp, binaryen.anyref), this.t.VariantRef), m.i32.const(i)], binaryen.anyref);
+          [m.ref.cast(whole(), this.t.VariantRef), m.i32.const(i)], binaryen.anyref);
         this.emitBinding(c, field, ctx, parts);
       });
     } else {
@@ -769,6 +844,13 @@ class Compiler {
         return this.compileConstruct(node, ctx);
       case "obj-expr":
         return this.compileObject(node, ctx);
+      case "method-expr": {
+        // anonymous `method(self, ...): ... end` -> a first-class $Method value
+        // (self-binding method closure; same representation as object method fields).
+        const closure = this.buildClosureFromParts(
+          this.headerParamBindings(node), this.childNamed(node, "block")!, ctx, "$amth_");
+        return this.m.struct.new([this.m.ref.cast(closure, this.t.ClosureRef)], this.t.Method);
+      }
       case "dot-expr":
         return this.compileDot(node, ctx);
       case "extend-expr":
@@ -948,9 +1030,9 @@ class Compiler {
     const m = this.m;
     const objExpr = node.kids[0]!;
     const name = this.childNamed(node, "NAME")!.value!;
-    // Module-alias field access: `N.foo` -> the global `foo`.
+    // Module-alias field access: `N.foo` -> module N's exported global `foo`.
     if (this.moduleAliasName(objExpr)) {
-      const r = this.resolveName(name, ctx);
+      const r = this.resolveModuleMember(name, ctx);
       if (r === null) throw new CompileError(`unbound module member: ${name}`, node);
       return r;
     }
@@ -1118,13 +1200,18 @@ class Compiler {
 
     // method / field call:  obj.m(args)
     const dot = this.asDot(fnNode);
-    // `_` curry: `_.m(a)` / `f(_)` -> a lambda over the underscores (unless `_` is
-    // a real module alias, handled below).
-    if (!(dot && this.moduleAliasName(dot.objExpr))) {
-      const cur2 = this.curryOver(node, [dot ? dot.objExpr : undefined, ...argExprNodes], ctx);
+    const isModAlias = !!(dot && this.moduleAliasName(dot.objExpr));
+    // `_` curry: `_.m(a)` / `f(_)` / `N.foo(_)` -> a lambda over the underscores.
+    // For a module-alias call (N.foo(...)) the receiver N is a module, not a value,
+    // so only the args may be `_`; otherwise the receiver may itself be `_` (`_.m(a)`).
+    {
+      const curOperands = isModAlias
+        ? argExprNodes
+        : [dot ? dot.objExpr : undefined, ...argExprNodes];
+      const cur2 = this.curryOver(node, curOperands, ctx);
       if (cur2 !== null) return cur2;
     }
-    if (dot && this.moduleAliasName(dot.objExpr)) {
+    if (isModAlias) {
       // `N.foo(args)` where N is a module alias -> call the global `foo`
       const args = argExprNodes.map((a) => this.compileExpr(a, ctx, false));
       const intr = this.compileIntrinsic(dot.name, args, ctx);
@@ -1133,7 +1220,7 @@ class Compiler {
         const v = this.variants.get(dot.name)!;
         return this.makeVariant(dot.name, v, args);
       }
-      const g = this.resolveName(dot.name, ctx);
+      const g = this.resolveModuleMember(dot.name, ctx);
       if (g === null) throw new CompileError(`unbound module member: ${dot.name}`, node);
       return this.callClosureValue(g, args, ctx, tail);
     }
@@ -1160,7 +1247,15 @@ class Compiler {
     // latent over-application in a never-run visitor branch) fall through to the
     // reified constructor closure, which reads exactly its field count — Pyret
     // defers constructor arity to runtime, so we don't hard-error at compile time.
-    if (name && this.variants.has(name) && !this.isBound(name, ctx)
+    //
+    // A top-level `shadow X` smart constructor (e.g. pprint's `shadow concat =
+    // lam(fst, snd): fst + snd end`, a 2-arg wrapper over the 4-arg `concat`
+    // variant) registers a global that shadows the variant. We disambiguate by
+    // ARITY: a call matching the variant's field count builds the variant (this is
+    // what the data decl's own methods mean by `concat(self, other, 0, true)`),
+    // while the smart-constructor arity falls through to the shadowing global. Only
+    // a LOCAL binding (param/let) fully overrides the constructor.
+    if (name && this.variants.has(name) && !this.isLocallyBound(name, ctx)
         && this.variants.get(name)!.fields.length === args.length) {
       return this.makeVariant(name, this.variants.get(name)!, args);
     }
@@ -1293,16 +1388,19 @@ class Compiler {
         this.t.FixnumRef);
     }
     // Raw arrays = a $Fields (array (mut anyref)). The rest of the raw-array library
-    // (to-list/map/each/fold) is built on these in the prelude.
-    if (name === "raw-array-get" && args.length === 2) {
+    // (to-list/map/each/fold) is built on these in the prelude. Each primitive is
+    // also exposed under a `prim-` name so the prelude can wrap it in a first-class
+    // `fun raw-array-get(...)` (needed when the name is used as a value, not called)
+    // without the wrapper recursing into itself (the wrapper body calls `prim-`).
+    if ((name === "raw-array-get" || name === "prim-raw-array-get") && args.length === 2) {
       return m.array.get(m.ref.cast(args[0]!, this.t.FieldsRef),
         m.call("$num_to_i32", [args[1]!], binaryen.i32), binaryen.anyref, false);
     }
-    if (name === "raw-array-length" && args.length === 1) {
+    if ((name === "raw-array-length" || name === "prim-raw-array-length") && args.length === 1) {
       return m.call("$make_fix",
         [m.i64.extend_u(m.array.len(m.ref.cast(args[0]!, this.t.FieldsRef)))], this.t.FixnumRef);
     }
-    if (name === "raw-array-set" && args.length === 3) {
+    if ((name === "raw-array-set" || name === "prim-raw-array-set") && args.length === 3) {
       const a = ctx.addLocal(binaryen.anyref);
       return m.block(null, [
         m.local.set(a, args[0]!),
@@ -1312,7 +1410,7 @@ class Compiler {
       ], binaryen.anyref);
     }
     // raw-array-of(elt, n) -> a fresh $Fields of length n, every slot = elt.
-    if (name === "raw-array-of" && args.length === 2) {
+    if ((name === "raw-array-of" || name === "prim-raw-array-of") && args.length === 2) {
       return m.array.new(this.t.Fields, m.call("$num_to_i32", [args[1]!], binaryen.i32), args[0]!);
     }
     // Type predicates (value-model). Each returns a Pyret boolean by testing the
@@ -1442,12 +1540,21 @@ class Compiler {
   // obj.m(args): look up the field; if it's a method, call its closure with
   // self prepended; otherwise call the field value as a plain closure.
   private compileMethodCall(objExpr: CstNode, name: string, argNodes: CstNode[], ctx: Ctx, tail: boolean): number {
+    const objVal = this.compileExpr(objExpr, ctx, false);
+    const argVals = argNodes.map((a) => this.compileExpr(a, ctx, false));
+    return this.compileMethodOnValue(objVal, name, argVals, ctx, tail);
+  }
+
+  // Method dispatch on already-compiled values: look up `name` on objVal (variant
+  // via the method registry, or a plain object), then call it (as a self-binding
+  // $Method, or a plain field-as-closure).
+  private compileMethodOnValue(objVal: number, name: string, argVals: number[], ctx: Ctx, tail: boolean): number {
     const m = this.m;
     const objLocal = ctx.addLocal(binaryen.anyref);
     const fieldLocal = ctx.addLocal(binaryen.anyref);
-    const argLocals = argNodes.map(() => ctx.addLocal(binaryen.anyref));
-    const prelude: number[] = [m.local.set(objLocal, this.compileExpr(objExpr, ctx, false))];
-    argNodes.forEach((a, i) => prelude.push(m.local.set(argLocals[i]!, this.compileExpr(a, ctx, false))));
+    const argLocals = argVals.map(() => ctx.addLocal(binaryen.anyref));
+    const prelude: number[] = [m.local.set(objLocal, objVal)];
+    argVals.forEach((a, i) => prelude.push(m.local.set(argLocals[i]!, a)));
     // Where to look up the method: a data variant routes through the per-id method
     // registry; a plain object holds its methods directly.
     const obj = () => m.local.get(objLocal, binaryen.anyref);
@@ -1494,6 +1601,12 @@ class Compiler {
   private isBound(name: string, ctx: Ctx): boolean {
     return ctx.locals.has(name) || ctx.params.has(name) || ctx.captures.has(name) || this.topScope.has(name);
   }
+  // Bound by a LOCAL (param/let/capture) — not just a top-level global. Used to let
+  // a data-variant constructor win over a top-level `shadow` smart-constructor while
+  // still honoring local shadowing.
+  private isLocallyBound(name: string, ctx: Ctx): boolean {
+    return ctx.locals.has(name) || ctx.params.has(name) || ctx.captures.has(name);
+  }
 
   private asNum(expr: number): number { return this.m.ref.cast(expr, this.t.NumRef); }
   private truthy(expr: number): number { return this.m.i31.get_s(this.m.ref.cast(expr, binaryen.i31ref)); }
@@ -1514,24 +1627,47 @@ class Compiler {
         continue;
       }
       const right = this.compileExpr(kids[i + 1]!, ctx, false);
-      acc = this.applyBinop(opTok.name, acc, right, kids[i]!);
+      acc = this.applyBinop(opTok.name, acc, right, kids[i]!, ctx);
     }
     return acc;
   }
 
-  private applyBinop(op: string, left: number, right: number, opNode: CstNode): number {
+  private applyBinop(op: string, left: number, right: number, opNode: CstNode, ctx: Ctx): number {
     const m = this.m;
-    if (op === "PLUS") return m.call("$plus", [left, right], binaryen.anyref);
-    if (ARITH_FN[op]) return m.call(ARITH_FN[op]!, [this.asNum(left), this.asNum(right)], this.t.NumRef);
-    if (CMP[op]) {
-      const c = m.call("$num_compare", [this.asNum(left), this.asNum(right)], binaryen.i32);
-      return this.mkBool(CMP[op]!(c, m));
+    // Operator overloading: if the left operand is a user data variant/object,
+    // dispatch `a <op> b` to its magic method `a._<m>(b)` (Pyret semantics, e.g.
+    // pprint's PPrintDoc `+`). Primitives (num/string) take the fast path below.
+    const meth = OP_METHOD[op];
+    if (meth) {
+      const lv = ctx.addLocal(binaryen.anyref);
+      const rv = ctx.addLocal(binaryen.anyref);
+      const l = () => m.local.get(lv, binaryen.anyref);
+      const isUserVal = m.i32.or(
+        m.ref.test(l(), this.t.VariantRefNull), m.ref.test(l(), this.t.ObjectRefNull));
+      return m.block(null, [
+        m.local.set(lv, left),
+        m.local.set(rv, right),
+        m.if(isUserVal,
+          this.compileMethodOnValue(l(), meth, [m.local.get(rv, binaryen.anyref)], ctx, false),
+          this.primBinop(op, l(), m.local.get(rv, binaryen.anyref)),
+          binaryen.anyref),
+      ], binaryen.anyref);
     }
     if (op === "EQUALEQUAL") return this.mkBool(m.call("$equal", [left, right], binaryen.i32));
     if (op === "NEQ") return this.mkBool(m.i32.eqz(m.call("$equal", [left, right], binaryen.i32)));
     if (op === "AND") return this.mkBool(m.i32.and(this.truthy(left), this.truthy(right)));
     if (op === "OR") return this.mkBool(m.i32.or(this.truthy(left), this.truthy(right)));
     throw new CompileError(`unsupported binop: ${op}`, opNode);
+  }
+
+  // Primitive (number/string) binop — the non-overloaded fast path.
+  private primBinop(op: string, left: number, right: number): number {
+    const m = this.m;
+    if (op === "PLUS") return m.call("$plus", [left, right], binaryen.anyref);
+    if (ARITH_FN[op]) return m.call(ARITH_FN[op]!, [this.asNum(left), this.asNum(right)], this.t.NumRef);
+    // comparison
+    const c = m.call("$num_compare", [this.asNum(left), this.asNum(right)], binaryen.i32);
+    return this.mkBool(CMP[op]!(c, m));
   }
 
   private compileIf(node: CstNode, ctx: Ctx, tail: boolean): number {
@@ -1785,13 +1921,40 @@ class Compiler {
     const m = this.m;
     const stmts = block.kids.filter((k) => k.name === "stmt");
     const parts: number[] = [];
+    const hoisted = this.hoistBlockFuns(stmts, ctx, parts);
     let hasValue = false;
     stmts.forEach((stmt, i) => {
       const isLast = i === stmts.length - 1;
       if (this.emitStmt(this.stmtInner(stmt), ctx, tail, isLast, parts)) hasValue = true;
     });
+    // Scope the hoist to this block: a sibling block may reuse a name (different box).
+    for (const n of hoisted) ctx.hoistedFuns.delete(n);
     if (!hasValue) parts.push(m.ref.i31(m.i32.const(2)));
     return m.block(null, parts, binaryen.anyref);
+  }
+
+  // Pre-declare every block-level `fun` (as a boxed cell) before compiling any
+  // statement, so sibling funs can be forward- and mutually-referenced (real
+  // Pyret gives block `fun`s letrec semantics). Each box is filled when its
+  // definition is reached (compileLocalFun), and closures capture the box.
+  private hoistBlockFuns(stmts: CstNode[], ctx: Ctx, parts: number[]): string[] {
+    const m = this.m;
+    const hoisted: string[] = [];
+    for (const stmt of stmts) {
+      const inner = this.stmtInner(stmt);
+      if (inner.name !== "fun-expr") continue;
+      const nm = this.childNamed(inner, "NAME");
+      if (!nm?.value) continue;
+      const name = nm.value;
+      if (ctx.hoistedFuns.has(name)) continue;
+      const idx = ctx.addLocal(binaryen.anyref);
+      ctx.locals.set(name, idx);
+      ctx.boxed.add(name);
+      ctx.hoistedFuns.add(name);
+      hoisted.push(name);
+      parts.push(m.local.set(idx, this.makeBox(m.ref.i31(m.i32.const(2)))));
+    }
+    return hoisted;
   }
 
   private compileLocalFun(fnExpr: CstNode, ctx: Ctx): number {
@@ -1800,6 +1963,12 @@ class Compiler {
     const paramBindings = this.headerParamBindings(fnExpr);
     const params = this.headerParams(fnExpr);
     const body = this.childNamed(fnExpr, "block")!;
+    // Pre-hoisted sibling (letrec): the box already exists — just fill it.
+    if (ctx.hoistedFuns.has(name)) {
+      const hidx = ctx.locals.get(name)!;
+      const closure = this.buildClosureFromParts(paramBindings, body, ctx, "$lfn_");
+      return this.setBox(m.local.get(hidx, binaryen.anyref), closure);
+    }
     const idx = ctx.addLocal(binaryen.anyref);
     ctx.locals.set(name, idx);
     // Recursive local fun: its name is free in its own body. Box it (a shared cell)
