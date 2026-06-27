@@ -131,3 +131,19 @@ test("pure-Pyret parser: parses real compiler source files", async () => {
   const mu = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/trove/matrix-util.arr"));
   expect(mu).toContain("ok stmts=34");
 });
+
+// LARGE files that previously overflowed the WASM call stack ("Maximum call stack
+// size exceeded") now parse, because the tokenizer (`lex`) and statement-list parse
+// (`parse-stmts`) are tail-recursive (constant stack via the seed's native tail
+// calls).  well-formed.arr is 1410 lines; anf.arr is 452 — both well past the depth
+// that overflowed before.  (The very largest — resolve-scope/ast/type-check — still
+// hit a separate "Length out of range of buffer" host/memory limit, see notes.)
+test("pure-Pyret parser: large compiler files parse (constant-stack tokenizer/parser)", async () => {
+  const wasm = await buildSourceFile(REALFILE_PROBE);
+  const anf = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/compiler/anf.arr"));
+  expect(anf).toContain("ok stmts=");
+  expect(anf).not.toContain("Maximum call stack");
+  const wf = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/compiler/well-formed.arr"));
+  expect(wf).toContain("ok stmts=");
+  expect(wf).not.toContain("Maximum call stack");
+});
