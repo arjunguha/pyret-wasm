@@ -1463,23 +1463,29 @@ fun parse-cases(st :: PState) -> A.Expr:
 end
 
 fun parse-cases-branches(st :: PState):
+  # TAIL-RECURSIVE over branches: a `cases` in the real compiler dispatches over the whole
+  # AST (dozens of branches); a non-tail link(...) would grow the stack per branch.
+  # Accumulate in reverse, rev at the terminator; thread the else-block.
+  parse-cases-branches-acc(st, empty)
+end
+
+fun parse-cases-branches-acc(st :: PState, acc :: List<A.CasesBranch>):
   if at-kind(st, "BAR"):
     p-advance(st)
     if at-name(st, "else"):
       p-advance(st)
       expect(st, "THICKARROW")
       eb = parse-block(st)
-      {empty; some(eb)}
+      {rev(acc); some(eb)}
     else:
       nm = expect(st, "NAME").value
       args = if at-kind(st, "LPAREN"): parse-cases-args(st) else: empty end
       expect(st, "THICKARROW")
       body = parse-block(st)
-      rest = parse-cases-branches(st)
-      {link(A.s-cases-branch(dl, dl, nm, args, body), rest.{0}); rest.{1}}
+      parse-cases-branches-acc(st, link(A.s-cases-branch(dl, dl, nm, args, body), acc))
     end
   else:
-    {empty; none}
+    {rev(acc); none}
   end
 end
 
@@ -2034,16 +2040,18 @@ fun parse-variants(st :: PState) -> List<A.Variant>:
   else:
     if at-kind(st, "BAR"): p-advance(st) else: nothing end
     first = parse-variant(st)
-    link(first, parse-variant-rest(st))
+    # TAIL-RECURSIVE over the remaining variants (a `data` like ast.arr's Expr has dozens):
+    # accumulate in reverse, rev at the end, instead of a stack-growing non-tail link.
+    parse-variant-rest-acc(st, link(first, empty))
   end
 end
 
-fun parse-variant-rest(st :: PState) -> List<A.Variant>:
+fun parse-variant-rest-acc(st :: PState, acc :: List<A.Variant>) -> List<A.Variant>:
   if at-kind(st, "BAR"):
     p-advance(st)
-    link(parse-variant(st), parse-variant-rest(st))
+    parse-variant-rest-acc(st, link(parse-variant(st), acc))
   else:
-    empty
+    rev(acc)
   end
 end
 

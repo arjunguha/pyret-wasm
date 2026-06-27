@@ -37,6 +37,8 @@ const CLOSURE_FILES = [
   "../self-compiler/compiler/locators/file.arr",  // a locator module
   "../self-compiler/trove/ast.arr",               // the 3739-LOC AST (memory + constant-stack)
   "../self-compiler/compiler/desugar.arr",
+  "../self-compiler/compiler/resolve-scope.arr",  // 1874 LOC — constant-stack over big cases
+  "../self-compiler/compiler/type-check.arr",     // 2662 LOC — the largest pass (huge cases)
   "../self-host/wasm-of-pyret.arr",
   // These were FALSELY flagged as parse blockers by the obsolete JS-GLR bridge
   // (serializeCst: "unhandled CST node contract-stmt" / "Parse error near import").
