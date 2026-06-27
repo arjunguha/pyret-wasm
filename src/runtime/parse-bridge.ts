@@ -111,6 +111,12 @@ export const TAGS = {
   LRBINDS: 90, // helper: a List<LetrecBind>
   RFRAC: 91, // s-rfrac: str = "~num/den" (rough rational literal)
   CHECKREFINE: 92, // s-check-test w/ refinement: str = op kind, kids = [left, refinement, right]
+  // --- round 5 ---
+  MULTILET: 93, // s-let-expr: kids = [LETBINDS, body-block]
+  LETBIND: 94, // s-let-bind: str = name, kids = [value]
+  VARBIND: 95, // s-var-bind: str = name, kids = [value]
+  LETBINDS: 96, // helper: a List<LetBind>
+  REACTOR: 97, // s-reactor: kids = [MEMBERS]
 } as const;
 
 // One node of the flat pre-order stream. `nkids` children follow immediately
@@ -376,6 +382,14 @@ function toExpr(orig: CstNode): AstNode {
     }
     case "letrec-expr":
       return letrecExpr(n);
+    case "multi-let-expr":
+      return multiLet(n);
+    case "reactor-expr":
+      // reactor: field, ... end -> s-reactor (fields are s-data-field/method members).
+      return node(TAGS.REACTOR, "", [node(TAGS.MEMBERS, "", lowerFields(n, "fields", "field"))]);
+    // TODO(grammar): `table-extend` (-> s-table-extend, needs ColumnBinds) and
+    // `load-table-expr` (-> s-load-table, needs LoadTableSpec rows) — peripheral
+    // table-library forms (1 corpus file each); left to the default throw for now.
     default:
       if (n.kids.length === 1) return toExpr(n.kids[0]!);
       throw new Error(`parse-bridge: unhandled CST node '${n.name}'`);
@@ -428,6 +442,21 @@ function letrecExpr(n: CstNode): AstNode {
     });
   const body = toBlock(n.kids.find((k) => k.name === "block")!);
   return node(TAGS.LETREC, "", [node(TAGS.LRBINDS, "", binds), body]);
+}
+
+// multi-let-expr: LET let-binding (COMMA let-binding)* (COLON|BLOCK) block END ->
+// s-let-expr. Each let-binding wraps a let-expr (-> s-let-bind) or var-expr (-> s-var-bind).
+function multiLet(n: CstNode): AstNode {
+  const binds = n.kids
+    .filter((k) => k.name === "let-binding")
+    .map((lb) => {
+      const inner = lb.kids[0]!; // let-expr | var-expr
+      const name = bindName(inner.kids.find((k) => k.name === "toplevel-binding")!);
+      const value = toExpr(inner.kids[inner.kids.length - 1]!);
+      return node(inner.name === "var-expr" ? TAGS.VARBIND : TAGS.LETBIND, name, [value]);
+    });
+  const body = toBlock(n.kids.find((k) => k.name === "block")!);
+  return node(TAGS.MULTILET, "", [node(TAGS.LETBINDS, "", binds), body]);
 }
 
 // app-expr: fn app-args  (fn may itself be a dot-expr => method call).
