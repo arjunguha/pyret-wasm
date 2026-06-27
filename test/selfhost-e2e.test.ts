@@ -279,3 +279,27 @@ test("self-hosted: mutual recursion (even/odd) with a sibling helper", async () 
   expect(result.error).toBeUndefined();
   expect(result.output).toContain("1 test passed");
 });
+
+// ─── Level 10: print, for-loops, type aliases ─────────────────────────────────
+// `print(x)` lowers to a prim-app the backend maps to the host `print` import (renders
+// x via $val_to_string, writes to stdout) — value rendering happens in Pyret-emitted WASM.
+test("self-hosted: print(42) writes 42 to stdout", async () => {
+  const { result } = await selfHostRun("print(42)");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("42");
+});
+
+// `for ITER(b from e): body end` desugars to ITER(lam(b): body end, e).
+test("self-hosted: for-loop desugars to a higher-order call and runs", async () => {
+  const { result } = await selfHostRun(
+    "fun use(f, a): f(a) end\ncheck: (for use(x from 5): x + 1 end) is 6 end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("1 test passed");
+});
+
+// `type` / `newtype` aliases are erased.
+test("self-hosted: type alias is erased (compiles + runs)", async () => {
+  const { result } = await selfHostRun("type N = Number\ncheck: 40 + 2 is 42 end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("1 test passed");
+});

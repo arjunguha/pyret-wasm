@@ -361,6 +361,15 @@ fun compile-prim-app(fname :: String, args, c :: Ctx) -> List<Number>:
       compile-avals(args, c).append(E.i-call(rt-funcidx("$check_is"))).append(E.i-ref-null(110))
     | fname == "check-is-not" then:
       compile-avals(args, c).append(E.i-call(rt-funcidx("$check_is_not"))).append(E.i-ref-null(110))
+    # ---- print/display: render the value to SCRATCH-OFFSET, call the host print
+    #      import (addr, len), and return the printed value (Pyret's print is identity) ----
+    | (fname == "print") or (fname == "display") then:
+      v = c.next-local
+      compile-aval(args.first, c).append(E.local-set(v))
+        .append(E.i32-const(R.SCRATCH-OFFSET))                       # addr (under the len)
+        .append(E.local-get(v)).append(E.i-call(rt-funcidx("$val_to_string")))  # -> len
+        .append(E.i-call(host-funcidx("print")))                    # print(addr, len)
+        .append(E.local-get(v))                                     # result = the value
     # ---- control-flow aborts + the unmapped tail -> $raise host import ----
     | throw-prims.member(fname) then: raise-instr()
     | otherwise: raise-instr()   # TODO(port): makeArrayN, getMaker*, getColonField, getBracket, makeSome/None, run-task...
@@ -943,9 +952,12 @@ fun compile-prog(prog) -> List<Number>:
       func-c = E.vec(rt-func-decls.append(lam-func-decls).append(ctor-func-decls).append([list: E.leb-u(main-type-idx())]))
 
       # ----- table + element segment: lambda funcidxs then ctor funcidxs -----
+      # ALWAYS declare table 0 (even size 0): the runtime kernels themselves use
+      # call_indirect (closure dispatch), so `call_indirect` must validate even when the
+      # user program defines no lambdas/ctors. An empty table validates fine; it's only
+      # indexed at runtime when a real closure exists.
       num-slots = num-lams + num-ctors
-      table-c = if num-slots == 0: empty
-                else: E.vec([list: E.table-entry([list: 112], num-slots)]) end   # 112 = funcref
+      table-c = E.vec([list: E.table-entry([list: 112], num-slots)])   # 112 = funcref
       lam-funcidxs = range(0, num-lams).map(lam(i): NUM-IMPORTS + (num-rt + i) end)
       ctor-funcidxs = range(0, num-ctors).map(lam(j): NUM-IMPORTS + ((num-rt + num-lams) + j) end)
       all-slots = lam-funcidxs.append(ctor-funcidxs)
