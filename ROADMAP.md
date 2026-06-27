@@ -49,10 +49,12 @@ rewrite remains documented as future work (`self-host/NAMESPACE-NOTES.md`) but i
 
 | program | direct seed→Wasm | stoppable Wasm | original Pyret (compute/total) |
 |---|---|---|---|
-| `adding-ones-2000` | 8.1 ms | 10.3 ms | ~5 ms / ~175 ms |
-| `recursion-triangle-20000` | stack overflow | 8.7 ms | ~12 ms / ~182 ms |
-| `tail-sum-1000000` | 122.7 ms | 142.6 ms | ~78 ms / ~248 ms |
+| `adding-ones-2000` | 8.1 ms | 10.3 ms | 22 ms / 205 ms |
+| `recursion-triangle-20000` | stack overflow | 8.7 ms | 21 ms / 204 ms |
+| `tail-sum-1000000` | 122.7 ms | 142.6 ms | 97 ms / 280 ms |
 
+Original-Pyret column freshly measured on Node v24 (`bash scripts/bench-pyret-baseline.sh`,
+best of 3): *total* includes a ~183 ms Node+runtime startup baseline, *compute* = total − baseline.
 Stoppability costs ~1.1–1.3× (native tail calls ⇒ no trampoline); CPS also *enables* the
 deep non-tail recursion that overflows the direct path. See README for full methodology.
 
