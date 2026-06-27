@@ -112,6 +112,67 @@ try {
   const out2 = await page.$eval("#interactions", (e) => e.textContent ?? "");
   if (runningStatus === "running…" && out2.includes("[Stopped]")) console.log("✓ Stop button interrupts an infinite loop");
   else { console.log("✗ Stop failed; status was", runningStatus); failed = true; }
+
+  // Table rendering path: PyretTable.toTable turns a printed table value into an
+  // HTML <table>. (The seed can't compile `table-expr` yet, so we exercise the
+  // rendering function directly — the auto-path is wired in ide.js for when it can.)
+  const tbl = await page.evaluate(() => {
+    const s = 'table: name, age\n  row: "Bob", 12\n  row: "Alice", 17\nend';
+    const el = window.PyretTable && window.PyretTable.toTable(s);
+    if (!el) return null;
+    return { tag: el.tagName, headers: [...el.querySelectorAll("th")].map((e) => e.textContent),
+             rows: el.querySelectorAll("tbody tr").length, cell00: el.querySelector("tbody td")?.textContent };
+  });
+  if (tbl && tbl.tag === "TABLE" && tbl.headers.join(",") === "name,age" && tbl.rows === 2 && tbl.cell00 === "Bob")
+    console.log("✓ table value renders as an HTML <table> (2 cols, 2 rows)");
+  else { console.log("✗ table rendering wrong:", JSON.stringify(tbl)); failed = true; }
+
+  // Clickable error location: an unbound-id error shows a location link that jumps
+  // the editor cursor when clicked.
+  await page.evaluate(() => { (window).cm.setValue("\n\nno-such-variable-zzz"); (window).cm.setCursor({ line: 0, ch: 0 }); });
+  await page.click("#run");
+  await page.waitForFunction(() => !!document.querySelector("#interactions .error-box .err-loc")
+    || document.getElementById("status")?.textContent === "error", { timeout: 20000 });
+  const hasLoc = await page.evaluate(() => !!document.querySelector("#interactions .error-box .err-loc"));
+  if (hasLoc) {
+    await page.click("#interactions .error-box .err-loc");
+    const cur = await page.evaluate(() => { const c = (window).cm.getCursor(); return { line: c.line, ch: c.ch }; });
+    // the unbound id is on editor line 3 (0-based line 2)
+    if (cur.line === 2) console.log("✓ error location is clickable and jumps the cursor (→ line 3)");
+    else { console.log("✗ error-loc click moved cursor to", JSON.stringify(cur)); failed = true; }
+  } else { console.log("✗ no clickable error location"); failed = true; }
+
+  // --- Debugger: Pause freezes, Step advances, Resume continues (cooperative-stop infra) ---
+  await page.evaluate(() => (window).cm.setValue("fun loop(n): loop(n + 1) end\nloop(0)"));
+  await page.click("#run");
+  await page.waitForFunction(() => ((window).__pausesSeen ?? 0) > 0, { timeout: 15000 });
+  await page.click("#pause");
+  await page.waitForFunction(() => document.getElementById("status")?.textContent === "paused", { timeout: 10000 });
+  const dbgUI = await page.evaluate(() => ({
+    label: document.getElementById("pause")?.textContent,
+    stepOn: !document.getElementById("step")?.disabled,
+  }));
+  if (dbgUI.label?.includes("Resume") && dbgUI.stepOn) console.log("✓ Pause holds at a yield (status=paused, button→Resume, Step enabled)");
+  else { console.log("✗ pause UI wrong:", JSON.stringify(dbgUI)); failed = true; }
+  // Frozen: the pause count must not advance while held.
+  const c1 = await page.evaluate(() => (window).__pausesSeen);
+  await new Promise((r) => setTimeout(r, 500));
+  const c2 = await page.evaluate(() => (window).__pausesSeen);
+  if (c1 === c2) console.log(`✓ Pause freezes execution (pause count steady at ${c2})`);
+  else { console.log(`✗ not frozen: ${c1} → ${c2}`); failed = true; }
+  // Step: advances exactly past at least one more pause point.
+  await page.click("#step");
+  await page.waitForFunction((prev) => ((window).__pausesSeen ?? 0) > prev, { timeout: 10000 }, c2);
+  console.log("✓ Step advances one interval");
+  // Resume: back to running, count climbs again.
+  await page.click("#pause"); // labeled "Resume ▶" now
+  await page.waitForFunction(() => document.getElementById("status")?.textContent === "running…", { timeout: 10000 });
+  const c3 = await page.evaluate(() => (window).__pausesSeen);
+  await page.waitForFunction((prev) => ((window).__pausesSeen ?? 0) > prev, { timeout: 10000 }, c3);
+  console.log("✓ Resume continues execution");
+  await page.click("#stop");
+  await page.waitForFunction(() => document.getElementById("status")?.textContent === "stopped", { timeout: 10000 });
+  console.log("✓ debugger run stops cleanly");
 } catch (e) {
   console.log("✗ test threw:", String(e).slice(0, 200));
   failed = true;
