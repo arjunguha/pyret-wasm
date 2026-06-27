@@ -113,7 +113,7 @@ end
 
 # ===== control-flow + body-building helpers (byte lists) =====
 # blocktypes: bt-empty (no result); a valtype byte-list = a single-result block.
-fun seq(parts :: List) -> List<Number>: E.concat(parts) end
+fun seq(parts :: List) -> List<Number>: E.concat-bytes(parts) end
 fun blk(bt, parts :: List) -> List<Number>: E.i-block(bt).append(seq(parts)).append(E.i-end) end
 fun lp(parts :: List) -> List<Number>: E.i-loop(E.bt-empty).append(seq(parts)).append(E.i-end) end
 fun iff(parts :: List) -> List<Number>: E.i-if(E.bt-empty).append(seq(parts)).append(E.i-end) end
@@ -279,7 +279,7 @@ fun emit-make-variant() -> RtFun:
   body = E.local-get(0).append(E.local-get(1)).append(E.local-get(2))
     .append(E.struct-new(T-VARIANT))
     .append(E.end-instr)
-  rt-fun("$make_variant", [list: i32t, E.reft(T-STR), E.reftnull(T-FIELDS)],
+  rt-fun("$make_variant", [list: i32t, E.reft(T-STR), E.reft(T-FIELDS)],
          [list: E.reft(T-VARIANT)], empty, body)
 end
 # $variant_id(anyref) -> i32 : (cast $Variant).field0
@@ -314,7 +314,8 @@ fun emit-variant-field-by-name() -> RtFun:
           E.i-br(0) ]) ]),
       raise-host() ]).append(E.end-instr)
   rt-fun("$variant_field_by_name", [list: anyref, E.reft(T-STR)], [list: anyref],
-         [list: E.local-decl(3, i32t), E.local-decl(1, E.reft(T-NAMES))], body)
+         # locals (after params 0,1): 2=id(i32), 3=names(ref $Names), 4=n(i32), 5=i(i32)
+         [list: E.local-decl(1, i32t), E.local-decl(1, E.reft(T-NAMES)), E.local-decl(2, i32t)], body)
 end
 # $variant_equal(a, b) -> i32 : same id and field-wise $equal. locals: n=4, i=5 (i32);
 # fa=2, fb=3 (ref null $Fields).
@@ -337,7 +338,8 @@ fun emit-variant-equal() -> RtFun:
           E.i-br(0) ]) ]),
       E.i32-const(1) ]).append(E.end-instr)
   rt-fun("$variant_equal", [list: E.reft(T-VARIANT), E.reft(T-VARIANT)], [list: i32t],
-         [list: E.local-decl(2, i32t), E.local-decl(2, E.reftnull(T-FIELDS))], body)
+         # locals: 2=fields-a, 3=fields-b (ref null $Fields); 4=n, 5=i (i32)
+         [list: E.local-decl(2, E.reftnull(T-FIELDS)), E.local-decl(2, i32t)], body)
 end
 # $make_object(names, values) -> $Object
 fun emit-make-object() -> RtFun:
@@ -362,7 +364,8 @@ fun emit-obj-get() -> RtFun:
           E.i-br(0) ]) ]),
       raise-host() ]).append(E.end-instr)
   rt-fun("$obj_get", [list: anyref, E.reft(T-STR)], [list: anyref],
-         [list: E.local-decl(2, i32t), E.local-decl(1, E.reft(T-NAMES))], body)
+         # locals: 2=names(ref $Names), 3=i, 4=n (i32)
+         [list: E.local-decl(1, E.reft(T-NAMES)), E.local-decl(2, i32t)], body)
 end
 # $obj_equal(a, b) -> i32 : same names in order, values $equal. locals: i=4, n=5 (i32);
 # na=2, nb=3 (ref $Names).
@@ -387,7 +390,8 @@ fun emit-obj-equal() -> RtFun:
           E.i-br(0) ]) ]),
       E.i32-const(1) ]).append(E.end-instr)
   rt-fun("$obj_equal", [list: E.reft(T-OBJECT), E.reft(T-OBJECT)], [list: i32t],
-         [list: E.local-decl(2, i32t), E.local-decl(2, E.reft(T-NAMES))], body)
+         # locals: 2=names-a, 3=names-b (ref $Names); 4=i, 5=n (i32)
+         [list: E.local-decl(2, E.reft(T-NAMES)), E.local-decl(2, i32t)], body)
 end
 fun emit-obj-extend() -> RtFun: todo("$obj_extend", "prepend override names/values into a fresh $Object") end
 # $make_method(closure) -> $Method

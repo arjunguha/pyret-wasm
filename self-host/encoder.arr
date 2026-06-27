@@ -2,7 +2,7 @@ provide *
 # WASM-GC binary encoder, written in Pyret — the binaryen replacement for the
 # self-hosted compiler. Mirrors the byte sequences src/compiler/{types,runtime,
 # compile}.ts produce via binaryen. Lists of bytes (0..255) are the unit of output;
-# `concat`/`append` join them; sections wrap them. NOT yet run end-to-end.
+# `concat-bytes`/`append` join them; sections wrap them. NOT yet run end-to-end.
 #
 # Opcode references (from the seed's emitted .wat / binaryen disassembly):
 #   value types: i32=127 i64=126 f64=124 v128=123 funcref=112 externref=111
@@ -12,7 +12,7 @@ provide *
 #   GC ops (prefix 0xFB=251): struct.new=0 struct.new_default=1 struct.get=2
 #     struct.get_s=3 struct.get_u=4 struct.set=5 array.new=6 array.new_default=7
 #     array.new_fixed=8 array.get=11 array.get_s=12 array.get_u=13 array.set=14
-#     array.len=15 ref.test=20 ref.test_null=21 ref.cast=23 ref.cast_null=24
+#     array.len=15 ref.test=20 ref.test_null=21 ref.cast=22 ref.cast_null=23
 #     ref.i31=28 i31.get_s=29 i31.get_u=30
 #   ref.null ht = 208,ht (0xD0) ; ref.func=210 ; ref.is_null=209
 #   control: unreachable=0 nop=1 block=2 loop=3 if=4 else=5 end=11 br=12 br_if=13
@@ -31,11 +31,11 @@ fun sleb(n):
   done = ((rest == 0) and (byte < 64)) or ((rest == (0 - 1)) and (byte >= 64))
   if done: [list: byte] else: link(byte + 128, sleb(rest)) end
 end
-fun concat(lol):
-  cases(List) lol: | empty => empty | link(f, r) => append(f, concat(r)) end
+fun concat-bytes(lol):
+  cases(List) lol: | empty => empty | link(f, r) => append(f, concat-bytes(r)) end
 end
-fun cat(parts): concat(parts) end
-fun vec(items): append(leb-u(length(items)), concat(items)) end        # vector of pre-encoded items
+fun cat(parts): concat-bytes(parts) end
+fun vec(items): append(leb-u(length(items)), concat-bytes(items)) end        # vector of pre-encoded items
 fun byte-vec(bytes): append(leb-u(length(bytes)), bytes) end           # length-prefixed raw bytes
 fun list-eq(a, b):
   cases(List) a: | empty => is-empty(b)
@@ -116,7 +116,7 @@ fun i-br(label): link(12, leb-u(label)) end
 fun i-br-if(label): link(13, leb-u(label)) end
 
 # GC ops (0xFB = 251 prefix). Type/field operands are leb-u typeidx / fieldidx.
-fun gc(op, operands): append([list: 251], append(leb-u(op), concat(map(lam(o): leb-u(o) end, operands)))) end
+fun gc(op, operands): append([list: 251], append(leb-u(op), concat-bytes(map(lam(o): leb-u(o) end, operands)))) end
 fun struct-new(t): gc(0, [list: t]) end
 fun struct-new-default(t): gc(1, [list: t]) end
 fun struct-get(t, f): gc(2, [list: t, f]) end
@@ -133,8 +133,8 @@ array-len = gc(15, [list: ])
 fun array-copy(dst, src): gc(17, [list: dst, src]) end
 fun ref-test(ht): gc(20, [list: ht]) end
 fun ref-test-null(ht): gc(21, [list: ht]) end
-fun ref-cast(ht): gc(23, [list: ht]) end
-fun ref-cast-null(ht): gc(24, [list: ht]) end
+fun ref-cast(ht): gc(22, [list: ht]) end       # ref.cast (ref ht)      = 0xFB 0x16
+fun ref-cast-null(ht): gc(23, [list: ht]) end  # ref.cast (ref null ht) = 0xFB 0x17
 ref-i31 = append([list: 251], leb-u(28))
 i31-get-s = append([list: 251], leb-u(29))
 i31-get-u = append([list: 251], leb-u(30))
@@ -186,7 +186,7 @@ fun section(id, content): link(id, append(leb-u(length(content)), content)) end
 # 7 export, 9 element, 10 code, 11 data.
 fun wasm-module-of(type-c, import-c, func-c, table-c, mem-c, global-c, export-c, elem-c, code-c):
   fun s(id, c): if is-empty(c): empty else: section(id, c) end end
-  concat([list:
+  concat-bytes([list:
     wasm-magic,
     s(1, type-c), s(2, import-c), s(3, func-c), s(4, table-c), s(5, mem-c),
     s(6, global-c), s(7, export-c), s(9, elem-c), s(10, code-c) ])

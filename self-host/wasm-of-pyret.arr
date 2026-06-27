@@ -243,7 +243,7 @@ fun fv-of-lam(args, body): fv-subtract(fv-expr(body), arg-keys(args)) end
 # ===== a $Str (array i8) from a Pyret string's code points =====
 fun emit-str(s :: String) -> List<Number>:
   cps = string-to-code-points(s)
-  E.concat(cps.map(lam(cp): E.i32-const(cp) end)).append(E.array-new-fixed(T-STR, length(cps)))
+  E.concat-bytes(cps.map(lam(cp): E.i32-const(cp) end)).append(E.array-new-fixed(T-STR, length(cps)))
 end
 # read the boxed-var 1-cell at local `idx` -> its value
 fun box-read(idx :: Number) -> List<Number>:
@@ -280,7 +280,7 @@ fun compile-aval(v, c :: Ctx) -> List<Number>:
 end
 
 fun compile-avals(vs, c :: Ctx) -> List<Number>:
-  E.concat(vs.map(lam(v): compile-aval(v, c) end))
+  E.concat-bytes(vs.map(lam(v): compile-aval(v, c) end))
 end
 # pack a list of already-on-stack values into a $Fields array (caller pushed them)
 fun pack-fields(vs, c :: Ctx) -> List<Number>:
@@ -288,11 +288,11 @@ fun pack-fields(vs, c :: Ctx) -> List<Number>:
 end
 # a $Names array of $Str from field records (each with .name)
 fun emit-names(flds) -> List<Number>:
-  E.concat(flds.map(lam(f): emit-str(f.name) end)).append(E.array-new-fixed(T-NAMES, length(flds)))
+  E.concat-bytes(flds.map(lam(f): emit-str(f.name) end)).append(E.array-new-fixed(T-NAMES, length(flds)))
 end
 # a $Names array from a plain list of field-name strings
 fun emit-names-of(names) -> List<Number>:
-  E.concat(names.map(lam(nm): emit-str(nm) end)).append(E.array-new-fixed(T-NAMES, length(names)))
+  E.concat-bytes(names.map(lam(nm): emit-str(nm) end)).append(E.array-new-fixed(T-NAMES, length(names)))
 end
 
 # ===== prim-app dispatch =====
@@ -396,11 +396,11 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # collect-lambdas pass assigned this lambda; caps is its free vars packed into a
       # $Fields (read back inside the body from local 0). Closed lambdas get an empty caps.
       p = lookup-lam-pair(c.lams, tostring(l))
-      caps = E.concat(p.fvs.map(lam(k): load-capture(c, k) end)).append(E.array-new-fixed(T-FIELDS, length(p.fvs)))
+      caps = E.concat-bytes(p.fvs.map(lam(k): load-capture(c, k) end)).append(E.array-new-fixed(T-FIELDS, length(p.fvs)))
       E.i32-const(p.i).append(caps).append(E.struct-new(T-CLOSURE))
     | a-method(l, name, args, ret, body) =>
       p = lookup-lam-pair(c.lams, tostring(l))
-      caps = E.concat(p.fvs.map(lam(k): load-capture(c, k) end)).append(E.array-new-fixed(T-FIELDS, length(p.fvs)))
+      caps = E.concat-bytes(p.fvs.map(lam(k): load-capture(c, k) end)).append(E.array-new-fixed(T-FIELDS, length(p.fvs)))
       E.i32-const(p.i).append(caps).append(E.struct-new(T-CLOSURE)).append(E.struct-new(T-METHOD))
     | a-obj(l, fields) =>
       # $make_object(names, values)
@@ -460,7 +460,7 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # the top-level/global id resolution that a-id still leaves as null).
       this-names = variants.map(variant-name)
       emit-names-of(this-names)
-        .append(E.concat(variants.map(lam(vv): data-field-value(c, vv) end)))
+        .append(E.concat-bytes(variants.map(lam(vv): data-field-value(c, vv) end)))
         .append(E.array-new-fixed(T-FIELDS, length(variants)))
         .append(E.i-call(idx-make-object()))
     | a-ref(l, ann) => E.i-ref-null(110)                                   # TODO(port): bare ref
@@ -776,7 +776,7 @@ end
 # $variant_names global = (ref $Fields) of $Names, indexed by variant id, so
 # $variant_field_by_name can scan a variant's field names. Built from the registry.
 fun variant-names-init(ordered) -> List<Number>:
-  E.concat(ordered.map(lam(d): emit-names-of(d.fields) end)).append(E.array-new-fixed(T-FIELDS, length(ordered)))
+  E.concat-bytes(ordered.map(lam(d): emit-names-of(d.fields) end)).append(E.array-new-fixed(T-FIELDS, length(ordered)))
 end
 
 # ===== pre-pass: top-level binding keys (mirrored to globals) =====
@@ -806,8 +806,10 @@ fun compile-prog(prog) -> List<Number>:
       num-rt = length(RT-FUNS)
       num-ctors = length(dreg)
       ordered = ctors-by-id(dreg, 0, num-ctors)             # ctors in id order
-      # top-level globals follow $variant_names (global 0 when there are variants).
-      gbase = if num-ctors == 0: 0 else: 1 end
+      # $variant_names is ALWAYS global 0 (empty $Fields when there are no variants),
+      # because the $variant_field_by_name runtime kernel references global 0
+      # unconditionally; top-level globals follow it (gbase = 1).
+      gbase = 1
       tl-keys = collect-toplevel(body, empty).reverse()
       num-tl = length(tl-keys)
       gmap = map2(lam(k, gi): {k: k, gi: gbase + gi} end, tl-keys, range(0, num-tl))
@@ -851,10 +853,10 @@ fun compile-prog(prog) -> List<Number>:
       elem-c = if num-slots == 0: empty
                else: E.vec([list: E.elem-active-funcs(E.i32-const(0), all-slots)]) end
 
-      # ----- globals: $variant_names (global 0 when there are variants), then one
-      #       mutable anyref global per top-level binding (null-init; set in main) -----
-      vn-global = if num-ctors == 0: empty
-                  else: [list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))] end
+      # ----- globals: $variant_names ALWAYS at global 0 (empty $Fields when no
+      #       variants), then one mutable anyref global per top-level binding
+      #       (null-init; set in main) -----
+      vn-global = [list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))]
       tl-globals = range(0, num-tl).map(lam(_): E.global-entry(E.anyref, 1, E.i-ref-null(110)) end)
       all-globals = vn-global.append(tl-globals)
       global-c = if is-empty(all-globals): empty else: E.vec(all-globals) end
