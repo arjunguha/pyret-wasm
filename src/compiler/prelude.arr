@@ -117,6 +117,15 @@ sharing:
   method and-then(self, f): cases(Option) self: | none => none | some(x) => some(f(x)) end end
 end
 
+# Either — `either` is treated as prelude-provided (SKIP_MODULES), so left/right and
+# the Either type live here. left = "keep going" / right = "result" in fold-while etc.
+data Either:
+  | left(v)
+  | right(v)
+sharing:
+  method or-else(self, default): cases(Either) self: | left(_) => default | right(x) => x end end
+end
+
 # ---- boolean / numeric builtins (pure Pyret) ----
 fun not(b): if b: false else: true end end
 fun identity(x): x end
@@ -196,6 +205,24 @@ fun each_n(f, num, lst):
 end
 fun fold_n(f, num, base, lst):
   cases(List) lst: | empty => base | link(fst, rst) => fold_n(f, num + 1, f(num, base, fst), rst) end
+end
+# fold from the left while f returns left(acc); stop with right(v). (lists.fold-while)
+fun fold-while(f, base, lst):
+  cases(List) lst:
+    | empty => base
+    | link(elt, r) =>
+      cases(Either) f(base, elt):
+        | left(v) => fold-while(f, v, r)
+        | right(v) => v
+      end
+  end
+end
+# index of the first element satisfying pred (or -1); and Option variants used by the front-end.
+fun find-index(pred, lst):
+  fun helper(i, l):
+    cases(List) l: | empty => 0 - 1 | link(fst, rst) => if pred(fst): i else: helper(i + 1, rst) end end
+  end
+  helper(0, lst)
 end
 
 fun find(f, l):
