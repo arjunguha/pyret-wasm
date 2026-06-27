@@ -23,7 +23,7 @@ export class CompileError extends Error {
   }
 }
 
-interface VariantInfo { id: number; fields: string[]; methods?: { name: string; node: CstNode }[]; }
+interface VariantInfo { id: number; fields: string[]; methods?: { name: string; node: CstNode }[]; ownVariants?: string[]; }
 
 const ARITH_FN: Record<string, string> = {
   PLUS: "$num_add", DASH: "$num_sub", TIMES: "$num_mul", SLASH: "$num_divide",
@@ -33,6 +33,13 @@ const CMP: Record<string, (c: number, m: binaryen.Module) => number> = {
   GT: (c, m) => m.i32.gt_s(c, m.i32.const(0)),
   LEQ: (c, m) => m.i32.le_s(c, m.i32.const(0)),
   GEQ: (c, m) => m.i32.ge_s(c, m.i32.const(0)),
+};
+
+// Pyret binary operators desugar to method calls when the LHS is not a number/
+// string: `a + b` -> `a._plus(b)`, etc. (so data/objects can overload operators).
+const OP_METHOD: Record<string, string> = {
+  PLUS: "_plus", DASH: "_minus", TIMES: "_times", SLASH: "_divide",
+  LT: "_lessthan", GT: "_greaterthan", LEQ: "_lessequal", GEQ: "_greaterequal",
 };
 
 // Per-function compilation context.
@@ -58,6 +65,10 @@ class Compiler {
   m: binaryen.Module;
   t: RtTypes;
   variants = new Map<string, VariantInfo>();
+  // While compiling a data type's method bodies, its own variant constructors win
+  // over any top-level `shadow` of the same name (e.g. pprint's _plus uses the
+  // `concat` VARIANT even though `shadow concat = lam(a,b): a + b end` exists).
+  private methodVariantScope: Set<string> | null = null;
   nextVariantId = 1;
   topScope = new Map<string, string>(); // pyret name -> wasm global name
   moduleAliases = new Set<string>();    // `import lib as N` -> N (resolved to globals)
@@ -159,7 +170,19 @@ class Compiler {
       if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr") {
         const name = this.bindingName(this.letBinding(inner));
         const gname = this.topScope.get(name)!;
-        body.push(m.global.set(gname, this.compileExpr(inner.kids[inner.kids.length - 1]!, ctx, false)));
+        // `shadow x = <expr>` — the RHS must see the OUTER x (e.g. the variant the
+        // smart constructor wraps: `shadow str = lam(s): str(s, ...) end`), not the
+        // new global (which would self-recurse). All top-level names are pre-registered
+        // as globals, so temporarily mask this one while compiling the RHS, letting
+        // resolveName fall through to the variant/outer binding.
+        // Only mask when there's a variant to fall through to (smart-constructor
+        // shadows); leave other shadows alone so they don't become unbound.
+        const shadowed = inner.name === "let-expr" && this.variants.has(name)
+          && this.hasShadowToken(this.letBinding(inner));
+        if (shadowed) this.topScope.delete(name);
+        const initVal = this.compileExpr(inner.kids[inner.kids.length - 1]!, ctx, false);
+        if (shadowed) this.topScope.set(name, gname);
+        body.push(m.global.set(gname, initVal));
       } else if (inner.name === "check-expr") {
         body.push(this.compileCheckExpr(inner, ctx));
       } else if (inner.name === "check-test" && inner.kids.length > 1) {
@@ -226,8 +249,14 @@ class Compiler {
     // `with:` methods override them by name.
     const sharing = this.childNamed(dataExpr, "data-sharing");
     const shared = sharing ? this.collectMethods(sharing) : [];
-    for (const kid of dataExpr.kids) {
-      if (kid.name !== "first-data-variant" && kid.name !== "data-variant") continue;
+    const variantKids = dataExpr.kids.filter((k) => k.name === "first-data-variant" || k.name === "data-variant");
+    // All constructor names of this data decl — its methods resolve these to the
+    // variants even when a later top-level `shadow` rebinds the same name.
+    const ownVariants = variantKids.map((kid) => {
+      const ctor = this.childNamed(kid, "variant-constructor");
+      return ctor ? this.childNamed(ctor, "NAME")!.value! : this.childNamed(kid, "NAME")!.value!;
+    });
+    for (const kid of variantKids) {
       const own = this.collectMethods(this.childNamed(kid, "data-with"));
       const byName = new Map<string, { name: string; node: CstNode }>();
       for (const s of shared) byName.set(s.name, s);
@@ -240,10 +269,10 @@ class Compiler {
         const fields = members
           ? members.kids.filter((k) => k.name === "variant-member").map((vm) => this.bindingName(this.childNamed(vm, "binding")!))
           : [];
-        this.variants.set(name, { id: this.nextVariantId++, fields, methods });
+        this.variants.set(name, { id: this.nextVariantId++, fields, methods, ownVariants });
       } else {
         const nm = this.childNamed(kid, "NAME");
-        if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods });
+        if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods, ownVariants });
       }
     }
   }
@@ -271,7 +300,7 @@ class Compiler {
     body.push(m.global.set("$variant_methods", m.array.new_fixed(this.t.Fields, nulls)));
     const reg = () => m.ref.cast(m.global.get("$variant_methods", this.t.FieldsRefNull), this.t.FieldsRef);
     for (const v of withMethods) {
-      body.push(m.array.set(reg(), m.i32.const(v.id), this.makeMethodsObject(v.methods!, ctx)));
+      body.push(m.array.set(reg(), m.i32.const(v.id), this.makeMethodsObject(v.methods!, ctx, v.ownVariants)));
     }
   }
   // Populate $variant_names[id] with the variant's field-name list ($Names array),
@@ -289,13 +318,16 @@ class Compiler {
     }
   }
   // An $Object holding a variant's methods (name -> $Method closure), self-bound.
-  private makeMethodsObject(methods: { name: string; node: CstNode }[], ctx: Ctx): number {
+  private makeMethodsObject(methods: { name: string; node: CstNode }[], ctx: Ctx, ownVariants?: string[]): number {
     const m = this.m;
     const names = methods.map((meth) => this.strLiteralRaw(meth.name));
+    const savedScope = this.methodVariantScope;
+    this.methodVariantScope = ownVariants ? new Set(ownVariants) : savedScope;
     const values = methods.map((meth) => {
       const closure = this.buildClosureFromParts(this.headerParamBindings(meth.node), this.childNamed(meth.node, "block")!, ctx, "$vmth_");
       return m.struct.new([m.ref.cast(closure, this.t.ClosureRef)], this.t.Method);
     });
+    this.methodVariantScope = savedScope;
     return m.call("$make_object", [m.array.new_fixed(this.t.Names, names), m.array.new_fixed(this.t.Fields, values)], this.t.ObjectRef);
   }
 
@@ -523,6 +555,11 @@ class Compiler {
       const caps = m.struct.get(1, m.local.get(0, this.t.ClosureRef), this.t.FieldsRefNull, false);
       const cell = m.array.get(caps, m.i32.const(ctx.captures.get(name)!), binaryen.anyref, false);
       return (ctx.boxed.has(name) && !raw) ? this.unbox(cell) : cell;
+    }
+    // Inside a data type's methods, its own variant wins over a top-level `shadow`.
+    if (this.methodVariantScope?.has(name) && this.variants.has(name)) {
+      const vv = this.variants.get(name)!;
+      return vv.fields.length === 0 ? this.makeVariant(name, vv, []) : this.makeClosure(this.constructorFnIndex(name, vv), [], ctx);
     }
     if (this.topScope.has(name)) return m.global.get(this.topScope.get(name)!, binaryen.anyref);
     const v = this.variants.get(name);
@@ -1160,7 +1197,11 @@ class Compiler {
     // latent over-application in a never-run visitor branch) fall through to the
     // reified constructor closure, which reads exactly its field count — Pyret
     // defers constructor arity to runtime, so we don't hard-error at compile time.
-    if (name && this.variants.has(name) && !this.isBound(name, ctx)
+    // A data type's own variant constructor wins over a top-level `shadow` inside
+    // its method bodies (methodVariantScope), unless lexically rebound (param/local).
+    const lexBound = !!name && (ctx.locals.has(name) || ctx.params.has(name) || ctx.captures.has(name));
+    const preferVariant = !!name && this.methodVariantScope?.has(name) === true && !lexBound;
+    if (name && this.variants.has(name) && (preferVariant || !this.isBound(name, ctx))
         && this.variants.get(name)!.fields.length === args.length) {
       return this.makeVariant(name, this.variants.get(name)!, args);
     }
@@ -1514,24 +1555,84 @@ class Compiler {
         continue;
       }
       const right = this.compileExpr(kids[i + 1]!, ctx, false);
-      acc = this.applyBinop(opTok.name, acc, right, kids[i]!);
+      acc = this.applyBinop(opTok.name, acc, right, kids[i]!, ctx);
     }
     return acc;
   }
 
-  private applyBinop(op: string, left: number, right: number, opNode: CstNode): number {
+  private applyBinop(op: string, left: number, right: number, opNode: CstNode, ctx: Ctx): number {
     const m = this.m;
-    if (op === "PLUS") return m.call("$plus", [left, right], binaryen.anyref);
-    if (ARITH_FN[op]) return m.call(ARITH_FN[op]!, [this.asNum(left), this.asNum(right)], this.t.NumRef);
+    // Arithmetic/comparison: primitive on numbers (PLUS also on strings), else
+    // dispatch to the operator method (_plus/_minus/_lessthan/...) so data and
+    // objects can overload operators (e.g. pprint's PPrintDoc._plus).
+    if (op === "PLUS") {
+      return this.numOrMethod(left, right, ctx, "_plus", true,
+        (l, r) => m.call("$plus", [l, r], binaryen.anyref));
+    }
+    if (ARITH_FN[op]) {
+      return this.numOrMethod(left, right, ctx, OP_METHOD[op]!, false,
+        (l, r) => m.call(ARITH_FN[op]!, [this.asNum(l), this.asNum(r)], this.t.NumRef));
+    }
     if (CMP[op]) {
-      const c = m.call("$num_compare", [this.asNum(left), this.asNum(right)], binaryen.i32);
-      return this.mkBool(CMP[op]!(c, m));
+      return this.numOrMethod(left, right, ctx, OP_METHOD[op]!, false,
+        (l, r) => this.mkBool(CMP[op]!(m.call("$num_compare", [this.asNum(l), this.asNum(r)], binaryen.i32), m)));
     }
     if (op === "EQUALEQUAL") return this.mkBool(m.call("$equal", [left, right], binaryen.i32));
     if (op === "NEQ") return this.mkBool(m.i32.eqz(m.call("$equal", [left, right], binaryen.i32)));
     if (op === "AND") return this.mkBool(m.i32.and(this.truthy(left), this.truthy(right)));
     if (op === "OR") return this.mkBool(m.i32.or(this.truthy(left), this.truthy(right)));
     throw new CompileError(`unsupported binop: ${op}`, opNode);
+  }
+
+  // Apply a primitive numeric op when `left` is a number (or string, for PLUS),
+  // otherwise call left's operator method. Both operands are stashed in locals
+  // so they're evaluated once.
+  private numOrMethod(left: number, right: number, ctx: Ctx, methodName: string,
+                      allowStr: boolean, prim: (l: number, r: number) => number): number {
+    const m = this.m;
+    const L = ctx.addLocal(binaryen.anyref);
+    const R = ctx.addLocal(binaryen.anyref);
+    const lg = () => m.local.get(L, binaryen.anyref);
+    const rg = () => m.local.get(R, binaryen.anyref);
+    const isNum = m.ref.test(lg(), this.t.NumRefNull);
+    const cond = allowStr ? m.i32.or(isNum, m.ref.test(lg(), this.t.StrRefNull)) : isNum;
+    return m.block(null, [
+      m.local.set(L, left),
+      m.local.set(R, right),
+      m.if(cond, prim(lg(), rg()), this.dispatchMethodValue(lg(), methodName, [rg()], ctx), binaryen.anyref),
+    ], binaryen.anyref);
+  }
+
+  // Call value.method(args...) given already-compiled value/arg expressions.
+  // Mirrors compileMethodCall's variant-vs-object method lookup + dispatch.
+  private dispatchMethodValue(objExpr: number, name: string, argExprs: number[], ctx: Ctx): number {
+    const m = this.m;
+    const objLocal = ctx.addLocal(binaryen.anyref);
+    const fieldLocal = ctx.addLocal(binaryen.anyref);
+    const argLocals = argExprs.map(() => ctx.addLocal(binaryen.anyref));
+    const prelude: number[] = [m.local.set(objLocal, objExpr)];
+    argExprs.forEach((a, i) => prelude.push(m.local.set(argLocals[i]!, a)));
+    const obj = () => m.local.get(objLocal, binaryen.anyref);
+    const methodsSource = m.if(
+      m.ref.test(obj(), this.t.VariantRefNull),
+      m.ref.cast(
+        m.array.get(m.ref.cast(m.global.get("$variant_methods", this.t.FieldsRefNull), this.t.FieldsRef),
+          m.call("$variant_id", [m.ref.cast(obj(), this.t.VariantRef)], binaryen.i32),
+          binaryen.anyref, false),
+        this.t.ObjectRef),
+      m.ref.cast(obj(), this.t.ObjectRef),
+      this.t.ObjectRef);
+    prelude.push(m.local.set(fieldLocal,
+      m.call("$obj_get", [methodsSource, this.strLiteralRaw(name)], binaryen.anyref)));
+    const field = () => m.local.get(fieldLocal, binaryen.anyref);
+    const argGets = argLocals.map((l) => m.local.get(l, binaryen.anyref));
+    const methodClosure = m.call("$method_closure", [m.ref.cast(field(), this.t.MethodRef)], this.t.ClosureRef);
+    const methodCall = this.callClosureValue(methodClosure, [obj(), ...argGets], ctx, false);
+    const plainCall = this.callClosureValue(field(), argGets, ctx, false);
+    return m.block(null, [
+      ...prelude,
+      m.if(m.ref.test(field(), this.t.MethodRefNull), methodCall, plainCall, binaryen.anyref),
+    ], binaryen.anyref);
   }
 
   private compileIf(node: CstNode, ctx: Ctx, tail: boolean): number {
