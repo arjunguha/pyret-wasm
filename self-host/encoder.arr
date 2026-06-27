@@ -103,6 +103,7 @@ fun i-return-call-indirect(typeidx, tableidx): append([list: 19], append(leb-u(t
 fun i-ref-null(ht): link(208, leb-u(ht)) end   # NB: heaptypes >=0 are typeidx; abstract use the negative encodings (TODO)
 fun i-ref-func(i): link(210, leb-u(i)) end
 ref-eq = [list: 211]                            # ref.eq : (eqref, eqref) -> i32  (0xD3)
+ref-is-null = [list: 209]                       # ref.is_null : (ref null t) -> i32  (0xD1)
 # control flow. blocktype: 64 = empty; a single value type list = that result type;
 # a typeidx (sleb, non-negative) = a function-type block.
 bt-empty = [list: 64]
@@ -128,6 +129,8 @@ fun array-get-s(t): gc(12, [list: t]) end   # packed (i8/i16) signed read
 fun array-get-u(t): gc(13, [list: t]) end   # packed (i8/i16) unsigned read
 fun array-set(t): gc(14, [list: t]) end
 array-len = gc(15, [list: ])
+# array.copy dst src : stack [dst, dst-off, src, src-off, len] (len on top)
+fun array-copy(dst, src): gc(17, [list: dst, src]) end
 fun ref-test(ht): gc(20, [list: ht]) end
 fun ref-test-null(ht): gc(21, [list: ht]) end
 fun ref-cast(ht): gc(23, [list: ht]) end
@@ -141,8 +144,9 @@ i32-eqz = [list: 69]  i32-eq = [list: 70]  i32-ne = [list: 71]
 i32-lt-s = [list: 72]  i32-gt-s = [list: 74]  i32-le-s = [list: 76]  i32-ge-s = [list: 78]
 i32-add = [list: 106]  i32-sub = [list: 107]  i32-mul = [list: 108]  i32-div-s = [list: 109]
 i32-and = [list: 113]  i32-or = [list: 114]  i32-shl = [list: 116]  i32-shr-u = [list: 118]
-i64-eqz = [list: 80]  i64-eq = [list: 81]  i64-lt-s = [list: 83]  i64-gt-s = [list: 85]
+i64-eqz = [list: 80]  i64-eq = [list: 81]  i64-ne = [list: 82]  i64-lt-s = [list: 83]  i64-gt-s = [list: 85]
 i64-le-s = [list: 87]  i64-ge-s = [list: 89]
+i-select = [list: 27]   # select : [a, b, cond:i32] -> a if cond else b
 i64-add = [list: 124]  i64-sub = [list: 125]  i64-mul = [list: 126]  i64-div-s = [list: 127]
 i64-rem-s = [list: 129]  i64-and = [list: 131]  i64-or = [list: 132]  i64-shl = [list: 134]  i64-shr-u = [list: 136]
 f64-add = [list: 160]  f64-sub = [list: 161]  f64-mul = [list: 162]  f64-div = [list: 163]  f64-sqrt = [list: 159]

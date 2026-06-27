@@ -120,6 +120,34 @@ fun lookup-local(c :: Ctx, key) -> Number:
     | some(i) => i
   end
 end
+# top-level/global resolution: the `fenv` Ctx slot carries the global map
+# (List<{k; gi}>: top-level binding key -> wasm global index). Top-level bindings are
+# mirrored into mutable anyref globals so lambdas (which do NOT capture top-level names)
+# resolve them by global.get — enabling forward/mutually-recursive top-level reference.
+fun gmap-lookup(c :: Ctx, key):
+  find-gi(c.fenv, key)
+end
+fun find-gi(ps, key):
+  cases(List) ps:
+    | empty => none
+    | link(f, r) => if f.k == key: some(f.gi) else: find-gi(r, key) end
+  end
+end
+# resolve an id that is NOT a local: global.get if top-level, else null. (TODO(port):
+# module-qualified refs.)
+fun resolve-nonlocal(c :: Ctx, key) -> List<Number>:
+  cases(Option) gmap-lookup(c, key):
+    | some(gi) => E.global-get(gi)
+    | none => E.i-ref-null(110)
+  end
+end
+# if `key` is a top-level global, mirror the just-bound local `idx` into it.
+fun mirror-global(c :: Ctx, key, idx :: Number) -> List<Number>:
+  cases(Option) gmap-lookup(c, key):
+    | none => empty
+    | some(gi) => E.local-get(idx).append(E.global-set(gi))
+  end
+end
 # variant-name -> {id; arity; fields} option, from the data registry.
 fun data-lookup(c :: Ctx, name :: String): dreg-find(c.dreg, name) end
 fun dreg-find(ds, name :: String):
@@ -242,7 +270,7 @@ fun compile-aval(v, c :: Ctx) -> List<Number>:
     | a-id(l, id) =>
       k = name-key(id)
       cases(Option) lookup-local-opt(c, k):
-        | none => E.i-ref-null(110)                                          # TODO(port): top-level/global ref
+        | none => resolve-nonlocal(c, k)                                     # top-level global, else null
         | some(i) => if is-var(c, k): box-read(i) else: E.local-get(i) end
       end
     | a-srcloc(l, loc) => E.i-ref-null(110)                                  # TODO(port): srcloc value
@@ -331,12 +359,13 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
     | a-id-var(l, id) =>
       k = name-key(id)
       cases(Option) lookup-local-opt(c, k):
-        | none => E.i-ref-null(110)
+        | none => resolve-nonlocal(c, k)
         | some(i) => if is-var(c, k): box-read(i) else: E.local-get(i) end
       end
     | a-id-letrec(l, id, safe) =>
-      cases(Option) lookup-local-opt(c, name-key(id)):
-        | none => E.i-ref-null(110)
+      k = name-key(id)
+      cases(Option) lookup-local-opt(c, k):
+        | none => resolve-nonlocal(c, k)
         | some(i) => E.local-get(i)
       end
     | a-id-var-modref(l, id, uri, name) => E.i-ref-null(110)                # TODO(port): module ref
@@ -531,9 +560,11 @@ fun compile-aexpr(e, c :: Ctx, tail :: Boolean) -> List<Number>:
   cases(N.AExpr) e:
     | a-let(l, b, lt, body) =>
       idx = c.next-local
+      k = name-key(b.id)
       compile-lettable(lt, c, false)
         .append(E.local-set(idx))
-        .append(compile-aexpr(body, bind-local(c, name-key(b.id), idx), tail))
+        .append(mirror-global(c, k, idx))                 # top-level: also set the global
+        .append(compile-aexpr(body, bind-local(c, k, idx), tail))
     | a-var(l, b, lt, body) =>
       # box the value into a 1-cell $Fields so closures share the mutation.
       idx = c.next-local
@@ -547,9 +578,11 @@ fun compile-aexpr(e, c :: Ctx, tail :: Boolean) -> List<Number>:
     | a-type-let(l, bind, body) => compile-aexpr(body, c, tail)            # types erased
     | a-arr-let(l, b, idx2, lt, body) =>
       slot = c.next-local
+      k = name-key(b.id)
       compile-lettable(lt, c, false)
         .append(E.local-set(slot))
-        .append(compile-aexpr(body, bind-local(c, name-key(b.id), slot), tail))
+        .append(mirror-global(c, k, slot))
+        .append(compile-aexpr(body, bind-local(c, k, slot), tail))
   end
 end
 
@@ -700,8 +733,8 @@ end
 # compile one lambda to a code entry: caps (free vars from the closure env, local 0) and
 # args (from the $Fields param, local 1) are loaded into fresh locals, then the body in
 # tail position.  A captured `var` is re-bound as a var so reads/writes go through the box.
-fun compile-lam(lr, lam-map, dreg, gvars, nlams :: Number) -> List<Number>:
-  c0 = ctx(empty, 2, empty, empty, lam-map, dreg, gvars, nlams)
+fun compile-lam(lr, lam-map, dreg, gvars, nlams :: Number, gmap) -> List<Number>:
+  c0 = ctx(empty, 2, empty, gmap, lam-map, dreg, gvars, nlams)
   capres = bind-caps(lr.fvs, 0, c0, empty)
   argres = setup-args(lr.args, capres.cx, capres.code, 0)
   body-code = compile-aexpr(lr.body, argres.cx, true)
@@ -746,25 +779,49 @@ fun variant-names-init(ordered) -> List<Number>:
   E.concat(ordered.map(lam(d): emit-names-of(d.fields) end)).append(E.array-new-fixed(T-FIELDS, length(ordered)))
 end
 
+# ===== pre-pass: top-level binding keys (mirrored to globals) =====
+# Walk the a-let/a-arr-let/a-seq spine of the program body, collecting the keys bound
+# at the TOP LEVEL. These become mutable anyref globals so lambdas resolve them by
+# global.get (instead of capturing), supporting forward/mutual top-level reference.
+# (a-var top-level bindings are left local-only: their box semantics don't map cleanly
+# to a value global — TODO(port).)
+fun collect-toplevel(e, acc):
+  cases(N.AExpr) e:
+    | a-let(_, b, _, body) => collect-toplevel(body, link(name-key(b.id), acc))
+    | a-arr-let(_, b, _, _, body) => collect-toplevel(body, link(name-key(b.id), acc))
+    | a-var(_, _, _, body) => collect-toplevel(body, acc)
+    | a-seq(_, _, e2) => collect-toplevel(e2, acc)
+    | a-type-let(_, _, body) => collect-toplevel(body, acc)
+    | else => acc
+  end
+end
+
 # ===== program assembler =====
 fun compile-prog(prog) -> List<Number>:
   cases(N.AProg) prog:
     | a-program(l, provides, imports, body) =>
-      lams = collect-lams-expr(body, empty).reverse()       # source order
+      lams-raw = collect-lams-expr(body, empty).reverse()   # source order
       dreg = collect-data-expr(body, empty)                 # registry (ids by encounter)
       gvars = collect-gvars-expr(body, empty)               # a-var-bound keys
-      lam-map = index-pairs(lams, 0, empty)
       num-rt = length(RT-FUNS)
-      num-lams = length(lams)
       num-ctors = length(dreg)
       ordered = ctors-by-id(dreg, 0, num-ctors)             # ctors in id order
+      # top-level globals follow $variant_names (global 0 when there are variants).
+      gbase = if num-ctors == 0: 0 else: 1 end
+      tl-keys = collect-toplevel(body, empty).reverse()
+      num-tl = length(tl-keys)
+      gmap = map2(lam(k, gi): {k: k, gi: gbase + gi} end, tl-keys, range(0, num-tl))
+      # top-level names are resolved via globals, so DON'T capture them into closures.
+      lams = lams-raw.map(lam(lr): {key: lr.key, args: lr.args, body: lr.body, fvs: fv-subtract(lr.fvs, tl-keys)} end)
+      lam-map = index-pairs(lams, 0, empty)
+      num-lams = length(lams)
       # funcidx space: [imports 0..NUM-IMPORTS-1][runtime][lambdas][ctors][main].
       main-funcidx = NUM-IMPORTS + (((num-rt + num-lams) + num-ctors))
 
       # ----- main (() -> anyref), the lambda bodies, and the ctor bodies -----
-      main-ctx = ctx(empty, 0, empty, empty, lam-map, dreg, gvars, num-lams)
+      main-ctx = ctx(empty, 0, empty, gmap, lam-map, dreg, gvars, num-lams)
       main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], compile-aexpr(body, main-ctx, true))
-      lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams) end)
+      lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry
       # would append a second `end`).
@@ -794,9 +851,13 @@ fun compile-prog(prog) -> List<Number>:
       elem-c = if num-slots == 0: empty
                else: E.vec([list: E.elem-active-funcs(E.i32-const(0), all-slots)]) end
 
-      # ----- global: $variant_names (only when there are variants) -----
-      global-c = if num-ctors == 0: empty
-                 else: E.vec([list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))]) end
+      # ----- globals: $variant_names (global 0 when there are variants), then one
+      #       mutable anyref global per top-level binding (null-init; set in main) -----
+      vn-global = if num-ctors == 0: empty
+                  else: [list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))] end
+      tl-globals = range(0, num-tl).map(lam(_): E.global-entry(E.anyref, 1, E.i-ref-null(110)) end)
+      all-globals = vn-global.append(tl-globals)
+      global-c = if is-empty(all-globals): empty else: E.vec(all-globals) end
 
       # ----- import section: host functions, module "host" (occupy the low funcidxs) -----
       import-c = E.vec(map2(lam(hi, k): E.import-func("host", hi.name, import-type-idx(k)) end,
