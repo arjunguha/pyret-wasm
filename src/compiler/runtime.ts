@@ -469,6 +469,30 @@ export class Runtime {
           m.call("$check_fail_pred", [m.i32.const(0), m.i32.const(0)], binaryen.none)),
       ]));
     }
+
+    // $check_is_refine(a, b, ok): `a is%(pred) b` — the comparator was applied at
+    // the call site, `ok` is its boolean result.  total++; ok? passed++ : report
+    // (stash a, fail b — same rendered shape as $check_is).
+    {
+      const ar = () => m.local.get(0, binaryen.anyref);
+      const br = () => m.local.get(1, binaryen.anyref);
+      const ok = () => m.local.get(2, I);
+      const ln = () => m.local.get(3, I);
+      const mk = (failFn: string) => m.block(null, [
+        m.global.set("$total", m.i32.add(m.global.get("$total", I), m.i32.const(1))),
+        m.if(ok(),
+          m.global.set("$passed", m.i32.add(m.global.get("$passed", I), m.i32.const(1))),
+          m.block(null, [
+            m.local.set(3, m.call("$val_to_string", [ar()], I)),
+            m.call("$check_stash", [m.i32.const(SCRATCH_OFFSET), ln()], binaryen.none),
+            m.local.set(3, m.call("$val_to_string", [br()], I)),
+            m.call(failFn, [m.i32.const(SCRATCH_OFFSET), ln()], binaryen.none),
+          ])),
+      ]);
+      const refineSig = binaryen.createType([binaryen.anyref, binaryen.anyref, I]);
+      m.addFunction("$check_is_refine", refineSig, binaryen.none, [I], mk("$check_fail"));
+      m.addFunction("$check_isnot_refine", refineSig, binaryen.none, [I], mk("$check_fail_isnot"));
+    }
   }
 
   private buildStrings() {
