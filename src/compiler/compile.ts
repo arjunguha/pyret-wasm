@@ -1294,15 +1294,15 @@ class Compiler {
     }
     // Raw arrays = a $Fields (array (mut anyref)). The rest of the raw-array library
     // (to-list/map/each/fold) is built on these in the prelude.
-    if (name === "raw-array-get" && args.length === 2) {
+    if ((name === "raw-array-get" || name === "prim-raw-array-get") && args.length === 2) {
       return m.array.get(m.ref.cast(args[0]!, this.t.FieldsRef),
         m.call("$num_to_i32", [args[1]!], binaryen.i32), binaryen.anyref, false);
     }
-    if (name === "raw-array-length" && args.length === 1) {
+    if ((name === "raw-array-length" || name === "prim-raw-array-length") && args.length === 1) {
       return m.call("$make_fix",
         [m.i64.extend_u(m.array.len(m.ref.cast(args[0]!, this.t.FieldsRef)))], this.t.FixnumRef);
     }
-    if (name === "raw-array-set" && args.length === 3) {
+    if ((name === "raw-array-set" || name === "prim-raw-array-set") && args.length === 3) {
       const a = ctx.addLocal(binaryen.anyref);
       return m.block(null, [
         m.local.set(a, args[0]!),
@@ -1312,7 +1312,7 @@ class Compiler {
       ], binaryen.anyref);
     }
     // raw-array-of(elt, n) -> a fresh $Fields of length n, every slot = elt.
-    if (name === "raw-array-of" && args.length === 2) {
+    if ((name === "raw-array-of" || name === "prim-raw-array-of") && args.length === 2) {
       return m.array.new(this.t.Fields, m.call("$num_to_i32", [args[1]!], binaryen.i32), args[0]!);
     }
     // Type predicates (value-model). Each returns a Pyret boolean by testing the
