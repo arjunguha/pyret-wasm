@@ -91,3 +91,20 @@ test("mutable string-dict: set-now mutates a shared cell; each-key-now", async (
     s`)).toBe("3");
   expect(await result(`[mutable-string-dict: "a", 1].has-key-now("a")`)).toBe("true");
 });
+
+test("type predicates", async () => {
+  const t = async (src: string) => (await run(await buildSource(src))).output.trim();
+  expect(await t('is-string("hi")')).toBe("true");
+  expect(await t("is-string(5)")).toBe("false");
+  expect(await t("is-number(5)")).toBe("true");
+  expect(await t("is-number(1/2)")).toBe("true");
+  expect(await t("is-boolean(true)")).toBe("true");
+  expect(await t("is-boolean(nothing)")).toBe("false");
+  expect(await t("is-nothing(nothing)")).toBe("true");
+  expect(await t("is-nothing(5)")).toBe("false");
+  expect(await t("is-function(lam(x): x end)")).toBe("true");
+  expect(await t("is-function(5)")).toBe("false");
+  expect(await t("is-tuple({1; 2})")).toBe("true");
+  expect(await t("is-tuple(5)")).toBe("false");
+  expect(await t("is-number(num-to-roughnum(2))")).toBe("true");
+});

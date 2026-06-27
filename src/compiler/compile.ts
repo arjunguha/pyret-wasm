@@ -1143,6 +1143,44 @@ class Compiler {
     if (name === "raw-array-of" && args.length === 2) {
       return m.array.new(this.t.Fields, m.call("$num_to_i32", [args[1]!], binaryen.i32), args[0]!);
     }
+    // Type predicates (value-model). Each returns a Pyret boolean by testing the
+    // value's runtime representation. booleans/nothing are i31 (0/1/2).
+    if (args.length === 1) {
+      const simple: Record<string, binaryen.Type> = {
+        "is-string": this.t.StrRefNull,
+        "is-number": this.t.NumRefNull,
+        "is-function": this.t.ClosureRefNull,
+        "is-object": this.t.ObjectRefNull,
+        "is-raw-array": this.t.FieldsRefNull,
+      };
+      if (name in simple) return this.mkBool(m.ref.test(args[0]!, simple[name]!));
+      // i31-tag predicates: guard with ref.test i31ref, then read the tag.
+      const i31pred = (wantEq: ((g: number) => number)) => {
+        const a = ctx.addLocal(binaryen.anyref);
+        const get = () => m.local.get(a, binaryen.anyref);
+        return m.block(null, [
+          m.local.set(a, args[0]!),
+          this.mkBool(m.if(m.ref.test(get(), binaryen.i31ref),
+            wantEq(m.i31.get_s(m.ref.cast(get(), binaryen.i31ref))),
+            m.i32.const(0), binaryen.i32)),
+        ], binaryen.anyref);
+      };
+      if (name === "is-boolean") return i31pred((g) => m.i32.lt_s(g, m.i32.const(2)));
+      if (name === "is-nothing") return i31pred((g) => m.i32.eq(g, m.i32.const(2)));
+      if (name === "is-tuple") {
+        const a = ctx.addLocal(binaryen.anyref);
+        const get = () => m.local.get(a, binaryen.anyref);
+        return m.block(null, [
+          m.local.set(a, args[0]!),
+          this.mkBool(m.if(m.ref.test(get(), this.t.VariantRefNull),
+            m.i32.eq(m.call("$variant_id", [m.ref.cast(get(), this.t.VariantRef)], binaryen.i32), m.i32.const(0)),
+            m.i32.const(0), binaryen.i32)),
+        ], binaryen.anyref);
+      }
+      if (name === "num-to-roughnum") {
+        return m.call("$make_rough", [m.call("$to_f64", [this.asNum(args[0]!)], binaryen.f64)], this.t.RoughnumRef);
+      }
+    }
     if ((name === "print" || name === "display" || name === "print-error") && args.length === 1) {
       const argLocal = ctx.addLocal(binaryen.anyref);
       const len = ctx.addLocal(binaryen.i32);
