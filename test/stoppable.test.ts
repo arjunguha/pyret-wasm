@@ -167,3 +167,32 @@ test("stoppable: a normal program is NOT reported stopped", async () => {
   expect(r.stopped).toBe(false);
   expect(r.output.trim()).toBe("81");
 });
+
+// ---- check: blocks (CPS-transformed) ----
+// The CPS transform handles `check:` blocks by CPS-evaluating each test's operands to
+// values (so calls inside stay interruptible) then comparing them in a check block — so
+// the seed's check harness records pass/fail + renders messages exactly as the direct
+// compiler. Only equality-comparison ops (is / is-not / is-roughly / ...) are supported;
+// satisfies/is%/raises call a user predicate/thunk that, post-CPS, takes a continuation
+// the harness can't supply.
+// NOTE: run-stoppable displays the top-level `nothing` result (the seed's run() suppresses
+// it), so we strip standalone "nothing" lines before comparing the check-harness output.
+async function checkAgrees(src: string): Promise<void> {
+  const seedOut = (await run(await buildSource(src))).output.trimEnd();
+  const stopRaw = (await runStoppable(await buildStoppableSource(src), { noYield: true }).promise).output.trimEnd();
+  const stopOut = stopRaw.split("\n").filter((l) => l !== "nothing").join("\n");
+  expect(stopOut, `check output for ${JSON.stringify(src)}`).toBe(seedOut);
+}
+
+test("stoppable: check block (passing) matches the seed", async () => {
+  await checkAgrees("check: 2 + 3 is 5 end");
+});
+test("stoppable: check block (failing) matches the seed", async () => {
+  await checkAgrees("check: 2 + 3 is 6 end");
+});
+test("stoppable: named check block, mixed pass/fail + is-not, matches the seed", async () => {
+  await checkAgrees('check "nm": 1 is 1\n  2 is-not 2\n  3 is 3 end');
+});
+test("stoppable: check with interruptible call in a test operand matches the seed", async () => {
+  await checkAgrees("fun f(x): x + 1 end\ncheck: f(4) is 5 end");
+});

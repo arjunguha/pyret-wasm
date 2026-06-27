@@ -67,16 +67,16 @@ const MATRIX: [string, string][] = [
 // Per-compiler PENDING — programs a given compiler can't handle YET. Promote into
 // MATRIX once ALL THREE handle it. (The seed handles all of these today.)
 //   self-hosted: needs data/cases-in-anf, prelude inclusion (lists/print), check-in-anf.
-//   stoppable:   CPS prelude inclusion already gives lists/strings; `check:` not yet.
+//   stoppable:   handles check: now (see test/stoppable.test.ts); nothing pending.
 const PENDING_SELF_HOSTED: [string, string][] = [
   ["check: 2 + 3 is 5 end", "(check block)"],
   ["[list: 1, 2, 3].length()", "3"],     // works on seed + stoppable; not self-hosted yet
   ["data D: | a(n) | b end\ncases(D) a(7): | a(n) => n | b => 0 end", "7"],
   ['"ab" + "cd"', '"abcd"'],              // works on seed + stoppable; not self-hosted yet
 ];
-const PENDING_STOPPABLE: [string, string][] = [
-  ["check: 2 + 3 is 5 end", "(check block)"], // CPS check-block handling not wired yet
-];
+// stoppable now handles check: (promoted — see test/stoppable.test.ts check tests),
+// lists, and strings; nothing pending for the stoppable compiler.
+const PENDING_STOPPABLE: [string, string][] = [];
 
 const wrap = (expr: string, expected: string) => `if (${expr}) == ${expected}: 0 else: 1 / 0 end`;
 
