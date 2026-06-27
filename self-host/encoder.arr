@@ -54,6 +54,10 @@ eqreft = [list: 109]
 i31reft = [list: 108]
 fun ref-null-t(ht): [list: 99, ht] end       # (ref null <typeidx ht>)
 fun ref-t(ht): [list: 100, ht] end           # (ref <typeidx ht>)
+# runtime.arr-facing aliases (shorter spellings used by runtime.arr / wasm-of-pyret.arr)
+anyref = anyreft
+fun reft(ht): ref-t(ht) end
+fun reftnull(ht): ref-null-t(ht) end
 
 # ===== type section: comptypes, subtyping, rec groups =====
 # storage type = a value type (or packed i8=120 / i16=119 for arrays/struct fields)
@@ -64,6 +68,11 @@ fun struct-type(fields): append([list: 95], vec(fields)) end          # 95 = str
 fun array-type(fld): append([list: 94], fld) end                      # 94 = array comptype
 fun func-type(params, results):                                       # 96 = func comptype
   append([list: 96], append(byte-vec(params), byte-vec(results)))
+end
+# like func-type but params/results are List<valtype-byte-list> (each valtype may be
+# multi-byte, e.g. a (ref null t)); counts entries, not bytes.
+fun func-type-vt(params, results):
+  append([list: 96], append(vec(params), vec(results)))
 end
 # subtype: 80 = sub (open) over a list of supertype indices, then the comptype.
 fun sub-type(super-idxs, comptype): append([list: 80], append(vec(map(lam(i): [list: i] end, super-idxs)), comptype)) end
@@ -83,6 +92,10 @@ i-drop = [list: 26]
 i-end = [list: 11]
 i-return = [list: 15]
 i-unreachable = [list: 0]
+# runtime.arr-facing aliases
+end-instr = i-end
+unreachable = i-unreachable
+fun call(i): i-call(i) end
 fun i-call(i): link(16, leb-u(i)) end
 fun i-call-indirect(typeidx, tableidx): append([list: 17], append(leb-u(typeidx), leb-u(tableidx))) end
 fun i-return-call(i): link(18, leb-u(i)) end
@@ -111,7 +124,7 @@ fun array-new-default(t): gc(7, [list: t]) end
 fun array-new-fixed(t, n): gc(8, [list: t, n]) end
 fun array-get(t): gc(11, [list: t]) end
 fun array-set(t): gc(14, [list: t]) end
-fun array-len(): gc(15, [list: ]) end
+array-len = gc(15, [list: ])
 fun ref-test(ht): gc(20, [list: ht]) end
 fun ref-test-null(ht): gc(21, [list: ht]) end
 fun ref-cast(ht): gc(23, [list: ht]) end
