@@ -101,6 +101,32 @@ function mergeMany(programs: CstNode[]): CstNode {
   };
 }
 
+// Remove top-level `check:`/`where:`-style test statements from a module. In real
+// Pyret, importing a module does NOT run its test blocks (they run only when the
+// module is the entry point under a test runner). Our whole-program flattening would
+// otherwise execute every imported module's tests at load — and any failing/crashing
+// test (e.g. type-structs' `check:` exercising the type pretty-printer) aborts the
+// whole program. So strip checks from every module except the entry point.
+function stripChecks(program: CstNode): CstNode {
+  const block = program.kids.find((k) => k.name === "block");
+  if (!block) return program;
+  const kept = block.kids.filter((stmt) => {
+    if (stmt.name !== "stmt") return true;
+    const inner = stmt.kids[0];
+    if (!inner) return true;
+    if (inner.name === "check-expr") return false;
+    // `x is y` / `x raises ...` are check-tests with >1 child; a single-child
+    // check-test is just a bare expression (keep it).
+    if (inner.name === "check-test" && inner.kids.length > 1) return false;
+    return true;
+  });
+  return {
+    name: "program",
+    pos: program.pos,
+    kids: program.kids.map((k) => (k === block ? { ...block, kids: kept } : k)),
+  };
+}
+
 let _preludeProgram: CstNode | null = null;
 
 async function loadModule(
@@ -126,5 +152,9 @@ export async function buildSourceFile(path: string): Promise<Uint8Array> {
   const order: CstNode[] = [];
   await loadModule(resolve(path), seen, order);
   if (!_preludeProgram) _preludeProgram = await parsePyret(PRELUDE_SRC);
-  return compile(mergeMany([_preludeProgram, ...order]));
+  // The entry module (loaded last, post-order) keeps its check blocks; all imported
+  // modules (and the prelude) have theirs stripped — imports don't run tests.
+  const main = order[order.length - 1]!;
+  const imports = order.slice(0, -1).map(stripChecks);
+  return compile(mergeMany([stripChecks(_preludeProgram), ...imports, main]));
 }

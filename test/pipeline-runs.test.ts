@@ -4,33 +4,25 @@
 // invoking the *compiler passes* — desugar / well-formed / resolve-scope / anf —
 // on real AST values and asserting what works today.
 //
-// ===== CURRENT STATE (re-probed on master, 2026-06-27) =====
-// RUNS correctly under the seed:
-//   - anf.arr  : module loads (its ast.arr dep's 10 where:-tests pass), and
-//                `anf-program(<s-program>)` NORMALIZES a hand-built program and
-//                round-trips through `.tosource().pretty(w)`.  anf also raises a
-//                *clean Pyret error* ("Missed case in anf: ...") on un-normalized
-//                input — i.e. it executes correctly, it isn't a wasm trap.
+// ===== CURRENT STATE (2026-06-27) =====
+// The whole desugar / well-formed / resolve-scope / anf dependency closure now LOADS
+// under the seed: `import X` runs each module's top-level init without crashing or
+// hanging (asserted below). Getting here cleared a chain of seed bugs surfaced only by
+// the real front-end's scale and idioms:
+//   - missing prelude funcs (Either/fold-while/take-while/each2.../find-index);
+//   - block-level `fun` letrec hoisting; module-alias arg currying; tuple `{a;b} as x`;
+//   - anonymous `method(...)` values; operator overloading via `_plus`/`_lessthan`/...;
+//   - arity-based variant-vs-`shadow` smart-constructor disambiguation;
+//   - non-recursive top-level `let` re-binding the same name across modules;
+//   - `N.member` resolving to module N's export (not a later local rebind);
+//   - PROGRAM-ORDER name resolution so a later module's `shadow map`/`foldl` doesn't
+//     capture the prelude's own recursion (the cross-module infinite-loop "hang");
+//   - the module-qualified collection ctor `[SD.string-dict: ...]`;
+//   - not running imported modules' `check:` blocks at load.
 //
-// KNOWN-FAIL (compile OK, but the MODULE crashes at init — next runtime lanes):
-//   1. desugar.arr       : `import desugar`       -> "access to a null reference"
-//   2. well-formed.arr   : `import well-formed`   -> "access to a null reference"
-//   3. resolve-scope.arr : `import resolve-scope` -> "access to a null reference"
-//      All three null-ref during *module initialization* (top-level/where: code
-//      running at load), BEFORE any pass entry point can be called. anf.arr does
-//      NOT, which is why anf is exercisable and the other three are not yet.
-//      PRIORITY ORDER for fixing (each unblocks the next stage of the pipeline):
-//        (a) desugar      — runs first in the real pipeline; highest leverage.
-//        (b) resolve-scope — needs a C.CompileEnvironment to call anyway, but the
-//            init crash must be cleared first.
-//        (c) well-formed  — `check-well-formed(ast)`; init crash blocks it.
-//      The init crashes are likely a single shared root cause (a top-level value
-//      in a common dependency of all three that anf doesn't pull in) — worth
-//      diagnosing once.
-//
-// NOTE: two KNOWN-FAILs documented in frontend-runs.test.ts are now STALE / fixed
-// on master: `s-op(...).tosource().pretty()` -> "[list: 1 + 2]" and
-// `PP.str(s).pretty(w)` -> "[list: hello]" both RUN now.
+// anf.arr also runs: `anf-program(<s-program>)` normalizes a hand-built program and
+// round-trips through `.tosource().pretty(w)`, and raises a clean Pyret error on
+// un-normalized input (it executes; it isn't a wasm trap).
 
 import { test, expect } from "bun:test";
 import { tmpdir } from "os";
@@ -85,18 +77,26 @@ test("anf-program NORMALIZES a string-literal program", async () => {
   expect(out).toContain("hi");
 });
 
-// ===== KNOWN-FAIL tripwires =====
-// These pass today *because the pass module crashes at init*. When a runtime lane
-// fixes the init crash, the corresponding tripwire flips red — a deliberate signal
-// to promote that pass to a real "RUNS" assertion (and update the header above).
-test("KNOWN-FAIL: desugar.arr crashes at module init (tripwire)", async () => {
-  await expect(runProg(`import desugar as D\n1`)).rejects.toThrow(/null reference/);
+// ===== front-end pass modules LOAD at init =====
+// Previously KNOWN-FAIL tripwires (the modules crashed/hung at module init). The seed
+// now loads the whole desugar/well-formed/resolve-scope dependency closure — `import X`
+// runs its top-level init without crashing — so these are real "loads" assertions.
+// Root causes fixed: a cross-module `shadow map`/`foldl` cycle (program-order name
+// resolution), non-recursive-let collisions across modules, operator/method dispatch,
+// and the module-qualified collection constructor `[SD.string-dict: ...]`.
+test("desugar.arr loads at module init", async () => {
+  expect(await firstLine(`import desugar as D\n1`)).toBe("1");
 });
 
-test("KNOWN-FAIL: well-formed.arr crashes at module init (tripwire)", async () => {
-  await expect(runProg(`import well-formed as W\n1`)).rejects.toThrow(/null reference/);
+test("well-formed.arr loads at module init", async () => {
+  expect(await firstLine(`import well-formed as W\n1`)).toBe("1");
 });
 
-test("KNOWN-FAIL: resolve-scope.arr crashes at module init (tripwire)", async () => {
-  await expect(runProg(`import resolve-scope as R\n1`)).rejects.toThrow(/null reference/);
+test("resolve-scope.arr loads at module init", async () => {
+  expect(await firstLine(`import resolve-scope as R\n1`)).toBe("1");
+});
+
+// The full front-end closure (compile-structs + ast-util + type-structs) also loads.
+test("compile-structs.arr loads at module init", async () => {
+  expect(await firstLine(`import compile-structs as C\n1`)).toBe("1");
 });
