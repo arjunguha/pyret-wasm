@@ -29,6 +29,35 @@ fun op-to-global(op-str :: String) -> String:
   end
 end
 
+# ── helpers for cases / data desugaring ──────────────────────────────────────
+
+fun desugar-cases-branch(b) -> A.CasesBranch:
+  cases(A.CasesBranch) b:
+    | s-cases-branch(l, pl, name, args, body) =>
+      A.s-cases-branch(l, pl, name, args, desugar-expr(body))
+    | s-singleton-cases-branch(l, pl, name, body) =>
+      A.s-singleton-cases-branch(l, pl, name, desugar-expr(body))
+  end
+end
+
+fun desugar-member(m) -> A.Member:
+  cases(A.Member) m:
+    | s-data-field(l, name, value) => A.s-data-field(l, name, desugar-expr(value))
+    | s-method-field(l, name, params, args, ann, doc, body, cl, ck, bl) =>
+      A.s-method-field(l, name, params, args, ann, doc, desugar-expr(body), cl, ck, bl)
+    | else => m
+  end
+end
+
+fun desugar-variant(v) -> A.Variant:
+  cases(A.Variant) v:
+    | s-variant(l, cl, vname, members, with-members) =>
+      A.s-variant(l, cl, vname, members, with-members.map(desugar-member))
+    | s-singleton-variant(l, vname, with-members) =>
+      A.s-singleton-variant(l, vname, with-members.map(desugar-member))
+  end
+end
+
 # ── cases-based AST desugaring (no visit()) ──────────────────────────────────
 #
 # Converts forms that ANF doesn't handle to forms it does:
@@ -160,7 +189,25 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       A.s-prim-app(loc, fname, args.map(desugar-expr), info)
 
     | s-construct(loc, modifier, constructor, values) =>
+      # NOTE: `[list: ...]` would lower to nested link/empty, but link/empty live in the
+      # prelude and the driver compiles ONLY user source (no prelude merged), so they'd be
+      # unbound. Left as a pass-through (ANF rejects s-construct) until the driver includes
+      # the prelude. See report.
       A.s-construct(loc, modifier, desugar-expr(constructor), values.map(desugar-expr))
+
+    | s-data(loc, name, params, mixins, variants, shared, chk-loc, chk) =>
+      A.s-data-expr(loc, name, A.s-name(loc, name), params, mixins,
+        variants.map(desugar-variant), shared.map(desugar-member), chk-loc, chk)
+
+    | s-cases(loc, typ, val, branches, blocky) =>
+      A.s-cases-else(loc, typ, desugar-expr(val),
+        branches.map(desugar-cases-branch),
+        A.s-prim-app(loc, "throwNoCasesMatched", [list:], A.prim-app-info-c(false)),
+        blocky)
+
+    | s-cases-else(loc, typ, val, branches, _else, blocky) =>
+      A.s-cases-else(loc, typ, desugar-expr(val),
+        branches.map(desugar-cases-branch), desugar-expr(_else), blocky)
 
     | s-paren(_, inner) => desugar-expr(inner)
 
@@ -194,6 +241,22 @@ fun fun-to-letrec-bind(fn :: A.Expr) -> A.LetrecBind:
   end
 end
 
+fun surface-variant-name(v) -> String:
+  cases(A.Variant) v:
+    | s-variant(_, _, vn, _, _) => vn
+    | s-singleton-variant(_, vn, _) => vn
+  end
+end
+
+# the remaining statements as a single body expression (for let/letrec bodies)
+fun stmts-to-body(desugared :: List<A.Expr>) -> A.Expr:
+  l = A.dummy-loc
+  if is-empty(desugared): A.s-id(l, A.s-name(l, "nothing"))
+  else if is-empty(desugared.rest): desugared.first
+  else: A.s-block(l, desugared)
+  end
+end
+
 fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
   l = A.dummy-loc
   cases(List) stmts:
@@ -205,15 +268,21 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
           {funs; remaining} = collect-funs(stmts)
           letrec-binds = funs.map(fun-to-letrec-bind)
           remaining-desugared = desugar-stmts(remaining)
-          # Body of the letrec is the remaining statements
-          letrec-body = if is-empty(remaining-desugared):
-            A.s-id(l, A.s-name(l, "nothing"))
-          else if is-empty(remaining-desugared.rest):
-            remaining-desugared.first
-          else:
-            A.s-block(l, remaining-desugared)
-          end
-          [list: A.s-letrec(l, letrec-binds, letrec-body, false)]
+          [list: A.s-letrec(l, letrec-binds, stmts-to-body(remaining-desugared), false)]
+        | s-data(dl, dname, _, _, variants, _, _, _) =>
+          # bind the data object to a fresh name, then bind each constructor name to
+          # its field of that object (so bare `ctor(args)` / cases over it resolve).
+          data-expr = desugar-expr(f)   # -> s-data-expr
+          objname = "$data$" + dname
+          obj-id = A.s-id(dl, A.s-name(dl, objname))
+          data-bind = A.s-let-bind(dl, A.s-bind(dl, false, A.s-name(dl, objname), A.a-blank), data-expr)
+          ctor-binds = variants.map(lam(v):
+            vn = surface-variant-name(v)
+            A.s-let-bind(dl, A.s-bind(dl, false, A.s-name(dl, vn), A.a-blank),
+              A.s-dot(dl, obj-id, vn))
+          end)
+          body = stmts-to-body(desugar-stmts(rest))
+          [list: A.s-let-expr(dl, link(data-bind, ctor-binds), body, false)]
         | else =>
           link(desugar-expr(f), desugar-stmts(rest))
       end
