@@ -9,7 +9,46 @@ export const PRELUDE_SRC = `
 data List:
   | empty
   | link(first, rest)
+sharing:
+  method map(self, f): map(f, self) end,
+  method filter(self, p): filter(p, self) end,
+  method foldl(self, f, init): foldl(f, init, self) end,
+  method foldr(self, f, init): foldr(f, init, self) end,
+  method each(self, f): each(f, self) end,
+  method length(self): length(self) end,
+  method reverse(self): reverse(self) end,
+  method append(self, other): append(self, other) end,
+  method get(self, i): get(self, i) end,
+  method member(self, x): member(self, x) end,
+  method find(self, p): find(p, self) end,
+  method last(self): last(self) end,
+  method take(self, n): take(self, n) end,
+  method drop(self, n): drop(self, n) end,
+  method filter-map(self, f): filter-map(f, self) end,
+  method partition(self, p): partition(p, self) end,
+  method all(self, p): all(p, self) end,
+  method any(self, p): any(p, self) end,
+  method distinct(self): distinct(self) end,
+  method sort(self): list-sort(self) end,
+  method sort-by(self, lt, eq): list-sort-by(self, lt, eq) end,
+  method join-str(self, sep): string-join(self, sep) end,
+  method to-list(self): self end
 end
+# list sorting (insertion sort; CPS-safe: recursion + cases). sort-by takes a
+# less-than comparator and an equality comparator (Pyret's signature); we order by lt.
+fun list-insert-by(lt, x, l):
+  cases(List) l:
+    | empty => link(x, empty)
+    | link(f, r) => if lt(x, f): link(x, l) else: link(f, list-insert-by(lt, x, r)) end
+  end
+end
+fun list-sort-by(l, lt, eq):
+  cases(List) l:
+    | empty => empty
+    | link(f, r) => list-insert-by(lt, f, list-sort-by(r, lt, eq))
+  end
+end
+fun list-sort(l): list-sort-by(l, lam(a, b): a < b end, lam(a, b): a == b end) end
 
 fun length(l):
   cases(List) l:
@@ -298,7 +337,12 @@ sharing:
   method remove(self, k): s-str-dict(sd-del(self.entries, k)) end,
   method keys-list(self): map(lam(p): cases(KV) p: | kv(pk, pv) => pk end end, self.entries) end,
   method count(self): length(self.entries) end,
-  method to-list(self): self.entries end
+  method to-list(self): self.entries end,
+  method keys(self): set-from-list(self.keys-list()) end,
+  method fold-keys(self, f, init): foldl(f, init, self.keys-list()) end,
+  method each-key(self, f): each(f, self.keys-list()) end,
+  method map-keys(self, f): map(f, self.keys-list()) end,
+  method merge(self, other): foldl(lam(acc, k): acc.set(k, other.get-value(k)) end, self, other.keys-list()) end
 end
 fun sd-from-raw(arr):
   fun sd-loop(i, n):
@@ -317,7 +361,10 @@ sharing:
   method remove(self, x): p-set(filter(lam(e): not(e == x) end, self.elems)) end,
   method to-list(self): self.elems end,
   method size(self): length(self.elems) end,
-  method union(self, other): foldl(lam(acc, e): acc.add(e) end, self, other.to-list()) end
+  method union(self, other): foldl(lam(acc, e): acc.add(e) end, self, other.to-list()) end,
+  method intersect(self, other): p-set(filter(lam(e): other.member(e) end, self.elems)) end,
+  method difference(self, other): p-set(filter(lam(e): not(other.member(e)) end, self.elems)) end,
+  method fold(self, f, init): foldl(f, init, self.elems) end
 end
 fun set-from-raw(arr): foldl(lam(acc, e): acc.add(e) end, p-set(empty), raw-array-to-list(arr)) end
 
@@ -371,6 +418,9 @@ fun dict-keys-list(d): if is-m-dict(d): d.keys-list-now() else: d.keys-list() en
 fun fold-keys(f, init, d): foldl(f, init, dict-keys-list(d)) end
 fun each-key(f, d): each(f, dict-keys-list(d)) end
 fun each-key-now(f, d): each(f, dict-keys-list(d)) end
+fun map-keys(f, d): map(f, dict-keys-list(d)) end
+fun map-keys-now(f, d): map(f, dict-keys-list(d)) end
+fun fold-keys-now(f, init, d): foldl(f, init, dict-keys-list(d)) end
 
 # === raw-array builders / list / string helpers (used by the real front-end) ===
 fun raw-array-build(f, n):
