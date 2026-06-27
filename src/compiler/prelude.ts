@@ -32,6 +32,8 @@ sharing:
   method sort(self): list-sort(self) end,
   method sort-by(self, lt, eq): list-sort-by(self, lt, eq) end,
   method join-str(self, sep): string-join(self, sep) end,
+  method push(self, elt): link(elt, self) end,
+  method map2(self, other, f): map2(f, self, other) end,
   method to-list(self): self end
 end
 # list sorting (insertion sort; CPS-safe: recursion + cases). sort-by takes a
@@ -118,6 +120,9 @@ end
 data Option:
   | none
   | some(value)
+sharing:
+  method or-else(self, v): cases(Option) self: | none => v | some(x) => x end end,
+  method and-then(self, f): cases(Option) self: | none => none | some(x) => some(f(x)) end end
 end
 
 # ---- boolean / numeric builtins (pure Pyret) ----
