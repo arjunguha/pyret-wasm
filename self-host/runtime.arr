@@ -805,9 +805,11 @@ fun emit-render() -> RtFun:
 end
 # $render_variant(v, addr) -> end addr.  tuples -> {..}, lists -> [list: ..], else
 # name "(" f0 ", " f1 ... ")".  locals: a=2, fields=3(reftnull Fields), i=4, n=5.
+# NB: the tuple sentinel id is -1 (not 0) so it can't collide with a real variant id
+# (collect-data assigns 0-based ids); dispatch to $render_tuple on id == -1.
 fun emit-render-variant() -> RtFun:
   body = blk(i32t, [list:
-      E.local-get(0), E.struct-get(T-VARIANT, 0), E.i32-eqz, iff([list:
+      E.local-get(0), E.struct-get(T-VARIANT, 0), E.i32-const(-1), E.i32-eq, iff([list:
         E.local-get(0), E.local-get(1), rt-call("$render_tuple"), E.i-br(1) ]),
       E.local-get(0), E.struct-get(T-VARIANT, 0), E.global-get(GI-LINK-ID), E.i32-eq,
       E.local-get(0), E.struct-get(T-VARIANT, 0), E.global-get(GI-EMPTY-ID), E.i32-eq, E.i32-or, iff([list:
