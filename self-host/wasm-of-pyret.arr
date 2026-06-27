@@ -806,8 +806,9 @@ fun compile-prog(prog) -> List<Number>:
       num-rt = length(RT-FUNS)
       num-ctors = length(dreg)
       ordered = ctors-by-id(dreg, 0, num-ctors)             # ctors in id order
-      # top-level globals follow $variant_names (global 0 when there are variants).
-      gbase = if num-ctors == 0: 0 else: 1 end
+      # globals: [runtime block 0..NUM-RT-GLOBALS-1][$variant_names?][top-level...].
+      # top-level globals follow the runtime block and $variant_names (when variants exist).
+      gbase = R.NUM-RT-GLOBALS + (if num-ctors == 0: 0 else: 1 end)
       tl-keys = collect-toplevel(body, empty).reverse()
       num-tl = length(tl-keys)
       gmap = map2(lam(k, gi): {k: k, gi: gbase + gi} end, tl-keys, range(0, num-tl))
@@ -856,19 +857,24 @@ fun compile-prog(prog) -> List<Number>:
       vn-global = if num-ctors == 0: empty
                   else: [list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))] end
       tl-globals = range(0, num-tl).map(lam(_): E.global-entry(E.anyref, 1, E.i-ref-null(110)) end)
-      all-globals = vn-global.append(tl-globals)
+      # runtime globals ($link_id/$empty_id/$passed/$total) occupy the lowest indices.
+      all-globals = R.rt-globals().append(vn-global.append(tl-globals))
       global-c = if is-empty(all-globals): empty else: E.vec(all-globals) end
 
       # ----- import section: host functions, module "host" (occupy the low funcidxs) -----
       import-c = E.vec(map2(lam(hi, k): E.import-func("host", hi.name, import-type-idx(k)) end,
                             R.host-imports, range(0, NUM-IMPORTS)))
 
-      # ----- export main -----
-      export-c = E.vec([list: E.export-entry("main", 0, main-funcidx)])
+      # ----- linear memory (scratch for string marshalling): 1..256 pages, exported -----
+      mem-c = E.vec([list: E.mem-type(1, 256)])
+
+      # ----- exports: main (func 0) + the memory (so the host reads rendered strings) -----
+      export-c = E.vec([list: E.export-entry("main", 0, main-funcidx),
+                              E.export-entry("memory", 2, 0)])
 
       # ----- code section -----
       code-c = E.vec(rt-code.append(lam-code).append(ctor-code).append([list: main-code]))
 
-      E.wasm-module-of(type-c, import-c, func-c, table-c, empty, global-c, export-c, elem-c, code-c)
+      E.wasm-module-of(type-c, import-c, func-c, table-c, mem-c, global-c, export-c, elem-c, code-c)
   end
 end
