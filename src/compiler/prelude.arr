@@ -677,6 +677,20 @@ fun num-within(tol): num-within-rel(tol) end
 fun within-abs(tol): num-within-abs(tol) end
 fun within-rel(tol): num-within-rel(tol) end
 fun within(tol): num-within-rel(tol) end
+# the *-now variants compare "now" (mutable-aware) equality; we have no mutable refs
+# in equality yet, so they coincide with the structural/numeric tolerance versions.
+fun within-now(tol): num-within-rel(tol) end
+fun within-abs-now(tol): num-within-abs(tol) end
+fun within-rel-now(tol): num-within-rel(tol) end
+fun num-within-abs-now(tol): num-within-abs(tol) end
+fun num-within-rel-now(tol): num-within-rel(tol) end
+# sign predicates (pure, on the numeric order)
+fun num-is-positive(n): n > 0 end
+fun num-is-negative(n): n < 0 end
+fun num-is-non-positive(n): n <= 0 end
+fun num-is-non-negative(n): n >= 0 end
+# PI as a roughnum constant (irrational)
+PI = ~3.141592653589793
 # join-str: like string-join but tostrings each element first
 fun join-str(l, sep): string-join(map(lam(e): tostring(e) end, l), sep) end
 
