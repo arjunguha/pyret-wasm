@@ -686,6 +686,8 @@ class Compiler {
         return this.compileObject(node, ctx);
       case "dot-expr":
         return this.compileDot(node, ctx);
+      case "extend-expr":
+        return this.compileExtend(node, ctx);
       case "for-expr":
         return this.compileFor(node, ctx, tail);
       case "user-block-expr": {
@@ -826,6 +828,31 @@ class Compiler {
       ? m.array.new_fixed(this.t.Fields, [])
       : m.array.new_fixed(this.t.Fields, values);
     return m.call("$make_object", [namesArr, valuesArr], this.t.ObjectRef);
+  }
+
+  // `e.{f: v, ...}` — object update: a NEW object that is `e` with the given fields
+  // overridden/added (new fields prepended; $obj_extend relies on first-match lookup).
+  private compileExtend(node: CstNode, ctx: Ctx): number {
+    const m = this.m;
+    const objVal = m.ref.cast(this.compileExpr(node.kids[0]!, ctx, false), this.t.ObjectRef);
+    const fieldsNode = this.childNamed(node, "fields");
+    const fields = fieldsNode ? fieldsNode.kids.filter((k) => k.name === "field") : [];
+    const names: number[] = [];
+    const values: number[] = [];
+    for (const f of fields) {
+      const key = this.childNamed(f, "key");
+      const nameStr = key ? this.childNamed(key, "NAME")!.value! : this.childNamed(f, "NAME")!.value!;
+      names.push(this.strLiteralRaw(nameStr));
+      if (f.kids.some((k) => k.name === "METHOD")) {
+        const closure = this.buildClosureFromParts(this.headerParamBindings(f), this.childNamed(f, "block")!, ctx, "$mth_");
+        values.push(m.struct.new([m.ref.cast(closure, this.t.ClosureRef)], this.t.Method));
+      } else {
+        values.push(this.compileExpr(this.childNamed(f, "binop-expr")!, ctx, false));
+      }
+    }
+    const nn = m.array.new_fixed(this.t.Names, names);
+    const nv = m.array.new_fixed(this.t.Fields, values);
+    return m.call("$obj_extend", [objVal, nn, nv], this.t.ObjectRef);
   }
 
   private compileDot(node: CstNode, ctx: Ctx): number {

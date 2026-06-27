@@ -297,6 +297,36 @@ export class Runtime {
       ], binaryen.anyref);
       m.addFunction("$obj_get", binaryen.createType([t.ObjectRef, t.StrRef]), binaryen.anyref, [t.NamesRef, I, I], body);
     }
+    // $obj_extend(obj, newNames, newValues) -> $Object. Builds a new object with the
+    // new fields PREPENDED before the base fields, so $obj_get's first-match lookup
+    // returns the new value for overridden names and the base value otherwise
+    // (override + add semantics). newNames must be non-empty (extend has >=1 field).
+    {
+      const obj = () => m.local.get(0, t.ObjectRef);
+      const nn = () => m.local.get(1, t.NamesRef);
+      const nv = () => m.local.get(2, t.FieldsRef);
+      const bn = () => m.local.get(3, t.NamesRef);
+      const bv = () => m.local.get(4, t.FieldsRef);
+      const rn = () => m.local.get(5, t.NamesRef);
+      const rv = () => m.local.get(6, t.FieldsRef);
+      const nl = () => m.local.get(7, I), bl = () => m.local.get(8, I);
+      const tot = () => m.i32.add(nl(), bl());
+      const body = m.block(null, [
+        m.local.set(3, m.struct.get(0, obj(), t.NamesRef, false)),
+        m.local.set(4, m.struct.get(1, obj(), t.FieldsRef, false)),
+        m.local.set(7, m.array.len(nn())),
+        m.local.set(8, m.array.len(bn())),
+        m.local.set(5, m.array.new(t.Names, tot(), m.array.get(nn(), m.i32.const(0), t.StrRef, false))),
+        m.local.set(6, m.array.new(t.Fields, tot(), m.ref.null(binaryen.anyref))),
+        m.array.copy(rn(), m.i32.const(0), nn(), m.i32.const(0), nl()),
+        m.array.copy(rn(), nl(), bn(), m.i32.const(0), bl()),
+        m.array.copy(rv(), m.i32.const(0), nv(), m.i32.const(0), nl()),
+        m.array.copy(rv(), nl(), bv(), m.i32.const(0), bl()),
+        m.struct.new([rn(), rv()], t.Object),
+      ], t.ObjectRef);
+      m.addFunction("$obj_extend", binaryen.createType([t.ObjectRef, t.NamesRef, t.FieldsRef]), t.ObjectRef,
+        [t.NamesRef, t.FieldsRef, t.NamesRef, t.FieldsRef, I, I], body);
+    }
     // $variant_field_by_name(v, names, name) -> anyref. Resolves a data-variant field
     // by NAME at runtime (scan the variant's field-name list, return the field at the
     // matching index). Needed because variants of one type can share field names at
