@@ -26,6 +26,7 @@ import { resolve } from "path";
 const PROBE = resolve(import.meta.dir, "../self-host/pyret-parser-probe.arr");
 const PROBE2 = resolve(import.meta.dir, "../self-host/pyret-parser-probe2.arr");
 const PROBE3 = resolve(import.meta.dir, "../self-host/pyret-parser-probe3.arr");
+const PROBE4 = resolve(import.meta.dir, "../self-host/pyret-parser-probe4.arr");
 
 test("pure-Pyret parser compiles clean under the seed (-> valid wasm)", async () => {
   const wasm = await buildSourceFile(PROBE);
@@ -64,4 +65,23 @@ test("pure-Pyret parser: produces real source locations", async () => {
   expect(o).toContain("app: test.arr 2:0-2:4 char 20-24"); // f(2) on line 2
   expect(o).toContain("op: line 1 col 10 char 10");          // x + 1 op
   expect(o).toContain("is-srcloc: true");                    // not a builtin/dummy loc
+});
+
+// Round-3 grammar: full check-ops (incl. is%(refine) and the does-not-raise
+// postfix), multi-let / letrec / type-let, spy, exact decimals + rough integers,
+// and tuple-destructuring let — all into the real ast.arr AST end-to-end.
+test("pure-Pyret parser: let/letrec/type-let, check-ops, spy, decimals", async () => {
+  const r = await run(await buildSourceFile(PROBE4));
+  const o = r.output;
+  expect(o).toContain("stmts: s-let s-let s-let s-letrec s-type-let s-check s-spy-block");
+  expect(o).toContain("dec: 157/50");                 // 3.14 -> exact rational
+  expect(o).toContain("rough: s-num true");           // ~5 -> roughnum-valued s-num
+  expect(o).toContain("tuplelet: s-tuple-bind");      // {a; b} = {1; 2}
+  expect(o).toContain("multilet: s-let binds=2 body=s-block");
+  expect(o).toContain("letrec: s-letrec binds=1");
+  expect(o).toContain("typelet: s-type-let s-type-bind");
+  expect(o).toContain("checkops: [list: s-op-is, s-op-is-not, s-op-raises-not, s-op-is]");
+  expect(o).toContain("postfix-none: true");          // does-not-raise has no RHS
+  expect(o).toContain("refine-some: true");           // is%(within(1)) carries a refinement
+  expect(o).toContain("spy: s-spy-block msg=true implicit=true");
 });

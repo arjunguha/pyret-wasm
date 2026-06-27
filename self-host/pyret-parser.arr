@@ -947,6 +947,9 @@ fun parse-name-atom(st :: PState, v :: String) -> A.Expr:
   else if v == "ask": parse-ask(st)
   else if v == "cases": parse-cases(st)
   else if v == "for": parse-for(st)
+  else if v == "let": parse-multi-let(st)
+  else if v == "letrec": parse-letrec(st)
+  else if v == "type-let": parse-type-let(st)
   else if (v == "block") and peek2-kind(st, "COLON"):
     p-advance(st)
     p-advance(st)
@@ -959,21 +962,37 @@ fun parse-name-atom(st :: PState, v :: String) -> A.Expr:
   end
 end
 
-### build a numeric literal node.  `rough` tags `~`-prefixed roughnums (fractions
-### become s-rfrac; rough integers fall back to s-num for now).
+### build a numeric literal node.  `rough` tags `~`-prefixed roughnums.
+###   a/b            -> s-frac     (~a/b -> s-rfrac)
+###   a.b            -> s-num with an EXACT rational (numer / 10^k); ~a.b -> roughnum
+###   a (integer)    -> s-num      (~a -> s-num holding a roughnum)
 fun make-number(loc :: A.Loc, txt :: String, rough :: Boolean) -> A.Expr:
   if string-contains(txt, "/"):
     idx = string-index-of(txt, "/")
     n = int-of(string-substring(txt, 0, idx))
     d = int-of(string-substring(txt, idx + 1, string-length(txt)))
     if rough: A.s-rfrac(loc, n, d) else: A.s-frac(loc, n, d) end
+  else if string-contains(txt, ".") and not(has-exp(txt)):
+    # decimal a.b -> exact rational  numer / 10^(#frac-digits)
+    idx = string-index-of(txt, ".")
+    int-part = string-substring(txt, 0, idx)
+    frac-part = string-substring(txt, idx + 1, string-length(txt))
+    numer = int-of(int-part + frac-part)
+    val = numer / num-expt(10, string-length(frac-part))
+    if rough: A.s-num(loc, num-to-roughnum(val)) else: A.s-num(loc, val) end
   else if string-contains(txt, "."):
-    # TODO(grammar): real decimals; for now use the integer part.
+    # TODO(grammar): decimals with exponents -> integer part for now
     idx = string-index-of(txt, ".")
     A.s-num(loc, int-of(string-substring(txt, 0, idx)))
   else:
-    A.s-num(loc, int-of(txt))
+    n = int-of(txt)
+    if rough: A.s-num(loc, num-to-roughnum(n)) else: A.s-num(loc, n) end
   end
+end
+
+### does this number literal carry an `e`/`E` exponent?
+fun has-exp(txt :: String) -> Boolean:
+  string-contains(txt, "e") or string-contains(txt, "E")
 end
 
 fun int-of(s :: String) -> Number:
@@ -1286,6 +1305,7 @@ fun parse-stmt(st :: PState) -> A.Expr:
   else if at-name(st, "type") and peek2-kind(st, "NAME"): parse-type(st)
   else if at-name(st, "newtype") and peek2-kind(st, "NAME"): parse-newtype(st)
   else if at-name(st, "when"): parse-when(st)
+  else if at-name(st, "spy"): parse-spy(st)
   else if at-name(st, "check") or at-name(st, "examples"): parse-check(st)
   else if at-kind(st, "NAME") and peek2-kind(st, "COLONEQUALS"):
     nm-tok = p-advance(st)
@@ -1303,13 +1323,44 @@ fun parse-stmt(st :: PState) -> A.Expr:
 end
 
 ### A let-binding starts with `shadow`, or with `NAME =` / `NAME ::` (a binding,
-### not the start of a larger expression like `NAME.field` or `NAME(args)`).
+### not the start of a larger expression like `NAME.field` or `NAME(args)`), or
+### with a tuple-binding `{ ... } [as b] =` (tuple-destructuring let).
 fun is-let-start(st :: PState) -> Boolean:
   if at-name(st, "shadow"): true
   else if at-kind(st, "NAME"):
     peek2-kind(st, "EQUALS") or peek2-kind(st, "COLONCOLON")
+  else if at-kind(st, "LBRACE"):
+    tuple-let-ahead(st)
   else:
     false
+  end
+end
+
+### Lookahead: at a `{`, decide whether this is a tuple-destructuring let — i.e. the
+### matching `}` is followed by `=` (or `as`, the optional tuple-binding alias) —
+### rather than a tuple/object expression.  Scans the raw token stream by brace depth.
+fun tuple-let-ahead(st :: PState) -> Boolean:
+  after-brace(tok-stream, 0)
+end
+
+fun after-brace(ts :: List<Token>, depth :: Number) -> Boolean:
+  cases(List) ts:
+    | empty => false
+    | link(t, r) =>
+      ask:
+        | t.kind == "LBRACE" then: after-brace(r, depth + 1)
+        | t.kind == "RBRACE" then:
+          if depth <= 1:
+            cases(List) r:
+              | empty => false
+              | link(n, _) => (n.kind == "EQUALS") or ((n.kind == "NAME") and (n.value == "as"))
+            end
+          else:
+            after-brace(r, depth - 1)
+          end
+        | t.kind == "EOF" then: false
+        | otherwise: after-brace(r, depth)
+      end
   end
 end
 
@@ -1346,6 +1397,141 @@ fun parse-newtype(st :: PState) -> A.Expr:
   namet-tok = expect(st, "NAME")
   A.s-newtype(node-loc(start), A.s-name(tok-loc(nm-tok), nm-tok.value),
     A.s-name(tok-loc(namet-tok), namet-tok.value))
+end
+
+### multi-let:  let let-binding (, let-binding)* (block|colon) block end
+fun parse-multi-let(st :: PState) -> A.Expr:
+  start = p-peek(st)
+  expect-name(st, "let")
+  binds = parse-let-binding-list(st)
+  blocky = parse-block-or-colon(st)
+  body = parse-block(st)
+  expect-name(st, "end")
+  A.s-let-expr(node-loc(start), binds, body, blocky)
+end
+
+fun parse-let-binding-list(st :: PState) -> List<A.LetBind>:
+  lb = parse-let-binding(st)
+  if at-kind(st, "COMMA"):
+    p-advance(st)
+    link(lb, parse-let-binding-list(st))
+  else:
+    link(lb, empty)
+  end
+end
+
+### let-binding:  [var] binding = binop   ->  s-var-bind / s-let-bind
+fun parse-let-binding(st :: PState) -> A.LetBind:
+  start = p-peek(st)
+  is-var = if at-name(st, "var"): p-advance(st) true else: false end
+  b = parse-binding(st)
+  expect(st, "EQUALS")
+  v = parse-binop(st)
+  if is-var: A.s-var-bind(node-loc(start), b, v)
+  else: A.s-let-bind(node-loc(start), b, v)
+  end
+end
+
+### letrec:  letrec let-expr (, let-expr)* (block|colon) block end
+fun parse-letrec(st :: PState) -> A.Expr:
+  start = p-peek(st)
+  expect-name(st, "letrec")
+  binds = parse-letrec-binding-list(st)
+  blocky = parse-block-or-colon(st)
+  body = parse-block(st)
+  expect-name(st, "end")
+  A.s-letrec(node-loc(start), binds, body, blocky)
+end
+
+fun parse-letrec-binding-list(st :: PState) -> List<A.LetrecBind>:
+  start = p-peek(st)
+  b = parse-binding(st)
+  expect(st, "EQUALS")
+  v = parse-binop(st)
+  lb = A.s-letrec-bind(node-loc(start), b, v)
+  if at-kind(st, "COMMA"):
+    p-advance(st)
+    link(lb, parse-letrec-binding-list(st))
+  else:
+    link(lb, empty)
+  end
+end
+
+### type-let:  type-let type-let-bind (, type-let-bind)* (block|colon) block end
+fun parse-type-let(st :: PState) -> A.Expr:
+  start = p-peek(st)
+  expect-name(st, "type-let")
+  binds = parse-type-let-bind-list(st)
+  blocky = parse-block-or-colon(st)
+  body = parse-block(st)
+  expect-name(st, "end")
+  A.s-type-let-expr(node-loc(start), binds, body, blocky)
+end
+
+fun parse-type-let-bind-list(st :: PState) -> List<A.TypeLetBind>:
+  b = parse-type-let-bind(st)
+  if at-kind(st, "COMMA"):
+    p-advance(st)
+    link(b, parse-type-let-bind-list(st))
+  else:
+    link(b, empty)
+  end
+end
+
+### type-let-bind:  type-bind ( NAME [<params>] = ann )  |  newtype-bind ( newtype NAME as NAME )
+fun parse-type-let-bind(st :: PState) -> A.TypeLetBind:
+  start = p-peek(st)
+  if at-name(st, "newtype"):
+    p-advance(st)
+    nm-tok = expect(st, "NAME")
+    expect-name(st, "as")
+    namet-tok = expect(st, "NAME")
+    A.s-newtype-bind(node-loc(start),
+      A.s-name(tok-loc(nm-tok), nm-tok.value), A.s-name(tok-loc(namet-tok), namet-tok.value))
+  else:
+    nm-tok = expect(st, "NAME")
+    params = parse-ty-params(st)
+    expect(st, "EQUALS")
+    ann = parse-ann(st)
+    A.s-type-bind(node-loc(start), A.s-name(tok-loc(nm-tok), nm-tok.value), params, ann)
+  end
+end
+
+### spy:  spy [message] : [spy-field (, spy-field)*] end
+fun parse-spy(st :: PState) -> A.Expr:
+  start = p-peek(st)
+  expect-name(st, "spy")
+  msg = if at-kind(st, "COLON"): none else: some(parse-binop(st)) end
+  expect(st, "COLON")
+  contents = if at-name(st, "end"): empty else: parse-spy-fields(st) end
+  expect-name(st, "end")
+  A.s-spy-block(node-loc(start), msg, contents)
+end
+
+fun parse-spy-fields(st :: PState) -> List<A.SpyField>:
+  f = parse-spy-field(st)
+  if at-kind(st, "COMMA"):
+    p-advance(st)
+    if at-name(st, "end"): link(f, empty)
+    else: link(f, parse-spy-fields(st))
+    end
+  else:
+    link(f, empty)
+  end
+end
+
+### spy-field:  NAME COLON binop   (explicit)   |   NAME   (implicit-label id-expr)
+fun parse-spy-field(st :: PState) -> A.SpyField:
+  start = p-peek(st)
+  nm-tok = expect(st, "NAME")
+  if at-kind(st, "COLON"):
+    p-advance(st)
+    v = parse-binop(st)
+    A.s-spy-expr(node-loc(start), nm-tok.value, v, false)
+  else:
+    ide = A.s-id(tok-loc(nm-tok), A.s-name(tok-loc(nm-tok), nm-tok.value))
+    A.s-spy-expr(node-loc(start), nm-tok.value, ide, true)
+  end
 end
 
 fun parse-var(st :: PState) -> A.Expr:
@@ -1387,33 +1573,89 @@ fun parse-check(st :: PState) -> A.Expr:
   A.s-check(node-loc(start), nm, body, keyword-check)
 end
 
-### check-test: lhs [check-op rhs].  Supports is / is-not / is== / raises / satisfies.
+### check-test: lhs check-op [%(refinement)] rhs [because cause]
+###            | lhs check-op-postfix [because cause]      (postfix = does-not-raise)
+### The full check-op set is supported (see cur-check-op).  Only the postfix op
+### `does-not-raise` (s-op-raises-not) may lack a right-hand side — ast.arr relies
+### on that invariant.
 fun parse-check-test-rest(st :: PState, start :: Token, left :: A.Expr) -> A.Expr:
   cases(Option) cur-check-op(st):
     | none => left
-    | some(op) =>
-      right = parse-binop(st)
-      A.s-check-test(node-loc(start), op, none, left, some(right), none)
+    | some(opp) =>
+      op = opp.{0}
+      postfix = opp.{1}
+      refinement = if at-kind(st, "PERCENT"):
+        p-advance(st)
+        expect(st, "LPAREN")
+        r = parse-binop(st)
+        expect(st, "RPAREN")
+        some(r)
+      else:
+        none
+      end
+      if postfix:
+        A.s-check-test(node-loc(start), op, refinement, left, none, parse-because(st))
+      else:
+        right = parse-binop(st)
+        A.s-check-test(node-loc(start), op, refinement, left, some(right), parse-because(st))
+      end
   end
 end
 
-fun cur-check-op(st :: PState) -> Option:
-  if at-name(st, "is"):
+### optional `because <expr>` cause on a check-test.
+fun parse-because(st :: PState) -> Option:
+  if at-name(st, "because"):
     p-advance(st)
-    if at-op(st, "=="): p-advance(st) some(A.s-op-is-op(dl, "op=="))
-    else: some(A.s-op-is(dl))
-    end
-  else if at-name(st, "is-not"):
-    p-advance(st)
-    some(A.s-op-is-not(dl))
-  else if at-name(st, "raises"):
-    p-advance(st)
-    some(A.s-op-raises(dl))
-  else if at-name(st, "satisfies"):
-    p-advance(st)
-    some(A.s-op-satisfies(dl))
+    some(parse-binop(st))
   else:
-    none  # TODO(grammar): is=~ is<=> is-roughly raises-satisfies because ...
+    none
+  end
+end
+
+### the current check operator (if any), as {CheckOp; is-postfix}.  Operators that
+### are spelled with a trailing comparison (`is==`/`is=~`/`is<=>` and the `is-not`
+### variants) lex as NAME + OP, so we glue them back together here.
+fun cur-check-op(st :: PState) -> Option:
+  t = p-peek(st)
+  if not(t.kind == "NAME"): none
+  else:
+    l = tok-loc(t)
+    v = t.value
+    ask:
+      | v == "is" then:
+        p-advance(st)
+        some({is-suffix-op(st, l, A.s-op-is(l)); false})
+      | v == "is-not" then:
+        p-advance(st)
+        some({is-not-suffix-op(st, l); false})
+      | v == "is-roughly" then: p-advance(st) some({A.s-op-is-roughly(l); false})
+      | v == "is-not-roughly" then: p-advance(st) some({A.s-op-is-not-roughly(l); false})
+      | v == "raises" then: p-advance(st) some({A.s-op-raises(l); false})
+      | v == "raises-other-than" then: p-advance(st) some({A.s-op-raises-other(l); false})
+      | v == "raises-satisfies" then: p-advance(st) some({A.s-op-raises-satisfies(l); false})
+      | v == "raises-violates" then: p-advance(st) some({A.s-op-raises-violates(l); false})
+      | v == "does-not-raise" then: p-advance(st) some({A.s-op-raises-not(l); true})
+      | v == "satisfies" then: p-advance(st) some({A.s-op-satisfies(l); false})
+      | v == "violates" then: p-advance(st) some({A.s-op-satisfies-not(l); false})
+      | otherwise: none
+    end
+  end
+end
+
+### after `is`, an immediate `==`/`=~`/`<=>` makes it an `is==`-style op.
+fun is-suffix-op(st :: PState, l :: A.Loc, plain :: A.CheckOp) -> A.CheckOp:
+  if at-op(st, "=="): p-advance(st) A.s-op-is-op(l, "op==")
+  else if at-op(st, "=~"): p-advance(st) A.s-op-is-op(l, "op=~")
+  else if at-op(st, "<=>"): p-advance(st) A.s-op-is-op(l, "op<=>")
+  else: plain
+  end
+end
+
+fun is-not-suffix-op(st :: PState, l :: A.Loc) -> A.CheckOp:
+  if at-op(st, "=="): p-advance(st) A.s-op-is-not-op(l, "op==")
+  else if at-op(st, "=~"): p-advance(st) A.s-op-is-not-op(l, "op=~")
+  else if at-op(st, "<=>"): p-advance(st) A.s-op-is-not-op(l, "op<=>")
+  else: A.s-op-is-not(l)
   end
 end
 
