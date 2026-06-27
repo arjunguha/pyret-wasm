@@ -2,10 +2,15 @@ node_modules/
 *.wasm
 .DS_Store
 dist/
-# Vendored upstream Pyret checkout (~943MB: parser, baseline compiler, corpus source).
-# Large; obtained separately. Our editable copies live in self-compiler/ and test-corpus/.
-pyret/
+# Upstream Pyret checkout lives OUTSIDE the repo at ../pyret (clone of
+# github.com/brownplt/pyret-lang into ../pyret/lang) so git ops here can't delete it;
+# `pyret` is a gitignored symlink -> ../pyret. Our editable copies live in
+# self-compiler/ and test-corpus/. Leading slash ignores the symlink AND any dir.
+/pyret
 # generated web bundles (build with: bun run build:web)
 web/main.bundle.js
 web/worker.bundle.js
 web/parser-bundle.js
+
+# agent worktrees / local state
+.claude/
