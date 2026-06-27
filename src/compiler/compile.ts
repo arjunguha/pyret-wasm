@@ -23,7 +23,7 @@ export class CompileError extends Error {
   }
 }
 
-interface VariantInfo { id: number; fields: string[]; refs?: boolean[]; methods?: { name: string; node: CstNode }[]; ownVariants?: string[]; }
+interface VariantInfo { id: number; fields: string[]; refs?: boolean[]; methods?: { name: string; node: CstNode }[]; ownVariants?: string[]; order?: number; }
 
 const ARITH_FN: Record<string, string> = {
   PLUS: "$num_add", DASH: "$num_sub", TIMES: "$num_mul", SLASH: "$num_divide",
@@ -95,6 +95,17 @@ class Compiler {
   // same-named local rebind (e.g. `t-string = T.t-string(...)`), which is defined
   // later in program order and thus still null at earlier use sites.
   firstGlobal = new Map<string, string>();
+  // Program-order resolution. Each top-level name may be bound several times across
+  // the flattened module list; globalGens records ALL bindings of a name in order.
+  // A reference compiled at `resolveOrder` resolves to the most-recent binding at or
+  // before it (lexical/program order), falling back to the FIRST for forward refs.
+  // This stops a LATER module's `shadow map = lam ...: lst.map(...)` from capturing
+  // the prelude's own `map` recursion (which would loop forever). Default Infinity =
+  // see everything (last-wins), used for the entry program's own top-level code.
+  globalGens = new Map<string, { order: number; gname: string }[]>();
+  resolveOrder = Infinity;   // order of the top-level item currently being compiled
+  curOrder = 0;              // order being assigned during pass-1 registration
+  stmtOrder = new Map<CstNode, number>(); // top-level stmt node -> its program-order index
 
   constructor() {
     this.m = new binaryen.Module();
@@ -134,8 +145,11 @@ class Compiler {
 
     // Pass 1: register data declarations + top-level names (funs and lets) as
     // globals so they may be forward/mutually referenced.
-    const topFuns: { node: CstNode; gname: string; fnIndex: number; wasmName: string }[] = [];
-    for (const stmt of stmts) {
+    const topFuns: { node: CstNode; gname: string; fnIndex: number; wasmName: string; order: number }[] = [];
+    for (let si = 0; si < stmts.length; si++) {
+      const stmt = stmts[si]!;
+      this.curOrder = si; // program-order index for this top-level statement
+      this.stmtOrder.set(stmt, si);
       const inner = this.stmtInner(stmt);
       if (inner.name === "data-expr") { this.registerData(inner); continue; }
       if (inner.name === "fun-expr") {
@@ -144,7 +158,7 @@ class Compiler {
         const fnIndex = this.fnNames.length;
         const wasmName = "$fn_" + this.gcount + "_" + name;
         this.fnNames.push(wasmName);
-        topFuns.push({ node: inner, gname, fnIndex, wasmName });
+        topFuns.push({ node: inner, gname, fnIndex, wasmName, order: si });
       } else if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr") {
         const nm = this.bindingName(this.letBinding(inner));
         // Whole-program flattening puts every module's top-level names in one global
@@ -160,10 +174,14 @@ class Compiler {
       }
     }
 
-    // Pass 2: compile top-level function bodies (no captures).
+    // Pass 2: compile top-level function bodies (no captures). Each function resolves
+    // names as of its own program position, so a prelude function's recursion binds to
+    // the prelude's globals, not a later module's same-named `shadow`.
     for (const tf of topFuns) {
+      this.resolveOrder = tf.order;
       this.compileFunction(tf.wasmName, tf.node, new Map());
     }
+    this.resolveOrder = Infinity;
 
     // Pass 3: $main — initialize fun globals (hoisted), then run statements.
     const ctx = new Ctx(true);
@@ -193,23 +211,30 @@ class Compiler {
     let printed = false;
     runnable.forEach((stmt, i) => {
       const inner = this.stmtInner(stmt);
+      const order = this.stmtOrder.get(stmt) ?? Infinity;
       if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr") {
         const name = this.bindingName(this.letBinding(inner));
         // Assign to THIS binding's own global (not topScope's last-wins entry).
         const gname = this.topLetGlobal.get(inner) ?? this.topScope.get(name)!;
-        // Non-recursive let: a re-binding's RHS sees the prior global (see pass 1).
-        const prior = this.topLetPrior.get(inner);
-        const saved = this.topScope.get(name);
-        if (prior !== undefined) this.topScope.set(name, prior);
+        // Non-recursive let: its RHS sees bindings strictly BEFORE it (so a re-binding
+        // like `shadow x = <expr using x>` reads the prior x, not the new global). A
+        // `rec` binding is recursive and may see itself.
+        this.resolveOrder = inner.name === "rec-expr" ? order : order - 1;
         const rhs = this.compileExpr(inner.kids[inner.kids.length - 1]!, ctx, false);
-        if (prior !== undefined && saved !== undefined) this.topScope.set(name, saved);
+        this.resolveOrder = Infinity;
         body.push(m.global.set(gname, rhs));
       } else if (inner.name === "check-expr") {
+        this.resolveOrder = order;
         body.push(this.compileCheckExpr(inner, ctx));
+        this.resolveOrder = Infinity;
       } else if (inner.name === "check-test" && inner.kids.length > 1) {
+        this.resolveOrder = order;
         body.push(this.compileCheckTest(inner, ctx));
+        this.resolveOrder = Infinity;
       } else {
+        this.resolveOrder = order;
         const value = this.compileExpr(inner, ctx, false);
+        this.resolveOrder = Infinity;
         if (i === runnable.length - 1) { body.push(m.local.set(resultLocal, value)); printed = true; }
         else body.push(m.drop(value));
       }
@@ -262,7 +287,22 @@ class Compiler {
     this.m.addGlobal(gname, binaryen.anyref, true, this.m.ref.null(binaryen.anyref));
     this.topScope.set(name, gname);
     if (!this.firstGlobal.has(name)) this.firstGlobal.set(name, gname);
+    const gens = this.globalGens.get(name) ?? [];
+    gens.push({ order: this.curOrder, gname });
+    this.globalGens.set(name, gens);
     return gname;
+  }
+
+  // The global for `name` visible to code at `this.resolveOrder`: the most-recent
+  // binding at or before that order, else the first (forward references). With the
+  // default resolveOrder=Infinity this is the last binding (= topScope).
+  private globalFor(name: string): string | undefined {
+    const gens = this.globalGens.get(name);
+    if (!gens || gens.length === 0) return this.topScope.get(name);
+    if (gens.length === 1) return gens[0]!.gname;
+    let best: string | undefined;
+    for (const g of gens) { if (g.order <= this.resolveOrder) best = g.gname; else break; }
+    return best ?? gens[0]!.gname;
   }
 
   // `N.member` (module-alias access) -> the original (first-registered) global for
@@ -304,10 +344,10 @@ class Compiler {
         const fields = memberNodes.map((vm) => this.bindingName(this.childNamed(vm, "binding")!));
         // a `ref`-annotated member (`bx(ref v, w)`) becomes a MUTABLE field cell.
         const refs = memberNodes.map((vm) => vm.kids.some((k) => k.name === "REF"));
-        this.variants.set(name, { id: this.nextVariantId++, fields, refs, methods, ownVariants });
+        this.variants.set(name, { id: this.nextVariantId++, fields, refs, methods, ownVariants, order: this.curOrder });
       } else {
         const nm = this.childNamed(kid, "NAME");
-        if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods, ownVariants });
+        if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods, ownVariants, order: this.curOrder });
       }
     }
     if (typeName && this.nextVariantId > minId) {
@@ -338,8 +378,12 @@ class Compiler {
     body.push(m.global.set("$variant_methods", m.array.new_fixed(this.t.Fields, nulls)));
     const reg = () => m.ref.cast(m.global.get("$variant_methods", this.t.FieldsRefNull), this.t.FieldsRef);
     for (const v of withMethods) {
+      // Method bodies resolve names as of their data decl's position (e.g. List's
+      // `.map` body `map(f, self)` binds to the prelude `map`, not a later `shadow`).
+      this.resolveOrder = v.order ?? Infinity;
       body.push(m.array.set(reg(), m.i32.const(v.id), this.makeMethodsObject(v.methods!, ctx, v.ownVariants)));
     }
+    this.resolveOrder = Infinity;
   }
   // Populate $variant_names[id] with the variant's field-name list ($Names array),
   // for every variant that has fields (emitted into $main's body).
@@ -658,7 +702,7 @@ class Compiler {
       const vv = this.variants.get(name)!;
       return vv.fields.length === 0 ? this.makeVariant(name, vv, []) : this.makeClosure(this.constructorFnIndex(name, vv), [], ctx);
     }
-    if (this.topScope.has(name)) return m.global.get(this.topScope.get(name)!, binaryen.anyref);
+    if (this.topScope.has(name)) return m.global.get(this.globalFor(name)!, binaryen.anyref);
     const v = this.variants.get(name);
     if (v) {
       // nullary variant -> the singleton value; with fields -> a constructor function.
@@ -1005,7 +1049,7 @@ class Compiler {
         let setter: number;
         if (ctx.boxed.has(nm)) setter = this.setBox(this.resolveName(nm, ctx, /*raw*/ true)!, value);
         else if (ctx.locals.has(nm)) setter = m.local.set(ctx.locals.get(nm)!, value);
-        else if (this.topScope.has(nm)) setter = m.global.set(this.topScope.get(nm)!, value);
+        else if (this.topScope.has(nm)) setter = m.global.set(this.globalFor(nm)!, value);
         else throw new CompileError(`cannot assign to unbound or non-var identifier: ${nm}`, node);
         return m.block(null, [setter, m.ref.i31(m.i32.const(2))], binaryen.anyref);
       }
