@@ -9,12 +9,13 @@ import { test, expect } from "bun:test";
 import { resolve } from "path";
 import { buildSourceFile } from "../src/build.ts";
 import { parsePyret } from "../src/parser/pyret-parser.ts";
-import { serializeCst } from "../src/runtime/parse-bridge.ts";
+import { serializeCst, TAGS } from "../src/runtime/parse-bridge.ts";
 import { buildHostImports, newHostState } from "../src/runtime/run.ts";
 
 const FIXTURE = resolve(import.meta.dir, "fixtures/surface-parse.arr");
+const DETAIL = resolve(import.meta.dir, "fixtures/surface-parse-detail.arr");
 
-// Run the fixture with the host bridge primed to parse `src`.
+// Run a seed-compiled fixture with the host bridge primed to parse `src`.
 async function runWithSource(wasm: Uint8Array, src: string): Promise<string> {
   const state = newHostState();
   state.sourceBytes = new TextEncoder().encode(src);
@@ -27,30 +28,81 @@ async function runWithSource(wasm: Uint8Array, src: string): Promise<string> {
   return state.captured;
 }
 
-test("surface-parse: '5' -> s-program / s-block / s-num(5)", async () => {
+test("surface-parse: '5' -> s-program / s-block / s-num", async () => {
   const wasm = await buildSourceFile(FIXTURE);
   const out = await runWithSource(wasm, "5");
-  // surface-parse("5") -> s-program { block: s-block { stmts: [s-num(5)] } }
   expect(out).toContain("prog=true"); // is-s-program
   expect(out).toContain("blk=true"); // is-s-block
-  expect(out).toContain("num=true"); // is-s-num
-  expect(out).toContain("n=5"); // the number payload
+  expect(out).toContain("label=s-num"); // first statement ctor
+});
+
+// Each source's first statement should rebuild into the matching ast.arr ctor,
+// exercising the full bridge (parse-bridge lowering + parse-from-tree rebuild).
+const FORMS: Array<[string, string]> = [
+  ["42", "s-num"],
+  ['"hi"', "s-str"],
+  ["true", "s-bool"],
+  ["x", "s-id"],
+  ["1 + 2", "s-op"],
+  ["f(1)", "s-app"],
+  ["o.x", "s-dot"],
+  ["a.b(2)", "s-app"], // method call = app of a dot
+  ["if x: 1 else: 2 end", "s-if-else"],
+  ["if x: 1 end", "s-if"],
+  ["x = 5", "s-let"],
+  ["var y = 3", "s-var"],
+  ["fun f(a): a end", "s-fun"],
+  ["lam(a): a end", "s-lam"],
+  ["[list: 1, 2]", "s-construct"],
+  ["5 is 6", "s-check-test"],
+];
+
+test("surface-parse: rebuilds the right ast.arr ctor for each core form", async () => {
+  const wasm = await buildSourceFile(FIXTURE);
+  for (const [src, label] of FORMS) {
+    const out = await runWithSource(wasm, src);
+    expect(out).toContain("prog=true");
+    expect(out, `source ${JSON.stringify(src)}`).toContain(`label=${label}`);
+  }
+});
+
+test("surface-parse: rebuilt AST carries real payloads (5 + x)", async () => {
+  const wasm = await buildSourceFile(DETAIL);
+  const out = await runWithSource(wasm, "5 + x");
+  expect(out).toContain("label=s-op");
+  expect(out).toContain("op=op+");
+  expect(out).toContain("left=s-num");
+  expect(out).toContain("ln=5");
+  expect(out).toContain("right=s-id");
+  expect(out).toContain("rid=x");
 });
 
 // The CST -> flat-AST lowering itself, exercised directly (no WASM).
 test("serializeCst lowers core forms to a flat pre-order stream", async () => {
   // "5" -> program, block, num
   const five = serializeCst(await parsePyret("5"));
-  expect(five.map((n) => n.tag)).toEqual([0, 1, 2]); // PROGRAM, BLOCK, NUM
+  expect(five.map((n) => n.tag)).toEqual([TAGS.PROGRAM, TAGS.BLOCK, TAGS.NUM]);
   expect(five[2]!.str).toBe("5");
 
   // "1 + 2" -> program, block, op(+, num, num)
   const sum = serializeCst(await parsePyret("1 + 2"));
-  expect(sum.map((n) => n.tag)).toEqual([0, 1, 6, 2, 2]); // …, OP, NUM, NUM
+  expect(sum.map((n) => n.tag)).toEqual([TAGS.PROGRAM, TAGS.BLOCK, TAGS.OP, TAGS.NUM, TAGS.NUM]);
   expect(sum[2]!.str).toBe("op+");
 
   // string / bool / id leaves
   expect(serializeCst(await parsePyret('"hi"'))[2]!.str).toBe("hi");
   expect(serializeCst(await parsePyret("true"))[2]!.str).toBe("true");
   expect(serializeCst(await parsePyret("x"))[2]!.str).toBe("x");
+
+  // app: APP -> [ID, EXPRS -> [NUM]]
+  const app = serializeCst(await parsePyret("f(1)"));
+  expect(app.map((n) => n.tag)).toEqual([
+    TAGS.PROGRAM, TAGS.BLOCK, TAGS.APP, TAGS.ID, TAGS.EXPRS, TAGS.NUM,
+  ]);
+
+  // fun: FUN -> [BINDS -> [BIND], BLOCK -> [ID]]
+  const fun = serializeCst(await parsePyret("fun f(a): a end"));
+  expect(fun.map((n) => n.tag)).toEqual([
+    TAGS.PROGRAM, TAGS.BLOCK, TAGS.FUN, TAGS.BINDS, TAGS.BIND, TAGS.BLOCK, TAGS.ID,
+  ]);
 });

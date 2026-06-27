@@ -39,9 +39,16 @@ export interface HostState {
   // `read_source_into` import (the self-hosted compiler's input). Empty otherwise.
   sourceBytes: Uint8Array;
   // Flat pre-order parse-tree (CST lowered by parse-bridge.serializeCst), exposed
-  // to the self-hosted parser via the `parse_*` imports. Precomputed by the caller
-  // (see setSourceForParsing); empty until then.
+  // to the self-hosted parser via the `parse_*` imports. Either precomputed by the
+  // caller, or produced lazily from `sourceBytes` by `parseSource` (below) on the
+  // first `parse_source` call; empty until then.
   parseNodes: SerNode[];
+  // Optional lazy parser: decode+parse+serialize a source string into a node
+  // stream. When set and `parseNodes` is still empty, the `parse_source` import
+  // parses `sourceBytes` on demand — so callers need only set `sourceBytes` (the
+  // same buffer `read-source` delivers), not precompute the CST. Kept as a
+  // callback so run.ts stays parser-agnostic (no static GLR import -> browser-safe).
+  parseSource?: (src: string) => SerNode[];
 }
 
 // Build the `host` import object. The same set is used by `run` and the
@@ -84,10 +91,17 @@ export function buildHostImports(state: HostState) {
         new Uint8Array(state.memory!.buffer, addr, state.sourceBytes.length).set(state.sourceBytes);
         return state.sourceBytes.length;
       },
-      // Self-hosted parser bridge (Option B): the CST is precomputed into
-      // state.parseNodes (flat pre-order); these four imports let the Pyret side
-      // walk it with a cursor (no in-WASM string-stream parsing). See parse-bridge.ts.
-      parse_source: (): number => state.parseNodes.length,
+      // Self-hosted parser bridge (Option B): the CST is a flat pre-order stream
+      // in state.parseNodes; these four imports let the Pyret side walk it with a
+      // cursor (no in-WASM string-stream parsing). See parse-bridge.ts. The stream
+      // is either precomputed by the caller, or parsed on demand here from
+      // sourceBytes via state.parseSource (so callers can set just sourceBytes).
+      parse_source: (): number => {
+        if (state.parseNodes.length === 0 && state.parseSource && state.sourceBytes.length > 0) {
+          state.parseNodes = state.parseSource(decoder.decode(state.sourceBytes));
+        }
+        return state.parseNodes.length;
+      },
       parse_node_tag: (i: number): number => state.parseNodes[i]!.tag,
       parse_node_nkids: (i: number): number => state.parseNodes[i]!.nkids,
       parse_node_str_into: (i: number, addr: number): number => {
