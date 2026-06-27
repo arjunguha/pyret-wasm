@@ -487,13 +487,13 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # vtag dispatch: stash val + its variant-id in temps, then a nested if-chain per
       # branch comparing the id (from the data registry); each matching branch binds its
       # args from the variant's $Fields by index, then runs its body; final else.
+      # only vtmp is stashed (it's anyref); the variant id (i32) can't live in an anyref
+      # local, so each branch recomputes it from vtmp via $variant_id.
       vtmp = c.next-local
-      idtmp = c.next-local + 1
-      c2 = ctx(c.locals, c.next-local + 2, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)   # reserve 2 temps
+      c2 = ctx(c.locals, c.next-local + 1, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)   # reserve 1 temp
       compile-aval(val, c)
         .append(E.local-set(vtmp))
-        .append(E.local-get(vtmp)).append(E.i-call(idx-variant-id())).append(E.local-set(idtmp))
-        .append(compile-branches(branches, vtmp, idtmp, c2, tail, els))
+        .append(compile-branches(branches, vtmp, c2, tail, els))
     | a-assign(l, id, value) =>
       # write the var's 1-cell: cell[0] := value ; assignment returns nothing.
       k = name-key(id)
@@ -567,32 +567,34 @@ end
 
 # ===== a-cases branch chain =====
 # Build a nested if/else over the variant id (in local `idtmp`), val in local `vtmp`.
-fun compile-branches(branches, vtmp :: Number, idtmp :: Number, c :: Ctx, tail :: Boolean, els) -> List<Number>:
+fun compile-branches(branches, vtmp :: Number, c :: Ctx, tail :: Boolean, els) -> List<Number>:
+  # the variant id of val, recomputed on the stack (i32) each branch (no i32 local).
+  val-id = E.local-get(vtmp).append(E.i-call(idx-variant-id()))
   cases(List) branches:
     | empty => compile-aexpr(els, c, tail)
     | link(br, rest) =>
       cases(N.ACasesBranch) br:
         | a-cases-branch(_, _, bname, bargs, bbody) =>
           cases(Option) data-lookup(c, bname):
-            | none => compile-branches(rest, vtmp, idtmp, c, tail, els)     # unknown variant: skip
+            | none => compile-branches(rest, vtmp, c, tail, els)     # unknown variant: skip
             | some(d) =>
               bound = bind-cases-args(bargs, 0, vtmp, c, empty)
-              E.local-get(idtmp).append(E.i32-const(d.id)).append(E.i32-eq)
+              val-id.append(E.i32-const(d.id)).append(E.i32-eq)
                 .append(E.i-if(ANYREF-BT))
                 .append(bound.code).append(compile-aexpr(bbody, bound.cx, tail))
                 .append(E.i-else)
-                .append(compile-branches(rest, vtmp, idtmp, c, tail, els))
+                .append(compile-branches(rest, vtmp, c, tail, els))
                 .append(E.i-end)
           end
         | a-singleton-cases-branch(_, _, bname, bbody) =>
           cases(Option) data-lookup(c, bname):
-            | none => compile-branches(rest, vtmp, idtmp, c, tail, els)
+            | none => compile-branches(rest, vtmp, c, tail, els)
             | some(d) =>
-              E.local-get(idtmp).append(E.i32-const(d.id)).append(E.i32-eq)
+              val-id.append(E.i32-const(d.id)).append(E.i32-eq)
                 .append(E.i-if(ANYREF-BT))
                 .append(compile-aexpr(bbody, c, tail))
                 .append(E.i-else)
-                .append(compile-branches(rest, vtmp, idtmp, c, tail, els))
+                .append(compile-branches(rest, vtmp, c, tail, els))
                 .append(E.i-end)
           end
       end
@@ -833,7 +835,10 @@ end
 # compile one variant constructor: receives args as $Fields (local 1); builds the
 # $Variant {id, name, fields=local1} and returns it.
 fun compile-ctor(d) -> List<Number>:
-  body = E.i32-const(d.id).append(emit-str(d.name)).append(E.local-get(1)).append(E.struct-new(T-VARIANT))
+  # local 1 (the args $Fields param) is nullable in the closure-call signature; the
+  # $Variant.fields field is non-null, so cast before struct.new.
+  body = E.i32-const(d.id).append(emit-str(d.name))
+    .append(E.local-get(1)).append(E.ref-cast(T-FIELDS)).append(E.struct-new(T-VARIANT))
   E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], body)
 end
 # $variant_names global = (ref $Fields) of $Names, indexed by variant id, so

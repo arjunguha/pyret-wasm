@@ -114,3 +114,44 @@ test("self-hosted: identity function compiles and runs", async () => {
   const { result } = await selfHostRun("fun id(x): x end\nid(42)");
   expect(result.error).toBeUndefined();
 });
+
+// ─── Level 5: data declarations, constructors, and cases ────────────────────────
+// `data` desugars to s-data-expr (with a generated type name); the driver binds the
+// data object + each constructor name from it (so bare `bar(x)` / `baz` resolve). The
+// backend emits a constructor fn per variant (table slot = nlams + id) building a
+// $Variant, and `cases` does vtag dispatch on $variant_id over the data registry.
+//
+// These tests use a "trap on wrong value" helper — `expect(v, e)` does `1 / 0` (a
+// runtime error) when v != e — so a WRONG cases dispatch / field binding TRAPS and the
+// test fails, making `result.error === undefined` a real correctness check.
+const DATA_PRELUDE =
+  "data Foo: | bar(x) | baz end\n" +
+  "fun expect(v, e): if v == e: 0 else: 1 / 0 end end\n";
+
+test("self-hosted: data declaration + constructor call compiles and runs", async () => {
+  const { result } = await selfHostRun("data Foo: | bar(x) | baz end\nbar(5)");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: cases binds a variant's field (bar(7) -> 7)", async () => {
+  const { result } = await selfHostRun(
+    DATA_PRELUDE + "expect(cases(Foo) bar(7): | bar(x) => x | baz => 99 end, 7)");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: cases dispatches a singleton variant (baz -> 99)", async () => {
+  const { result } = await selfHostRun(
+    DATA_PRELUDE + "expect(cases(Foo) baz: | bar(x) => x | baz => 99 end, 99)");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: a WRONG cases dispatch traps (sanity: the trap-pattern catches it)", async () => {
+  // bar(7) yields 7, not 99, so expect(...,99) divides by zero -> a runtime error
+  // (a trap makes run() reject), proving the trap-pattern would catch a bad dispatch.
+  let threw = false;
+  try {
+    await selfHostRun(
+      DATA_PRELUDE + "expect(cases(Foo) bar(7): | bar(x) => x | baz => 99 end, 99)");
+  } catch (_) { threw = true; }
+  expect(threw).toBe(true);
+});
