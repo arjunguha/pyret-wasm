@@ -54,11 +54,24 @@ intrinsics :: List<String> = [list:
   "emit-byte", "identical", "print", "display", "print-error" ]
 
 # ---- CstNode helpers (mirror only/child) ----
+# NB: the shared prelude's `find` returns the bare element (or `false`), NOT an
+# Option like standard Pyret. cps.ts/cps.arr were written against an Option-returning
+# find, so we provide local Option/raise variants here and route every find through them.
+fun find-opt<a>(f :: (a -> Boolean), l :: List<a>) -> Option<a>:
+  cases(List) l:
+    | empty => none
+    | link(fst, r) => if f(fst): some(fst) else: find-opt(f, r) end
+  end
+end
+fun find-bang<a>(f :: (a -> Boolean), l :: List<a>) -> a:
+  cases(Option) find-opt(f, l): | some(x) => x | none => raise("find-bang: not found") end
+end
+
 fun only(n :: CstNode) -> CstNode:
   cases(List) n.kids: | link(f, r) => f | empty => raise("expected single child of " + n.name) end
 end
 fun child(n :: CstNode, nm :: String) -> Option<CstNode>:
-  find(lam(k): k.name == nm end, n.kids)
+  find-opt(lam(k): k.name == nm end, n.kids)
 end
 fun child-bang(n :: CstNode, nm :: String) -> CstNode:
   cases(Option) child(n, nm): | some(c) => c | none => raise("missing child " + nm) end
@@ -270,16 +283,16 @@ end
 
 fun t-if(node :: CstNode, k :: Cont) -> String:
   kids = node.kids
-  cond = find(lam(x): x.name == "binop-expr" end, kids).value
+  cond = find-bang(lam(x): x.name == "binop-expr" end, kids)
   blocks = filter(lam(x): x.name == "block" end, kids)
   elseifs = filter(lam(x): x.name == "else-if" end, kids)
-  has-else = is-some(find(lam(x): x.name == "ELSECOLON" end, kids))
+  has-else = is-some(find-opt(lam(x): x.name == "ELSECOLON" end, kids))
   when not(has-else): raise("if without else not supported in CPS") end
   fun if-expr(vc :: String, kf :: Cont) -> String:
     base = "if " + vc + ": " + t-block(blocks.first, kf)
     mid = for fold(acc from base, ei from elseifs):
-      ec = find(lam(x): x.name == "binop-expr" end, ei.kids).value
-      eb = find(lam(x): x.name == "block" end, ei.kids).value
+      ec = find-bang(lam(x): x.name == "binop-expr" end, ei.kids)
+      eb = find-bang(lam(x): x.name == "block" end, ei.kids)
       acc + " else if " + render-pure(ec) + ": " + t-block(eb, kf)
     end
     mid + " else: " + t-block(blocks.get(blocks.length() - 1), kf) + " end"
@@ -311,7 +324,7 @@ end
 
 fun t-cases(node :: CstNode, k :: Cont) -> String:
   ty = render-ann(child(node, "ann"))
-  scrut = find(lam(x): x.name == "binop-expr" end, node.kids).value
+  scrut = find-bang(lam(x): x.name == "binop-expr" end, node.kids)
   branches = filter(lam(x): x.name == "cases-branch" end, node.kids)
   # else block (after the ELSE token) — TODO(port): index-based slice as in tCases
   else-block = find-else-block(node)
@@ -343,10 +356,10 @@ fun find-else-block(node :: CstNode) -> Option<CstNode>: none end
 
 # for ITER(p from e, ...): body end  ==>  ITER(lam(p,...,KG): yield-check(...) end, e..., reify k)
 fun t-for(node :: CstNode, k :: Cont) -> String:
-  iter-expr = find(lam(x): x.name == "expr" end, node.kids).value
+  iter-expr = find-bang(lam(x): x.name == "expr" end, node.kids)
   binds = filter(lam(x): x.name == "for-bind" end, node.kids)
   params = map(lam(b): binding-name(child-bang(b, "binding")) end, binds)
-  from-exprs = map(lam(b): find(lam(x): x.name == "binop-expr" end, b.kids).value end, binds)
+  from-exprs = map(lam(b): find-bang(lam(x): x.name == "binop-expr" end, b.kids) end, binds)
   body = child-bang(node, "block")
   kg = gensym("k")
   lam-body = t-block(body, k-var(kg))
