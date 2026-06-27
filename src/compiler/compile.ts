@@ -342,6 +342,21 @@ class Compiler {
     return [this.bindingName(binding)];
   }
 
+  // Like bindingNames, but EXCLUDES `shadow` names. A `shadow x = e` binding's name
+  // must NOT be in scope within its own RHS `e` (which refers to the OUTER x), so for
+  // free-variable/capture analysis we don't pre-bind shadowed names — otherwise a
+  // closure doing `shadow x = x.foo()` fails to capture the outer x. (Pervasive in the
+  // real compiler's accumulator pattern.)
+  private hasShadowToken(node: CstNode): boolean {
+    if (node.name === "SHADOW") return true;
+    return node.kids.some((k) => this.hasShadowToken(k));
+  }
+  private nonShadowBindingNames(binding: CstNode): string[] {
+    const comps = this.tupleComponents(binding);
+    if (comps) return comps.flatMap((c) => this.nonShadowBindingNames(c));
+    return this.hasShadowToken(binding) ? [] : [this.bindingName(binding)];
+  }
+
   // Bind `value` to `binding` (a name, or a tuple-destructure) as local(s), appending
   // the resulting local.set statements to `parts`. Tuple: store in a temp, then bind
   // each component to `temp.{i}` via $variant_field (tuples are variant id 0).
@@ -581,8 +596,10 @@ class Compiler {
         const inner = this.only(stmt);
         // let/var/rec all introduce block-scoped bindings; omitting var here made a
         // `var n` look free, spuriously propagating it upward as a captured var.
+        // nonShadowBindingNames: a `shadow x = <expr using x>` must NOT pre-bind x, so
+        // its RHS still captures the outer x.
         if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr")
-          for (const nm of this.bindingNames(this.letBinding(inner))) b2.add(nm);
+          for (const nm of this.nonShadowBindingNames(this.letBinding(inner))) b2.add(nm);
         else if (inner.name === "fun-expr") { const nm = this.childNamed(inner, "NAME"); if (nm) b2.add(nm.value!); }
       }
       for (const k of node.kids) add(this.freeVars(k, b2));
@@ -599,7 +616,7 @@ class Compiler {
     }
     if (node.name === "multi-let-expr" || node.name === "letrec-expr") {
       const b2 = new Set(bound);
-      for (const b of this.multiLetBinds(node)) for (const nm of this.bindingNames(this.letBinding(b))) b2.add(nm);
+      for (const b of this.multiLetBinds(node)) for (const nm of this.nonShadowBindingNames(this.letBinding(b))) b2.add(nm);
       for (const k of node.kids) add(this.freeVars(k, b2));
       return out;
     }
