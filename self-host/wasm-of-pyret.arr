@@ -797,6 +797,16 @@ fun collect-toplevel(e, acc):
 end
 
 # ===== program assembler =====
+# main sets $link_id/$empty_id from List's link/empty variant ids (looked up in the data
+# registry) so the renderer shows lists as [list: ...] and $cons/$empty_list build
+# well-formed variants. If the program defines no such variant, the global stays -1.
+fun gid-init(dreg, name :: String, gi :: Number) -> List<Number>:
+  cases(Option) dreg-find(dreg, name):
+    | none => empty
+    | some(d) => E.i32-const(d.id).append(E.global-set(gi))
+  end
+end
+
 fun compile-prog(prog) -> List<Number>:
   cases(N.AProg) prog:
     | a-program(l, provides, imports, body) =>
@@ -821,7 +831,10 @@ fun compile-prog(prog) -> List<Number>:
 
       # ----- main (() -> anyref), the lambda bodies, and the ctor bodies -----
       main-ctx = ctx(empty, 0, empty, gmap, lam-map, dreg, gvars, num-lams)
-      main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], compile-aexpr(body, main-ctx, true))
+      # set $link_id/$empty_id from the data registry before running the program body.
+      list-id-init = gid-init(dreg, "link", R.GI-LINK-ID).append(gid-init(dreg, "empty", R.GI-EMPTY-ID))
+      main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)],
+        list-id-init.append(compile-aexpr(body, main-ctx, true)))
       lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry

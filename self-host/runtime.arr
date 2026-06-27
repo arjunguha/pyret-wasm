@@ -15,12 +15,16 @@
 # ($render/$render_num/$render_variant/$render_list/$render_tuple/$render_object/
 # $val_to_string + $write_i64/$str_copy/$num_to_string), the CHECK HARNESS
 # ($check_is/$check_is_not/$check_pred via the $passed/$total globals + host imports),
-# $obj_extend, $cons/$empty_list, and $str_from_mem are now implemented (faithful ports
-# of runtime.ts). build-runtime() executes and emits 49 functions / ~2.8KB of body bytes.
-# STILL TODO(port): the rough/rational/bignum number tower (all $mag_*, $make_rat,
-# $to_f64, $num_expt), $str_to_codepoints, the CPS $yield primitive, and having `main`
-# set $link_id/$empty_id to List's link/empty ids (so the renderer shows [list: ...] and
-# $cons/$empty_list build well-formed variants; until then those globals stay -1).
+# $obj_extend, $cons/$empty_list, $str_from_mem, $str_to_codepoints, $num_expt (fixnum),
+# and $to_f64 (fixnum+rough) are now implemented (faithful ports of runtime.ts).
+# build-runtime() executes and emits 49 functions / ~3KB of body bytes. The assembler
+# (wasm-of-pyret.arr) now sets $link_id/$empty_id from List's link/empty variant ids at
+# the start of `main`, so the renderer shows [list: ...] and $cons/$empty_list build
+# well-formed variants.
+# STILL TODO(port): the rational/bignum tower ($make_rat, all $mag_*, the rough/rational
+# contagion in $plus/$num_compare/$render_num, and rat/big cases in $to_f64); the CPS
+# $yield primitive (NB: runtime.ts has no standalone $yield function — it lives in the
+# {stoppable} codegen path); and is-<variant> predicates (in wasm-of-pyret.arr a-data-expr).
 # NB: the backend can't yet RUN these end-to-end (the seed flat-namespace collision
 # blocks co-importing the backend with ast.arr to drive compile-prog), so byte-level
 # correctness is verified by mirroring runtime.ts + clean compile, not execution.
@@ -242,7 +246,25 @@ fun emit-num-modulo() -> RtFun:
   rt-fun("$num_modulo", [list: E.reft(T-NUM), E.reft(T-NUM)], [list: E.reft(T-NUM)],
          [list: E.local-decl(4, i64t)], body)
 end
-fun emit-num-expt() -> RtFun: todo("$num_expt", "repeated $num_mul loop, non-neg integer exponent") end
+# $num_expt(base, exp) = base^exp for a non-negative integer exp. runtime.ts loops over
+# $num_mul (full tower); since the fixnum fast path has no $num_mul, we inline an i64
+# fixnum multiply here (DEVIATION(port): fixnum-only, no tower contagion). locals:
+# result=2 (ref $Num), e=3 (i32), i=4 (i32).
+fun emit-num-expt() -> RtFun:
+  body = blk(E.reft(T-NUM), [list:
+      E.local-get(1), rt-call("$num_to_i32"), E.local-set(3),
+      E.i64-const(1), rt-call("$make_fix"), E.local-set(2),
+      E.i32-const(0), E.local-set(4),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(4), E.local-get(3), E.i32-ge-s, iff([list: E.i-br(2)]),
+          fix-i64(2), fix-i64(0), E.i64-mul, rt-call("$make_fix"), E.local-set(2),
+          E.local-get(4), E.i32-const(1), E.i32-add, E.local-set(4),
+          E.i-br(0) ]) ]),
+      E.local-get(2) ]).append(E.end-instr)
+  rt-fun("$num_expt", [list: E.reft(T-NUM), E.reft(T-NUM)], [list: E.reft(T-NUM)],
+         [list: E.local-decl(1, E.reft(T-NUM)), E.local-decl(2, i32t)], body)
+end
 
 # $num_to_i32(($Num)) -> i32 : assume fixnum, read i64 field, wrap to i32
 fun emit-num-to-i32() -> RtFun:
@@ -254,7 +276,16 @@ fun emit-num-to-i32() -> RtFun:
   rt-fun("$num_to_i32", [list: anyref], [list: i32t], empty, body)
 end
 
-fun emit-to-f64() -> RtFun: todo("$to_f64", "dispatch: fix -> f64.convert_i64; rough -> field; rat -> num/den; big -> limbs->f64") end
+# $to_f64(x :: $Num) -> f64 : rough -> the f64 field; else (fixnum) -> convert the i64
+# payload. TODO(port): rational (num/den) + bignum (limbs) cases — need $int_to_f64.
+fun emit-to-f64() -> RtFun:
+  body = E.local-get(0).append(E.struct-get(T-NUM, 0)).append(E.i32-const(TAG-ROUGH)).append(E.i32-eq)
+    .append(ifel-bt(f64t,
+        [list: E.local-get(0), E.ref-cast(T-ROUGH), E.struct-get(T-ROUGH, 1)],
+        [list: E.local-get(0), E.ref-cast(T-FIX), E.struct-get(T-FIX, 1), E.f64-convert-i64-s]))
+    .append(E.end-instr)
+  rt-fun("$to_f64", [list: E.reft(T-NUM)], [list: f64t], empty, body)
+end
 # $render_num(v :: $Num, addr :: i32) -> i32 end-addr. Roughnums print "roughnum";
 # everything else uses the fixnum decimal path (the tower is fixnum-only). locals: none.
 fun emit-render-num() -> RtFun:
@@ -400,7 +431,24 @@ fun emit-str-copy() -> RtFun:
       E.local-get(3) ]).append(E.end-instr)
   rt-fun("$str_copy", [list: E.reft(T-STR), i32t], [list: i32t], [list: E.local-decl(2, i32t)], body)
 end
-fun emit-str-to-codepoints() -> RtFun: todo("$str_to_codepoints", "build a Pyret list of fixnums from bytes") end
+# $str_to_codepoints(s :: $Str) -> anyref (List<Number>) : build from the END so order
+# holds (acc = empty; for i = len-1 downto 0: acc = cons(make_fix(s[i]), acc)). Faithful
+# port of runtime.ts. locals: i=1 (i32), acc=2 (anyref).
+fun emit-str-to-codepoints() -> RtFun:
+  body = blk(anyref, [list:
+      rt-call("$empty_list"), E.local-set(2),
+      E.local-get(0), E.array-len, E.i32-const(1), E.i32-sub, E.local-set(1),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(1), E.i32-const(0), E.i32-lt-s, iff([list: E.i-br(2)]),
+          E.local-get(0), E.local-get(1), E.array-get-u(T-STR), E.i64-extend-u-i32, rt-call("$make_fix"),
+          E.local-get(2), rt-call("$cons"), E.local-set(2),
+          E.local-get(1), E.i32-const(1), E.i32-sub, E.local-set(1),
+          E.i-br(0) ]) ]),
+      E.local-get(2) ]).append(E.end-instr)
+  rt-fun("$str_to_codepoints", [list: E.reft(T-STR)], [list: anyref],
+         [list: E.local-decl(1, i32t), E.local-decl(1, anyref)], body)
+end
 
 # ===== variants / objects / closures =====
 # $make_variant(id :: i32, name :: $Str, fields :: $Fields) -> (ref $Variant)
