@@ -22,10 +22,12 @@ const SELF_COMPILER = resolve(import.meta.dir, "../self-compiler");
 // Modules our prelude/runtime already provide, or builtins with no .arr — treated
 // as already-global (NOT loaded). Everything else with a matching .arr is compiled.
 const SKIP_MODULES = new Set([
-  "global", "base", "lists", "option",
+  "global", "base", "lists", "option", "either",
   "arrays", "sets", "string-dict", "s-exp", "s-exp-structs", "ffi",
   "contracts", "checker", "tables", "table", "render-error-display",
 ]);
+// NB: `either` is skipped — Either/left/right are prelude-provided so the prelude's
+// fold-while can use them; equality/error are NOT skipped (loaded as real modules).
 
 function findDescendant(node: CstNode, name: string): CstNode | undefined {
   if (node.name === name) return node;
