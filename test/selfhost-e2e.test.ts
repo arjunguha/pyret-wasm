@@ -216,6 +216,36 @@ test("self-hosted: non-recursive cases over a [list: ...] (head -> 7)", async ()
   expect(result.error).toBeUndefined();
 });
 
+// ─── Level 6b: the INJECTED [list:] path + value RENDERING ───────────────────────
+// These use `[list: ...]` WITHOUT a user `data List`, so the driver INJECTS the List
+// data node and `link`/`empty` resolve via name-key (which must be loc-INDEPENDENT —
+// the injected node's loc differs from the [list:] reference loc).  They also exercise
+// the renderer: lists -> `[list: a, b]`, the empty list -> `[list: ]`, and tuples ->
+// `{a; b}` (the tuple sentinel id is -1, distinct from a real variant's id 0).
+test("self-hosted: injected [list:] renders as [list: 1, 2, 3]", async () => {
+  const { result } = await selfHostRun("print([list: 1, 2, 3])");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("[list: 1, 2, 3]");
+});
+
+test("self-hosted: injected empty [list: ] renders as [list: ] (not a tuple)", async () => {
+  const { result } = await selfHostRun("print([list: ])");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("[list: ]");
+});
+
+test("self-hosted: tuple renders as {1; 2; 3} (sentinel id -1, no collision with variant 0)", async () => {
+  const { result } = await selfHostRun("print({1; 2; 3})");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("{1; 2; 3}");
+});
+
+test("self-hosted: a singleton variant (id 0) renders as its name, not a tuple", async () => {
+  const { result } = await selfHostRun("data D:\n  | mt\n  | c(v)\nend\nprint(mt)");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("mt");
+});
+
 // ─── Level 7: recursion over lists (length / sum) ───────────────────────────────
 // A self-recursive function over a `[list: ...]` — recursing on the variant's `rest`
 // field — compiles and runs with the CORRECT value.  We verify with an inline `if`
