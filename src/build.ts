@@ -22,7 +22,7 @@ const SELF_COMPILER = resolve(import.meta.dir, "../self-compiler");
 // Modules our prelude/runtime already provide, or builtins with no .arr — treated
 // as already-global (NOT loaded). Everything else with a matching .arr is compiled.
 const SKIP_MODULES = new Set([
-  "global", "base", "lists", "option", "either",
+  "global", "base", "lists", "option",
   "arrays", "sets", "string-dict", "s-exp", "s-exp-structs", "ffi",
   "contracts", "checker", "tables", "table", "render-error-display",
 ]);
