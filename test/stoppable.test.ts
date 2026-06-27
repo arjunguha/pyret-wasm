@@ -63,7 +63,35 @@ test("stoppable: matches the direct compiler", async () => {
   }
 });
 
+// The prelude is CPS-transformed TOGETHER with user code, so built-in higher-order
+// functions are themselves interruptible. Verify they still compute correctly through
+// the CPS pipeline (parity with the direct compiler).
+test("stoppable: prelude HOFs match the direct compiler", async () => {
+  for (const src of [
+    "foldl(lam(acc, x): acc + x end, 0, [list: 1, 2, 3, 4, 5])",
+    "sum(map(lam(x): x * x end, [list: 1, 2, 3]))",
+    "length(filter(lam(x): x > 2 end, [list: 1, 2, 3, 4]))",
+    "sum(range(0, 5))",
+    "for fold(acc from 0, x from range(1, 6)): acc + x end",
+    "each(lam(x): print(x) end, [list: 7, 8, 9])",
+  ]) {
+    expect(await evalStoppable(src)).toBe(await evalDirect(src));
+  }
+});
+
 // ---- (b) the stop button: a long/infinite computation is abandoned on ONE thread ----
+
+// The decisive proof that prelude HOFs are interruptible: the ONLY looping here is
+// inside the stdlib `range`/`each` (no user recursion), yet it can still be stopped.
+test("stoppable: a prelude HOF (each over a large range) can be STOPPED", async () => {
+  const h = runStoppable(
+    await buildStoppableSource("each(lam(x): x end, range(0, 300000))"),
+    { onPause: (n) => { if (n >= 2) h.stop(); } },
+  );
+  const r = await h.promise;
+  expect(r.stopped).toBe(true);
+  expect(r.pauses).toBeGreaterThanOrEqual(2);
+});
 
 test("stoppable: an infinite loop can be STOPPED", async () => {
   const h = runStoppable(

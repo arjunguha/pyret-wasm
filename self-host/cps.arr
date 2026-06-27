@@ -149,8 +149,12 @@ fun is-prim(name :: String) -> Boolean:
   # A program-defined `fun` shadows a same-named data constructor (image lib names).
   if fun-defs.member(name): false
   else:
+    # NB: the `and` group MUST be parenthesized — the seed parses mixed and/or
+    # left-associatively (no precedence), so without these parens the trailing
+    # `and ctors.member(...)` would poison the whole disjunction (every ctor would
+    # be misclassified as non-prim). cps.ts got this free from JS `&&` precedence.
     intrinsics.member(name) or ctors.member(name) or
-      (string-substring(name, 0, 3) == "is-") and ctors.member(string-substring(name, 3, string-length(name)))
+      ((string-substring(name, 0, 3) == "is-") and ctors.member(string-substring(name, 3, string-length(name))))
   end
 end
 
@@ -207,6 +211,12 @@ fun t(node :: CstNode, k :: Cont) -> String:
     | node.name == "when-expr" then: t-when(node, k)
     | node.name == "if-pipe-expr" then: t-ask(node, k)
     | node.name == "construct-expr" then: t-construct(node, k)
+    | node.name == "tuple-expr" then: t-tuple(node, k)
+    | node.name == "tuple-get" then:
+      idx = child-bang(node, "NUMBER").value.or-else("0")
+      t(find-bang(lam(x): x.name == "expr" end, node.kids),
+        k-fn(lam(v): applyk(k, "(" + v + ").{" + idx + "}") end))
+    | node.name == "obj-expr" then: t-obj(node, k)
     | node.name == "dot-expr" then:
       t(node.kids.first, k-fn(lam(vo): applyk(k, vo + "." + child-bang(node, "NAME").value.or-else("_")) end))
     | node.name == "lambda-expr" then: applyk(k, cps-lambda(node))
@@ -289,6 +299,39 @@ fun t-construct(node :: CstNode, k :: Cont) -> String:
         | none => empty | some(cb) => filter(lam(x): x.name == "binop-expr" end, cb.kids) end
   end
   t-seq(elems, empty, lam(vs): applyk(k, "[" + ctor-name + ": " + join-args(vs) + "]") end)
+end
+
+# {a; b; c}  — CPS-eval the fields left-to-right, then build the tuple literal.
+fun t-tuple(node :: CstNode, k :: Cont) -> String:
+  fields = cases(Option) child(node, "tuple-fields"):
+    | none => empty
+    | some(tf) => filter(lam(x): x.name == "binop-expr" end, tf.kids)
+  end
+  t-seq(fields, empty, lam(vs): applyk(k, "{" + string-join(vs, "; ") + "}") end)
+end
+
+# object literal {k: v, ..., method m(self,...): ... end}: CPS-eval value fields
+# left-to-right; method bodies are CPS-transformed and take a trailing continuation.
+fun obj-field-is-method(f :: CstNode) -> Boolean: is-some(child(f, "METHOD")) end
+fun cps-obj-method(f :: CstNode) -> String:
+  nm = child-bang(child-bang(f, "key"), "NAME").value.or-else("_")
+  params = header-params(f)
+  kg = gensym("k")
+  body = t-block(child-bang(f, "block"), k-var(kg))
+  "method " + nm + "(" + join-args(params + [list: kg]) + "): yield-check(lam(): " + body + " end) end"
+end
+fun t-obj(node :: CstNode, k :: Cont) -> String:
+  fields = cases(Option) child(node, "obj-fields"):
+    | none => empty
+    | some(ofs) => filter(lam(x): x.name == "obj-field" end, ofs.kids)
+  end
+  value-fields = filter(lam(f): not(obj-field-is-method(f)) end, fields)
+  method-srcs = map(cps-obj-method, filter(obj-field-is-method, fields))
+  keys = map(lam(f): child-bang(child-bang(f, "key"), "NAME").value.or-else("_") end, value-fields)
+  vals = map(lam(f): find-bang(lam(x): x.name == "binop-expr" end, f.kids) end, value-fields)
+  t-seq(vals, empty, lam(vs):
+      kv-pairs = fold_n(lam(i, acc, vv): acc + [list: keys.get(i) + ": " + vv] end, 0, empty, vs)
+      applyk(k, "{" + string-join(kv-pairs + method-srcs, ", ") + "}") end)
 end
 
 fun t-if(node :: CstNode, k :: Cont) -> String:

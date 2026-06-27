@@ -40,7 +40,18 @@ async function runCpsDriver(driverWasm: Uint8Array, serialized: string): Promise
   const imports = buildHostImports(state);
   const { instance } = await WebAssembly.instantiate(driverWasm as BufferSource, imports);
   state.instance = instance;
-  state.memory = instance.exports.memory as WebAssembly.Memory;
+  const mem = instance.exports.memory as WebAssembly.Memory;
+  state.memory = mem;
+  // The serialized CST is large (the prelude alone is ~285KB), and the driver reads
+  // it into linear memory and builds the CST + output string there. The seed's bump
+  // allocator doesn't grow memory itself, so pre-grow to fit (seed max = 256 pages).
+  const need = state.sourceBytes.length * 8 + (2 << 20);
+  const have = mem.buffer.byteLength;
+  if (need > have) {
+    const want = Math.ceil((need - have) / 65536);
+    const room = 256 - Math.ceil(have / 65536);
+    if (room > 0) { try { mem.grow(Math.min(want, room)); } catch { /* best effort */ } }
+  }
   (instance.exports.main as () => void)();
   return state.captured;
 }
@@ -50,13 +61,16 @@ export async function buildStoppableSourceWith(
   src: string,
   getDriverWasm: () => Promise<Uint8Array>,
 ): Promise<Uint8Array> {
-  const userProgram = await parse(src);
-  const serialized = serializeCstNode(userProgram);
+  // CPS-transform the prelude TOGETHER with user code (one program) so the stdlib's
+  // higher-order functions (map/each/foldl/filter/range/for) are themselves
+  // interruptible — a CPS'd user callback flows through a CPS'd `each`, and the
+  // yield-check at each loop step lets a Stop click be serviced. (Pyret's
+  // tokenizer/parser are stateful singletons, so parse sequentially.)
+  const program = await parse(PRELUDE_SRC + "\n" + src);
+  const serialized = serializeCstNode(program);
   const driver = await getDriverWasm();
   const transformed = (await runCpsDriver(driver, serialized)).trim();
-  // The prelude is prepended UNTRANSFORMED; user functions are CPS-transformed.
-  // (Transforming the prelude too — so its HOFs are interruptible — needs cps.arr
-  // to cover every prelude construct; tracked as the next step.)
-  const full = await parse(PRELUDE_SRC + "\n" + transformed);
+  // `transformed` already contains the CPS'd prelude + user code — do NOT re-prepend.
+  const full = await parse(transformed);
   return compile(full, { stoppable: true });
 }
