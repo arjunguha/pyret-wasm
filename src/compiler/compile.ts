@@ -1099,13 +1099,16 @@ class Compiler {
 
     // method / field call:  obj.m(args)
     const dot = this.asDot(fnNode);
-    // `_` curry: `_.m(a)` / `f(_)` -> a lambda over the underscores (unless `_` is
-    // a real module alias, handled below).
-    if (!(dot && this.moduleAliasName(dot.objExpr))) {
-      const cur2 = this.curryOver(node, [dot ? dot.objExpr : undefined, ...argExprNodes], ctx);
+    // `_` curry: `_.m(a)` / `f(_)` / `N.f(_)` -> a lambda over the underscores.
+    // For a module-alias call (`N.f(...)`) curry only the ARGS — the object `N` is
+    // the alias, not a `_`; otherwise curry the object too.
+    const isModAlias = !!(dot && this.moduleAliasName(dot.objExpr));
+    {
+      const curOperands = isModAlias ? argExprNodes : [dot ? dot.objExpr : undefined, ...argExprNodes];
+      const cur2 = this.curryOver(node, curOperands, ctx);
       if (cur2 !== null) return cur2;
     }
-    if (dot && this.moduleAliasName(dot.objExpr)) {
+    if (isModAlias) {
       // `N.foo(args)` where N is a module alias -> call the global `foo`
       const args = argExprNodes.map((a) => this.compileExpr(a, ctx, false));
       const intr = this.compileIntrinsic(dot.name, args, ctx);
