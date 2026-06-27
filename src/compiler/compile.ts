@@ -2226,10 +2226,35 @@ class Compiler {
 
   private compileCheckTest(node: CstNode, ctx: Ctx): number {
     const m = this.m;
-    const lhs = node.kids[0]!;
-    const opNode = node.kids[1]!;
-    const rhs = node.kids[2]!;
+    const kids = node.kids;
+    const lhs = kids[0]!;
+    const opIdx = kids.findIndex((k) => k.name === "check-op" || k.name === "check-op-postfix");
+    const opNode = kids[opIdx]!;
     const op = this.only(opNode).name;
+
+    // Refinement: `lhs <check-op>%(predExpr) rhs` — predExpr evaluates to a binary
+    // predicate used as the comparator instead of structural equality.  CST shape:
+    // check-op PERCENT (PARENSPACE|PARENNOSPACE) binop-expr RPAREN binop-expr
+    if (kids[opIdx + 1]?.name === "PERCENT") {
+      const rparenIdx = kids.findIndex((k, i) => i > opIdx && k.name === "RPAREN");
+      const refineExpr = kids[rparenIdx - 1]!; // binop-expr inside the parens
+      const refRhs = kids[rparenIdx + 1]!;     // binop-expr after the close paren
+      const isNeg = op.startsWith("ISNOT");
+      const lLoc = ctx.addLocal(binaryen.anyref);
+      const rLoc = ctx.addLocal(binaryen.anyref);
+      const okCall = this.truthy(this.callClosureValue(
+        this.compileExpr(refineExpr, ctx, false),
+        [m.local.get(lLoc, binaryen.anyref), m.local.get(rLoc, binaryen.anyref)], ctx, false));
+      const ok = isNeg ? m.i32.eqz(okCall) : okCall;
+      return m.block(null, [
+        m.local.set(lLoc, this.compileExpr(lhs, ctx, false)),
+        m.local.set(rLoc, this.compileExpr(refRhs, ctx, false)),
+        m.call(isNeg ? "$check_isnot_refine" : "$check_is_refine",
+          [m.local.get(lLoc, binaryen.anyref), m.local.get(rLoc, binaryen.anyref), ok], binaryen.none),
+      ]);
+    }
+
+    const rhs = kids[opIdx + 1]!;
     if (op === "IS") return m.call("$check_is", [this.compileExpr(lhs, ctx, false), this.compileExpr(rhs, ctx, false)], binaryen.none);
     if (op === "ISNOT") return m.call("$check_is_not", [this.compileExpr(lhs, ctx, false), this.compileExpr(rhs, ctx, false)], binaryen.none);
     if (op === "SATISFIES" || op === "SATISFIESNOT") {
