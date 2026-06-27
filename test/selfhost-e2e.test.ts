@@ -155,3 +155,69 @@ test("self-hosted: a WRONG cases dispatch traps (sanity: the trap-pattern catche
   } catch (_) { threw = true; }
   expect(threw).toBe(true);
 });
+
+// ─── Level 6: top-level `let` bindings and `[list: ...]` ────────────────────────
+// `x = e` at statement position desugars to s-let-expr over the rest (previously it
+// reached ANF as a bare s-let and errored "s-let should have been desugared
+// already"). `[list: e1, ...]` lowers to nested link(e1, ... empty); link/empty come
+// from the (minimal) List prelude prepended here.  NOTE: recursive list functions
+// (length/sum/map) do NOT work yet — a self-recursive call passing a cases-bound
+// variant FIELD as its argument hits a backend ref.cast trap (documented in the
+// driver); these tests deliberately stay non-recursive.
+const LIST_PRELUDE =
+  "data List:\n  | empty\n  | link(first, rest)\nend\n" +
+  "fun expect(v, e): if v == e: 0 else: 1 / 0 end end\n";
+
+test("self-hosted: top-level let binding compiles and runs", async () => {
+  const { result } = await selfHostRun("x = 10\nx + 5");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: multiple top-level let bindings compile and run", async () => {
+  const { result } = await selfHostRun(
+    "fun expect(v, e): if v == e: 0 else: 1 / 0 end end\na = 3\nb = 4\nexpect(a + b, 7)");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: [list: ...] literal builds and runs", async () => {
+  const { result } = await selfHostRun(LIST_PRELUDE + "[list: 1, 2, 3]");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: non-recursive cases over a [list: ...] (head -> 7)", async () => {
+  const { result } = await selfHostRun(
+    LIST_PRELUDE + "expect(cases(List) [list: 7, 8]: | empty => 0 | link(f, r) => f end, 7)");
+  expect(result.error).toBeUndefined();
+});
+
+// ─── Level 7: recursion over lists (length / sum) ───────────────────────────────
+// A self-recursive function over a `[list: ...]` — recursing on the variant's `rest`
+// field — compiles and runs with the CORRECT value.  We verify with an inline `if`
+// (`if v == expected: 0 else: 1 / 0 end`) rather than a sibling `expect` helper: a
+// recursive function PLUS a sibling helper of different arity in the same top-level
+// group currently hits a separate backend trap (documented in the driver); a single
+// recursive function is fine.  `if cond: 0 else: 1 / 0` makes a wrong value TRAP, so
+// `result.error === undefined` confirms the value is right.
+const LIST_LEN =
+  "data List:\n  | empty\n  | link(first, rest)\nend\n" +
+  "fun len(l):\n  cases(List) l:\n    | empty => 0\n    | link(f, r) => 1 + len(r)\n  end\nend\n";
+const LIST_SUM =
+  "data List:\n  | empty\n  | link(first, rest)\nend\n" +
+  "fun lsum(l):\n  cases(List) l:\n    | empty => 0\n    | link(f, r) => f + lsum(r)\n  end\nend\n";
+
+test("self-hosted: recursive length over a [list:] (== 3)", async () => {
+  const { result } = await selfHostRun(LIST_LEN + "if len([list: 1, 2, 3]) == 3: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: a WRONG length traps (sanity)", async () => {
+  let threw = false;
+  try { await selfHostRun(LIST_LEN + "if len([list: 1, 2, 3]) == 9: 0 else: 1 / 0 end"); }
+  catch (_) { threw = true; }
+  expect(threw).toBe(true);
+});
+
+test("self-hosted: recursive sum over a [list:] (== 60)", async () => {
+  const { result } = await selfHostRun(LIST_SUM + "if lsum([list: 10, 20, 30]) == 60: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});

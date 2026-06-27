@@ -30,13 +30,15 @@ test("self-hosted compiler compiles + runs a program in its subset (a literal)",
 });
 
 test("self-hosted compiler rejects programs outside its subset (triggers the CLI's seed fallback)", async () => {
-  // `[list: ...]` (s-construct) isn't handled by the driver's desugar yet -> throws
-  await expect(buildSelfHosted("[list: 5]")).rejects.toThrow();
+  // `var`/`:=` (assign-expr) isn't handled by the surface-parse bridge yet -> throws.
+  // (NB: `[list: ...]` now DOES compile via the self-hosted driver, so it's no longer
+  // a fallback example.)
+  await expect(buildSelfHosted("var c = 1\nc := 2\nc")).rejects.toThrow();
   // ...and the seed handles the very same program, so the fallback always works
-  const seed = await buildSource("print([list: 5])");
+  const seed = await buildSource("var c = 1\nc := 2\nprint(c)");
   const r = await run(seed);
   expect(r.error).toBeUndefined();
-  expect(r.output).toContain("5"); // [list: 5] rendered by the seed
+  expect(r.output).toContain("2"); // c := 2 computed by the seed
 });
 
 test("pyretc run --self-hosted: compiles a literal via the self-hosted compiler (exit 0)", async () => {

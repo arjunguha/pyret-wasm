@@ -58,6 +58,16 @@ fun desugar-variant(v) -> A.Variant:
   end
 end
 
+# build a right-nested `link(v0, link(v1, ..., empty))` from already-desugared values.
+fun build-link-chain(loc, vals, no-info):
+  cases(List) vals:
+    | empty => A.s-id(loc, A.s-name(loc, "empty"))
+    | link(v, rest) =>
+      A.s-app-enriched(loc, A.s-id(loc, A.s-name(loc, "link")),
+        [list: v, build-link-chain(loc, rest, no-info)], no-info)
+  end
+end
+
 # ── cases-based AST desugaring (no visit()) ──────────────────────────────────
 #
 # Converts forms that ANF doesn't handle to forms it does:
@@ -189,11 +199,13 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       A.s-prim-app(loc, fname, args.map(desugar-expr), info)
 
     | s-construct(loc, modifier, constructor, values) =>
-      # NOTE: `[list: ...]` would lower to nested link/empty, but link/empty live in the
-      # prelude and the driver compiles ONLY user source (no prelude merged), so they'd be
-      # unbound. Left as a pass-through (ANF rejects s-construct) until the driver includes
-      # the prelude. See report.
-      A.s-construct(loc, modifier, desugar-expr(constructor), values.map(desugar-expr))
+      # `[list: e1, e2, ...]` lowers to nested link(e1, link(e2, ..., empty)).
+      # link/empty come from the (minimal) prelude that the harness prepends.
+      # Only the `list` constructor is handled; others fall through to an error.
+      # NB: build the chain with an EXPLICIT recursion (not foldr): the seed's prelude
+      # foldr calls its function with SWAPPED args (f(acc, elt)), so a foldr-based build
+      # produced a malformed chain.  (Seed prelude bug, out of scope here.)
+      build-link-chain(loc, values.map(desugar-expr), no-info)
 
     | s-data(loc, name, params, mixins, variants, shared, chk-loc, chk) =>
       A.s-data-expr(loc, name, A.s-name(loc, name), params, mixins,
@@ -283,6 +295,14 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
           end)
           body = stmts-to-body(desugar-stmts(rest))
           [list: A.s-let-expr(dl, link(data-bind, ctor-binds), body, false)]
+        | s-let(ll, bind, val, _) =>
+          # top-level `x = e` → s-let-expr binding x over the remaining statements
+          body = stmts-to-body(desugar-stmts(rest))
+          [list: A.s-let-expr(ll, [list: A.s-let-bind(ll, bind, desugar-expr(val))], body, false)]
+        | s-var(ll, bind, val) =>
+          # top-level `var x = e` → s-let-expr with a var-bind over the rest
+          body = stmts-to-body(desugar-stmts(rest))
+          [list: A.s-let-expr(ll, [list: A.s-var-bind(ll, bind, desugar-expr(val))], body, false)]
         | else =>
           link(desugar-expr(f), desugar-stmts(rest))
       end
