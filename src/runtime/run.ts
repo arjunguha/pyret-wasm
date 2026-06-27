@@ -123,6 +123,21 @@ export function buildHostImports(state: HostState) {
         new Uint8Array(state.memory!.buffer, addr, bytes.length).set(bytes);
         return bytes.length;
       },
+      // Transcendental math via JS Math (no native WASM ops). op codes mirror runtime.ts.
+      math1: (op: number, x: number): number => {
+        switch (op) {
+          case 0: return Math.exp(x);
+          case 1: return Math.log(x);
+          case 2: return Math.sin(x);
+          case 3: return Math.cos(x);
+          case 4: return Math.tan(x);
+          case 5: return Math.atan(x);
+          case 6: return Math.asin(x);
+          case 7: return Math.acos(x);
+          default: return NaN;
+        }
+      },
+      math2: (op: number, x: number, y: number): number => (op === 0 ? Math.atan2(x, y) : NaN),
       check_summary: (passed: number, total: number) => {
         if (total === 0) return;
         if (passed === total) {
