@@ -19,6 +19,41 @@ export async function buildSource(src: string): Promise<Uint8Array> {
 // alias) and bare names from `include`/`provide *` resolve to those globals.
 
 const SELF_COMPILER = resolve(import.meta.dir, "../self-compiler");
+// Original Pyret front-end (via the gitignored `pyret` symlink → ../pyret), used as a
+// fallback for compiler sources we don't keep a self-compiler copy of (e.g. locators/*).
+const PYRET_SRC_ARR = resolve(import.meta.dir, "../pyret/lang/src/arr");
+
+// Pyret's own corpus tests import the real compiler via relative paths like
+// `import file("../../../src/arr/compiler/compile-structs.arr")`. In our repo layout
+// that resolves to a nonexistent `<repo>/src/arr/...`; the equivalent sources live in
+// `self-compiler/{compiler,trove}/` (our modifiable copies) or `pyret/lang/src/arr/`
+// (the originals). Redirect a `.../src/arr/<rest>` file import that doesn't exist to the
+// self-compiler copy, else the original — so multi-file compiler tests resolve.
+function redirectFileImport(absPath: string): string {
+  if (existsSync(absPath)) return absPath;
+  const m = absPath.match(/[\\/]src[\\/]arr[\\/](.+\.arr)$/);
+  if (m) {
+    const rest = m[1]!;
+    const inSelf = resolve(SELF_COMPILER, rest);
+    if (existsSync(inSelf)) return inSelf;
+    const inOrig = resolve(PYRET_SRC_ARR, rest);
+    if (existsSync(inOrig)) return inOrig;
+  }
+  // A self-compiler source importing a sibling we don't keep a copy of (e.g.
+  // `locators/*`) — fall back to the original tree so the closure resolves.
+  const s = absPath.match(/[\\/]self-compiler[\\/](.+\.arr)$/);
+  if (s) {
+    const inOrig = resolve(PYRET_SRC_ARR, s[1]!);
+    if (existsSync(inOrig)) return inOrig;
+  }
+  return absPath; // unchanged → surfaces the real ENOENT if it's a genuine miss
+}
+
+// Resolve an `import/include file("rel")` spec (relative to `dir`) to an absolute path,
+// applying the src/arr redirect.
+function resolveFileImport(dir: string, rel: string): string {
+  return redirectFileImport(resolve(dir, rel.endsWith(".arr") ? rel : rel + ".arr"));
+}
 // Modules our prelude/runtime already provide, or builtins with no .arr — treated
 // as already-global (NOT loaded). Everything else with a matching .arr is compiled.
 const SKIP_MODULES = new Set([
@@ -72,8 +107,7 @@ function localImports(program: CstNode, dir: string): string[] {
       const nm = special.kids.find((k) => k.name === "NAME");
       const str = special.kids.find((k) => k.name === "STRING");
       if (nm?.value === "file" && str?.value) {
-        const rel = stripStr(str.value);
-        out.push(resolve(dir, rel.endsWith(".arr") ? rel : rel + ".arr"));
+        out.push(resolveFileImport(dir, stripStr(str.value)));
       }
       continue;
     }
@@ -107,8 +141,7 @@ function moduleAliasTargets(program: CstNode, dir: string): { alias: string; pat
       const nm = special.kids.find((k) => k.name === "NAME");
       const str = special.kids.find((k) => k.name === "STRING");
       if (nm?.value === "file" && str?.value) {
-        const rel = stripStr(str.value);
-        out.push({ alias, path: resolve(dir, rel.endsWith(".arr") ? rel : rel + ".arr") });
+        out.push({ alias, path: resolveFileImport(dir, stripStr(str.value)) });
       }
       continue;
     }
