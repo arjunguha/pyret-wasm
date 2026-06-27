@@ -25,6 +25,14 @@ References mirrored:
   top-level var rather than a mutable record field because the seed compiler does
   not yet support ref-field reads / `get-bang`.) Parsing is therefore single-shot
   — one `parse` call at a time, which is all we need.
+- **Source locations are real.** The tokenizer threads a `Pos` (line/column/char,
+  lines 1-based, columns + char 0-based, matching Pyret) and every `Token` carries
+  its start+end span. The parser tracks the most-recently-consumed token in a
+  `var last-tok`; each `parse-*` captures its first token as `start` and builds the
+  node loc with `node-loc(start)` = span from `start`'s beginning to `last-tok`'s
+  end. `parse-named(src, uri)` records `uri` as the srcloc source name. (A handful
+  of deeply-nested *secondary* locs — op-loc on check-ops, pat-loc, the `where`
+  loc — are still `dummy-loc`; the primary `l` of every node is real.)
 - **No operator precedence**: like real Pyret, `binop-expr` is parsed
   left-associative; mixing operators without parens is a *well-formedness* error
   enforced later in the pipeline, not at parse time.
@@ -48,22 +56,31 @@ Parser:
 - check: `check:`/`examples:` blocks and `lhs is/is-not/is==/raises/satisfies rhs`.
 - bindings: `[shadow] NAME [:: ann]`; annotations: name / dot only.
 
+## Done since the first pass
+
+- **Full annotation grammar**: name / dot / app (`List<T>`) / arrow (`(A -> B)`) /
+  record (`{x :: A}`) / tuple (`{A; B}`) / pred (`Ann%(expr)`) / `Any`.
+- **Tuple bindings** `{a; b} [as n]`, and **contract statements** (`x :: T` with no
+  `=` desugars to `s-contract`).
+- **`type` aliases** (`type T<a> = Ann`) and **`newtype`** (`newtype T as TT`).
+- **`~` rough fractions** → `s-rfrac`.
+- **Real source locations** (see Design above) — line/col/char + source name.
+
 ## TODO(grammar) — to reach the full grammar
 
-- Annotations: arrow / record / app (`List<T>`) / pred (`%(...)`) / tuple anns.
-- Tuple bindings `{a; b}`, `as` bindings, contract statements (`x :: T`).
-- `type` / `newtype` / `type-let` / `multi-let` / `letrec` expressions.
+- `type-let` / `multi-let` / `letrec` expressions; tuple-destructuring lets
+  (`{a; b} = e` at statement position — currently only binding positions).
 - `spy`, tables (`table:`/`select`/`sieve`/`order`/`extract`/`transform`/
   `extend`/`load-table`), `reactor`.
 - Full check-op set (`is=~`, `is<=>`, `is-roughly`, `raises-satisfies`,
-  `because`, refinements `%(...)`).
-- Real number literals (decimals/exponents → exact rationals; `~` roughnums),
-  full string escapes (`\u`, `\x`, octal), triple-backtick strings.
-- Generics/instantiation `f<T>(...)` (currently `<`/`>` are only comparison ops).
+  `because`, refinements `%(...)` on check-ops).
+- Real number literals (decimals/exponents → exact rationals; rough *integers*
+  currently fall back to `s-num`), full string escapes (`\u`, `\x`, octal),
+  triple-backtick strings.
+- Generics/instantiation `f<T>(...)` in expression position (currently `<`/`>` are
+  only comparison ops outside annotations).
 - Reject mixed operators without parens (defer to well-formedness, as real Pyret).
-- **Real source locations** instead of `dummy-loc` (track line/col/pos in the
-  tokenizer and thread `Srcloc` through — needed for good error messages and for
-  byte-identical fixpoint parity with the reference parser's locs).
+- The few remaining secondary `dummy-loc`s (check-op locs, pat-loc, where-loc).
 
 ## Testing
 
