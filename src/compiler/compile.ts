@@ -566,9 +566,24 @@ class Compiler {
   }
 
   // ---- free variable analysis ----
+  // A `method m(self, ...): ... end` field inside an obj-expr / extend-expr / data
+  // with:/sharing: block. Its body is a closure (params incl. self are bound).
+  private isMethodField(node: CstNode): boolean {
+    return (node.name === "obj-field" || node.name === "field")
+      && node.kids.some((c) => c.name === "METHOD");
+  }
+
   private freeVars(node: CstNode, bound: Set<string>): Set<string> {
     const out = new Set<string>();
     const add = (s: Set<string>) => s.forEach((x) => out.add(x));
+    if (this.isMethodField(node)) {
+      // bind the method's params (incl. self) so they aren't spuriously captured.
+      const b2 = new Set(bound);
+      for (const p of this.headerParams(node)) b2.add(p);
+      const body = this.childNamed(node, "block");
+      if (body) add(this.freeVars(body, b2));
+      return out;
+    }
     if (node.name === "id-expr") {
       const nm = this.only(node).value!;
       if (!bound.has(nm)) out.add(nm);
@@ -684,6 +699,10 @@ class Compiler {
     if (node.name === "lambda-expr" || node.name === "fun-expr") {
       this.freeVars(node, new Set()).forEach((n) => out.add(n));
       // still descend so we also see closures nested inside this one
+    } else if (this.isMethodField(node)) {
+      // a method body is a closure too — a `var` it captures+assigns must be boxed.
+      const body = this.childNamed(node, "block");
+      if (body) this.freeVars(body, new Set(this.headerParams(node))).forEach((n) => out.add(n));
     }
     if (node.name === "for-expr") {
       // for body compiles to a lambda -> it captures its free vars (minus loop vars).
