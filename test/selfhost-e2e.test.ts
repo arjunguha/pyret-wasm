@@ -317,3 +317,30 @@ test("self-hosted: `or` short-circuits and compiles", async () => {
   expect(result.error).toBeUndefined();
   expect(result.output).toContain("3 tests passed");
 });
+
+// ─── Level 10: data-variant + object METHODS (with:/sharing:) ──────────────────
+// The self-hosted backend emits per-variant method tables ($variant_methods) and
+// a-method-app dispatches: variant -> $variant_methods[id], object -> the object;
+// a $Method's closure is called with self prepended. self.x inside a method reads a
+// variant field. Verified via trap-on-wrong-value (1/0 unless the value is right).
+test("self-hosted: data variant `with:` method (self.x) dispatches", async () => {
+  const { result } = await selfHostRun(
+    "data D: | a(x) with: method m(self): self.x end end\nif a(5).m() == 5: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: data `sharing:` method dispatches across variants", async () => {
+  const { result } = await selfHostRun(
+    "data D: | a(x) | b with: method extra(self): 2 end sharing: method n(self): 7 end end\n" +
+    "if (a(0).n() == 7) and (b.n() == 7): 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: object method dispatches (self-bound)", async () => {
+  const { result } = await selfHostRun(
+    "o = { method m(self): 42 end }\nif o.m() == 42: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: variant field access via a-dot (a(5).x)", async () => {
+  const { result } = await selfHostRun(
+    "data D: | a(x) end\nif a(5).x == 5: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});

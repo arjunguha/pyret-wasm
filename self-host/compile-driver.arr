@@ -57,7 +57,12 @@ fun desugar-member(m) -> A.Member:
   cases(A.Member) m:
     | s-data-field(l, name, value) => A.s-data-field(l, name, desugar-expr(value))
     | s-method-field(l, name, params, args, ann, doc, body, cl, ck, bl) =>
-      A.s-method-field(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), cl, ck, bl)
+      # Normalize a method field to a data-field whose VALUE is an s-method expression.
+      # anf reads each member's `.value` (get-value); s-method-field has no `.value`, so
+      # feeding it to anf raises "$err_no_field". (Mirrors real Pyret's desugar, which
+      # lowers method fields to data-field + s-method before anf.)
+      A.s-data-field(fresh-loc(), name,
+        A.s-method(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), cl, ck, bl))
     | else => m
   end
 end
@@ -230,9 +235,9 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       end))
 
     | s-obj(loc, fields) =>
-      A.s-obj(loc, fields.map(lam(f):
-        A.s-data-field(f.l, f.name, desugar-expr(f.value))
-      end))
+      # desugar-member handles BOTH s-data-field and s-method-field (the latter -> a
+      # data-field carrying an s-method value), so object methods compile too.
+      A.s-obj(loc, fields.map(desugar-member))
 
     | s-tuple(loc, fields) =>
       A.s-tuple(loc, fields.map(desugar-expr))
