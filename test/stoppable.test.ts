@@ -79,6 +79,33 @@ test("stoppable: prelude HOFs match the direct compiler", async () => {
   }
 });
 
+// Data METHODS survive the CPS transform: the `with:`/`sharing:` blocks are
+// CPS-transformed (each method takes a trailing continuation), so NAMED method calls
+// on built-in data (List, ...) work in stoppable mode. Operator methods (list `+`
+// via `_plus`) remain seed-blocked (fixed-arity operator dispatch). Parity with direct.
+test("stoppable: data methods (.map/.length/.foldl/...) match the direct compiler", async () => {
+  for (const src of [
+    "[list: 1, 2, 3].length()",
+    "sum([list: 1, 2, 3].map(lam(x): x + 1 end))",
+    "length([list: 1, 2, 3, 4].filter(lam(x): x > 2 end))",
+    "[list: 1, 2, 3].foldl(lam(acc, x): acc + x end, 0)",
+    "sum([list: 3, 2, 1].reverse())",
+  ]) {
+    expect(await evalStoppable(src)).toBe(await evalDirect(src));
+  }
+});
+
+// A data method that internally drives a stdlib loop stays interruptible.
+test("stoppable: a data method (.map over a large range) can be STOPPED", async () => {
+  const h = runStoppable(
+    await buildStoppableSource("range(0, 300000).map(lam(x): x end)"),
+    { onPause: (n) => { if (n >= 2) h.stop(); } },
+  );
+  const r = await h.promise;
+  expect(r.stopped).toBe(true);
+  expect(r.pauses).toBeGreaterThanOrEqual(2);
+});
+
 // ---- (b) the stop button: a long/infinite computation is abandoned on ONE thread ----
 
 // The decisive proof that prelude HOFs are interruptible: the ONLY looping here is
