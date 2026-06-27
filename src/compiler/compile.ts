@@ -631,20 +631,67 @@ class Compiler {
 
   // [list: e1, e2, ...] -> link(e1, link(e2, ... empty))
   private compileConstruct(node: CstNode, ctx: Ctx): number {
+    const m = this.m;
     const ctorNode = node.kids.find((k) => k.name === "binop-expr")!;
     const ctorName = this.simpleName(ctorNode);
     const trailing = this.childNamed(node, "trailing-opt-comma-binops");
     const cb = trailing && this.childNamed(trailing, "comma-binops");
     const elems = cb ? cb.kids.filter((k) => k.name === "binop-expr") : [];
-    if (ctorName !== "list") throw new CompileError(`unsupported constructor: [${ctorName}: ...]`, node);
-    const emptyInfo = this.variants.get("empty");
-    const linkInfo = this.variants.get("link");
-    if (!emptyInfo || !linkInfo) throw new CompileError("List type unavailable (prelude missing)", node);
-    let acc = this.makeVariant("empty", emptyInfo, []);
-    for (let i = elems.length - 1; i >= 0; i--) {
-      acc = this.makeVariant("link", linkInfo, [this.compileExpr(elems[i]!, ctx, false), acc]);
+    // [list: ...] desugars directly to link/empty (handles any length efficiently).
+    if (ctorName === "list") {
+      const emptyInfo = this.variants.get("empty");
+      const linkInfo = this.variants.get("link");
+      if (!emptyInfo || !linkInfo) throw new CompileError("List type unavailable (prelude missing)", node);
+      let acc = this.makeVariant("empty", emptyInfo, []);
+      for (let i = elems.length - 1; i >= 0; i--) {
+        acc = this.makeVariant("link", linkInfo, [this.compileExpr(elems[i]!, ctx, false), acc]);
+      }
+      return acc;
     }
-    return acc;
+    // [raw-array: ...] is the primitive: a $Fields (array (mut anyref)).
+    if (ctorName === "raw-array") {
+      return this.rawArrayOf(elems.map((e) => this.compileExpr(e, ctx, false)));
+    }
+    // string-dict / set: desugar to a prelude function over a raw-array. (Done via a
+    // plain function rather than a `.make` object so the prelude stays CPS-safe — no
+    // object literals/tuples, which the stoppable transform doesn't handle.)
+    const dictSetFn =
+      (ctorName === "string-dict" || ctorName === "mutable-string-dict") ? "sd-from-raw" :
+      (ctorName === "set" || ctorName === "list-set" || ctorName === "tree-set") ? "set-from-raw" : null;
+    if (dictSetFn) {
+      const fn = this.resolveName(dictSetFn, ctx);
+      if (fn !== null) {
+        const raw = this.rawArrayOf(elems.map((e) => this.compileExpr(e, ctx, false)));
+        return this.callClosureValue(fn, [raw], ctx, false);
+      }
+    }
+    // General Pyret construct protocol: [C: e1..en] == C.make([raw-array: e1..en]).
+    // The constructor C is a value whose `make` field builds the collection.
+    const ctorVal = this.compileExpr(ctorNode, ctx, false);
+    const objLocal = ctx.addLocal(binaryen.anyref);
+    const fieldLocal = ctx.addLocal(binaryen.anyref);
+    const rawLocal = ctx.addLocal(binaryen.anyref);
+    const pre = [
+      m.local.set(objLocal, ctorVal),
+      m.local.set(rawLocal, this.rawArrayOf(elems.map((e) => this.compileExpr(e, ctx, false)))),
+      m.local.set(fieldLocal, m.call("$obj_get",
+        [m.ref.cast(m.local.get(objLocal, binaryen.anyref), this.t.ObjectRef), this.strLiteralRaw("make")],
+        binaryen.anyref)),
+    ];
+    const field = () => m.local.get(fieldLocal, binaryen.anyref);
+    const raw = () => m.local.get(rawLocal, binaryen.anyref);
+    const methodClosure = m.call("$method_closure", [m.ref.cast(field(), this.t.MethodRef)], this.t.ClosureRef);
+    const methodCall = this.callClosureValue(methodClosure, [m.local.get(objLocal, binaryen.anyref), raw()], ctx, false);
+    const plainCall = this.callClosureValue(field(), [raw()], ctx, false);
+    return m.block(null, [
+      ...pre,
+      m.if(m.ref.test(field(), this.t.MethodRefNull), methodCall, plainCall, binaryen.anyref),
+    ], binaryen.anyref);
+  }
+
+  // Build a raw-array ($Fields) value from compiled element expressions.
+  private rawArrayOf(vals: number[]): number {
+    return this.m.array.new_fixed(this.t.Fields, vals);
   }
 
   // { field: expr, method m(self, ...): ... , ... }
@@ -989,6 +1036,25 @@ class Compiler {
     }
     if (name === "identical" && args.length === 2) {
       return this.mkBool(m.ref.eq(m.ref.cast(args[0]!, binaryen.eqref), m.ref.cast(args[1]!, binaryen.eqref)));
+    }
+    // Raw arrays = a $Fields (array (mut anyref)). The rest of the raw-array library
+    // (to-list/map/each/fold) is built on these in the prelude.
+    if (name === "raw-array-get" && args.length === 2) {
+      return m.array.get(m.ref.cast(args[0]!, this.t.FieldsRef),
+        m.call("$num_to_i32", [args[1]!], binaryen.i32), binaryen.anyref, false);
+    }
+    if (name === "raw-array-length" && args.length === 1) {
+      return m.call("$make_fix",
+        [m.i64.extend_u(m.array.len(m.ref.cast(args[0]!, this.t.FieldsRef)))], this.t.FixnumRef);
+    }
+    if (name === "raw-array-set" && args.length === 3) {
+      const a = ctx.addLocal(binaryen.anyref);
+      return m.block(null, [
+        m.local.set(a, args[0]!),
+        m.array.set(m.ref.cast(m.local.get(a, binaryen.anyref), this.t.FieldsRef),
+          m.call("$num_to_i32", [args[1]!], binaryen.i32), args[2]!),
+        m.local.get(a, binaryen.anyref),
+      ], binaryen.anyref);
     }
     if ((name === "print" || name === "display" || name === "print-error") && args.length === 1) {
       const argLocal = ctx.addLocal(binaryen.anyref);
