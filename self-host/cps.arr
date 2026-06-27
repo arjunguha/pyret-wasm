@@ -550,11 +550,39 @@ fun cps-lambda(node :: CstNode) -> String:
   "lam(" + join-args(params + [list: kg]) + "): yield-check(lam(): " + body + " end) end"
 end
 
+# A method `field` (in a `with:`/`sharing:` block) shares the obj-field CST shape, so
+# `cps-obj-method` transforms it (CPS body + trailing continuation param), which is what
+# a method CALL SITE `obj.m(args)` expects (t-app's a-dot case appends reifyk(k)).
+# OPERATOR methods (`_plus`/`_lessthan`/...) are SEED-BLOCKED: the seed's operator
+# dispatch calls them with FIXED arity (no continuation slot), so a CPS'd operator method
+# would arity-mismatch. We emit only NAMED methods; operator methods are dropped — list
+# `+` etc. stay non-interruptible in stoppable mode (no regression: ALL methods were
+# dropped before; named methods now survive).
+fun field-method-name(f :: CstNode) -> String:
+  child-bang(child-bang(f, "key"), "NAME").value.or-else("_")
+end
+fun is-operator-method(f :: CstNode) -> Boolean:
+  string-substring(field-method-name(f), 0, 1) == "_"
+end
+# CPS-transform the NAMED method fields of a `data-with` / `data-sharing` block.
+fun data-block-methods(blk :: Option<CstNode>) -> List<String>:
+  cases(Option) blk:
+    | none => empty
+    | some(b) =>
+      cases(Option) child(b, "fields"):
+        | none => empty
+        | some(fs) =>
+          methods = filter(lam(x): (x.name == "field") and is-some(child(x, "METHOD")) end, fs.kids)
+          map(cps-obj-method, filter(lam(f): not(is-operator-method(f)) end, methods))
+      end
+  end
+end
+
 fun render-data(node :: CstNode) -> String:
   ty-name = child-bang(node, "NAME").value.or-else("_")
   variants = filter(lam(k): (k.name == "data-variant") or (k.name == "first-data-variant") end, node.kids)
   parts = map(lam(v):
-      cases(Option) child(v, "variant-constructor"):
+      ctor-part = cases(Option) child(v, "variant-constructor"):
         | some(ctor) =>
           nm = child-bang(ctor, "NAME").value.or-else("_")
           fields = cases(Option) child(ctor, "variant-members"):
@@ -565,8 +593,17 @@ fun render-data(node :: CstNode) -> String:
           nm + "(" + join-args(fields) + ")"
         | none => child-bang(v, "NAME").value.or-else("_")
       end
+      # per-variant `with:` methods (CPS-transformed, named only)
+      with-methods = data-block-methods(child(v, "data-with"))
+      if is-empty(with-methods): ctor-part
+      else: ctor-part + " with: " + string-join(with-methods, ", ")
+      end
     end, variants)
-  "data " + ty-name + ": " + string-join(map(lam(p): "| " + p end, parts), " ") + " end"
+  # shared `sharing:` methods (CPS-transformed, named only)
+  sharing-methods = data-block-methods(child(node, "data-sharing"))
+  variant-src = string-join(map(lam(p): "| " + p end, parts), " ")
+  sharing-src = if is-empty(sharing-methods): "" else: " sharing: " + string-join(sharing-methods, ", ") end
+  "data " + ty-name + ": " + variant-src + sharing-src + " end"
 end
 
 # ---- top level ----
