@@ -20,6 +20,7 @@ const ANNLABEL = resolve(import.meta.dir, "fixtures/surface-parse-annlabel.arr")
 const IMPFILE = resolve(import.meta.dir, "fixtures/surface-parse-impfile.arr");
 const DATA = resolve(import.meta.dir, "fixtures/surface-parse-data.arr");
 const WHERE = resolve(import.meta.dir, "fixtures/surface-parse-where.arr");
+const MULTILET = resolve(import.meta.dir, "fixtures/surface-parse-multilet.arr");
 
 // Run a seed-compiled fixture with the host bridge primed to parse `src`.
 async function runWithSource(wasm: Uint8Array, src: string): Promise<string> {
@@ -104,6 +105,11 @@ const FORMS: Array<[string, string]> = [
   ["letrec x = 1: x end", "s-letrec"],
   ["~1/2", "s-rfrac"],
   ["5 is%(within(2)) 6", "s-check-test"], // is%(pred) refinement clause
+  // round 7 (multi-binding let + reactor)
+  // NB: s-let-expr.label() is "s-let" in ast.arr; the dedicated test below asserts
+  // the s-let-expr identity + bind kinds to distinguish it from a single s-let.
+  ["let a = 1, b = 2: a + b end", "s-let"],
+  ["reactor: init: 1, on-tick: f end", "s-reactor"],
 ];
 
 test("surface-parse: rebuilds the right ast.arr ctor for each core form", async () => {
@@ -264,4 +270,15 @@ test("surface-parse: provide-block (provide: ... end) rebuilds s-provide-block",
   const out = await runWithSource(wasm, "provide: x, y end\n5");
   expect(out).toContain("provide=s-provide-block");
   expect(out).toContain("label=s-num");
+});
+
+// round 7: multi-binding `let a = 1, var b = 2: ... end` rebuilds s-let-expr with a
+// mix of s-let-bind / s-var-bind (label() is "s-let", so assert the variant identity).
+test("surface-parse: multi-binding let rebuilds s-let-expr with let/var binds", async () => {
+  const wasm = await buildSourceFile(MULTILET);
+  const out = await runWithSource(wasm, "let a = 1, var b = 2: a end");
+  expect(out).toContain("is-let-expr=true");
+  expect(out).toContain("nbinds=2");
+  expect(out).toContain("b0-let=true");
+  expect(out).toContain("b1-var=true");
 });

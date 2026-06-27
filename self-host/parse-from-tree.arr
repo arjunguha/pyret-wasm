@@ -108,6 +108,11 @@ LRBIND = 89
 LRBINDS = 90
 RFRAC = 91
 CHECKREFINE = 92
+MULTILET = 93
+LETBIND = 94
+VARBIND = 95
+LETBINDS = 96
+REACTOR = 97
 
 # Shared read cursor into the flat pre-order stream.
 var cursor = 0
@@ -294,6 +299,11 @@ fun build-node(tag, s, kids):
   else if tag == CHECKREFINE:
     A.s-check-test(l, check-op(l, s), some(kids.get(1)), kids.get(0),
       some(kids.get(2)), none)
+  else if tag == MULTILET: A.s-let-expr(l, kids.get(0), kids.get(1), false)
+  else if tag == LETBIND: A.s-let-bind(l, mk-bind(l, s), kids.get(0))
+  else if tag == VARBIND: A.s-var-bind(l, mk-bind(l, s), kids.get(0))
+  else if tag == LETBINDS: kids   # a List<LetBind>
+  else if tag == REACTOR: A.s-reactor(l, kids.get(0))
   else if tag == BIND: mk-bind(l, s)
   else if tag == PROGRAM:
     # `provide { ... }` (flag "block") prepends the provide expr as a leading kid,
