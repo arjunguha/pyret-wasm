@@ -97,7 +97,7 @@ throw-prims :: List<String> = [list:
 # resolve-scope) so capture knows to grab the BOX. nlams: lambda count, so a-data-expr can
 # compute a ctor's table slot (= nlams + variant.id).
 data Ctx: ctx(locals, next-local :: Number, vars, fenv, lams, dreg, gvars, nlams :: Number) end
-fun name-key(n): tostring(n) end          # TODO(port): use A.Name's .key()
+fun name-key(n): n.key() end          # loc-independent Name identity (was tostring(n))
 fun bind-local(c :: Ctx, key, idx :: Number) -> Ctx:
   ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
@@ -508,6 +508,11 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       compile-aval(obj, c).append(emit-str(field)).append(E.i-call(idx-variant-field-by-name()))
     | a-tuple(l, fields) =>
       # tuple = $Variant id 0, name "tuple", fields.
+      # TODO(render): id 0 collides with the FIRST data variant (collect-data assigns
+      # id=length, 0-based) — render_variant + $equal mis-treat that variant as a tuple.
+      # Moving this sentinel to -1 is the right fix, BUT lists/variants still render ""
+      # (a deeper render_variant/$render dispatch bug) and the cli-selfhost fallback test
+      # assumes lists trap — fix those together in a follow-up.
       E.i32-const(0).append(emit-str("tuple")).append(pack-fields(fields, c)).append(E.struct-new(T-VARIANT))
     | a-tuple-get(l, tup, index) =>
       compile-aval(tup, c)

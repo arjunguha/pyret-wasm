@@ -56,6 +56,10 @@ test("pyretc run --self-hosted: falls back to the seed for out-of-subset program
   const out = await new Response(proc.stdout).text();
   const err = await new Response(proc.stderr).text();
   expect(code).toBe(0);
+  // FALLBACK fixture = `print(num-max(5, 3))`: num-max isn't in the driver's minimal injected
+  // prelude, so the self-hosted compile runs then traps -> CLI falls back to the seed (which
+  // has num-max) -> prints 5. (Was `print([list: 5])`, but lists now compile + run
+  // self-hosted after the loc-independent name-key fix, so that no longer triggers fallback.)
   expect(err).toContain("falling back to seed"); // it announced the fallback
   expect(out).toContain("5");                     // and the seed produced the right result
 });
