@@ -95,6 +95,35 @@ test("stoppable: data methods (.map/.length/.foldl/...) match the direct compile
   }
 });
 
+// OPERATOR methods (list/data `+` -> `_plus`, etc.) are routed through the `cps-op-*`
+// intrinsic, so they're dispatched WITH a continuation and match the direct compiler.
+// (Numeric/string `+`/`<` stay a direct fast-path — covered by the arithmetic tests.)
+test("stoppable: operator methods (list +, chains) match the direct compiler", async () => {
+  for (const src of [
+    "tostring([list: 1, 2] + [list: 3, 4])",
+    "tostring([list: 1] + [list: 2] + [list: 3])",
+    "length([list: 1, 2] + [list: 3, 4, 5])",
+    "tostring([list: 1, 2] + empty)",
+    'string-append("a", "b") + "c"',
+  ]) {
+    expect(await evalStoppable(src)).toBe(await evalDirect(src));
+  }
+});
+
+// An operator method (`_plus`) driving a long stdlib loop stays interruptible — the
+// only way to pause is inside the CPS'd `_plus`/`append`, proving operator methods
+// thread the continuation.
+test("stoppable: an operator-method loop (repeated list +) can be STOPPED", async () => {
+  const h = runStoppable(
+    await buildStoppableSource(
+      "foldl(lam(acc, x): acc + [list: x] end, empty, range(0, 20000))"),
+    { onPause: (n) => { if (n >= 2) h.stop(); } },
+  );
+  const r = await h.promise;
+  expect(r.stopped).toBe(true);
+  expect(r.pauses).toBeGreaterThanOrEqual(2);
+});
+
 // A data method that internally drives a stdlib loop stays interruptible.
 test("stoppable: a data method (.map over a large range) can be STOPPED", async () => {
   const h = runStoppable(

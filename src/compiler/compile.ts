@@ -41,6 +41,18 @@ const OP_METHOD: Record<string, string> = {
   LT: "_lessthan", GT: "_greaterthan", LEQ: "_lessequal", GEQ: "_greaterequal",
 };
 
+// Stoppable-mode CPS operator intrinsics. The CPS transform emits `cps-op-plus(a,
+// b, k)` for an overloadable binop so the operator-METHOD path (e.g. list `+` ->
+// `_plus`) can be threaded a continuation (the seed's normal operator dispatch
+// calls `_plus` with fixed arity and no continuation, which a CPS'd method can't
+// accept). The intrinsic: if `a` is a number/string, tail-call `k` with the
+// primitive result; else tail-dispatch the CPS method `a._plus(b, k)`.
+const OP_INTRINSIC: Record<string, string> = {
+  "cps-op-plus": "PLUS", "cps-op-minus": "DASH", "cps-op-times": "TIMES",
+  "cps-op-divide": "SLASH", "cps-op-lessthan": "LT", "cps-op-greaterthan": "GT",
+  "cps-op-lessequal": "LEQ", "cps-op-greaterequal": "GEQ",
+};
+
 // Per-function compilation context.
 class Ctx {
   params = new Map<string, number>();   // name -> index in args array
@@ -1470,6 +1482,11 @@ class Compiler {
       return this.compileFinishResult(args[0]!, ctx);
     }
 
+    // stoppable CPS operator intrinsic: cps-op-plus(a, b, k) etc. (tail-aware)
+    if (this.stoppable && name && OP_INTRINSIC[name] && args.length === 3 && !this.isBound(name, ctx)) {
+      return this.compileCpsOp(OP_INTRINSIC[name]!, args, ctx, tail);
+    }
+
     // runtime intrinsics (shadowable by user bindings)
     if (name && !this.isBound(name, ctx)) {
       const intr = this.compileIntrinsic(name, args, ctx);
@@ -2037,7 +2054,7 @@ class Compiler {
 
   // Call value.method(args...) given already-compiled value/arg expressions.
   // Mirrors compileMethodCall's variant-vs-object method lookup + dispatch.
-  private dispatchMethodValue(objExpr: number, name: string, argExprs: number[], ctx: Ctx): number {
+  private dispatchMethodValue(objExpr: number, name: string, argExprs: number[], ctx: Ctx, tail = false): number {
     const m = this.m;
     const objLocal = ctx.addLocal(binaryen.anyref);
     const fieldLocal = ctx.addLocal(binaryen.anyref);
@@ -2059,11 +2076,41 @@ class Compiler {
     const field = () => m.local.get(fieldLocal, binaryen.anyref);
     const argGets = argLocals.map((l) => m.local.get(l, binaryen.anyref));
     const methodClosure = m.call("$method_closure", [m.ref.cast(field(), this.t.MethodRef)], this.t.ClosureRef);
-    const methodCall = this.callClosureValue(methodClosure, [obj(), ...argGets], ctx, false);
-    const plainCall = this.callClosureValue(field(), argGets, ctx, false);
+    const methodCall = this.callClosureValue(methodClosure, [obj(), ...argGets], ctx, tail);
+    const plainCall = this.callClosureValue(field(), argGets, ctx, tail);
     return m.block(null, [
       ...prelude,
       m.if(m.ref.test(field(), this.t.MethodRefNull), methodCall, plainCall, binaryen.anyref),
+    ], binaryen.anyref);
+  }
+
+  // Stoppable CPS operator: cps-op-<op>(a, b, k). If `a` is a number (or string for
+  // PLUS), tail-call `k` with the primitive result; otherwise tail-dispatch the CPS
+  // operator method `a._plus(b, k)` so a data overload (e.g. list `+` -> `_plus`,
+  // now CPS'd with a trailing continuation) is reachable and interruptible.
+  private compileCpsOp(op: string, args: number[], ctx: Ctx, tail: boolean): number {
+    const m = this.m;
+    const A = ctx.addLocal(binaryen.anyref);
+    const B = ctx.addLocal(binaryen.anyref);
+    const K = ctx.addLocal(binaryen.anyref);
+    const ag = () => m.local.get(A, binaryen.anyref);
+    const bg = () => m.local.get(B, binaryen.anyref);
+    const kg = () => m.local.get(K, binaryen.anyref);
+    let primResult: number;
+    if (op === "PLUS") primResult = m.call("$plus", [ag(), bg()], binaryen.anyref);
+    else if (ARITH_FN[op]) primResult = m.call(ARITH_FN[op]!, [this.asNum(ag()), this.asNum(bg())], this.t.NumRef);
+    else primResult = this.mkBool(CMP[op]!(m.call("$num_compare", [this.asNum(ag()), this.asNum(bg())], binaryen.i32), m));
+    const isNum = m.ref.test(ag(), this.t.NumRefNull);
+    const cond2 = op === "PLUS" ? m.i32.or(isNum, m.ref.test(ag(), this.t.StrRefNull)) : isNum;
+    // numeric/string path: feed the primitive result to the continuation (tail call)
+    const numPath = this.callClosureValue(kg(), [primResult], ctx, tail);
+    // method path: a.<method>(b, k) — the CPS'd operator method takes the continuation
+    const methPath = this.dispatchMethodValue(ag(), OP_METHOD[op]!, [bg(), kg()], ctx, tail);
+    return m.block(null, [
+      m.local.set(A, args[0]!),
+      m.local.set(B, args[1]!),
+      m.local.set(K, args[2]!),
+      m.if(cond2, numPath, methPath, binaryen.anyref),
     ], binaryen.anyref);
   }
 

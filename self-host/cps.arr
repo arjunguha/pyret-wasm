@@ -245,10 +245,46 @@ fun t-binop(node :: CstNode, k :: Cont) -> String:
   end
   parts = split(node.kids, 0, empty, empty)
   t-seq(parts.{0}, empty, lam(vs):
-      e = fold_n(lam(i, acc, op): "(" + acc + " " + op + " " + vs.get(i + 1) + ")" end,
-                 0, vs.first, parts.{1})
-      applyk(k, e)
+      cps-fold-binop(vs.first, vs.rest, parts.{1}, k)
     end)
+end
+
+# Overloadable operators map to a `cps-op-*` seed intrinsic that dispatches the
+# operator method (`_plus`/...) WITH a continuation (numeric/string fast-path tail-
+# calls the continuation directly). Non-overloadable ops (and/or/==/<>/<=>) have no
+# data-method overload so they stay a bounded sub-expression.
+fun op-cps-helper(op :: String) -> Option<String>:
+  ask:
+    | op == "+" then: some("cps-op-plus")
+    | op == "-" then: some("cps-op-minus")
+    | op == "*" then: some("cps-op-times")
+    | op == "/" then: some("cps-op-divide")
+    | op == "<" then: some("cps-op-lessthan")
+    | op == ">" then: some("cps-op-greaterthan")
+    | op == "<=" then: some("cps-op-lessequal")
+    | op == ">=" then: some("cps-op-greaterequal")
+    | otherwise: none
+  end
+end
+
+# Combine the already-evaluated operand value-sources left-to-right (the seed parses
+# mixed operators left-associatively, no precedence). Each overloadable step is a
+# tail call to its `cps-op-*` helper threading the continuation; bounded ops fold
+# into a plain sub-expression.
+fun cps-fold-binop(acc :: String, rest :: List<String>, ops :: List<String>, k :: Cont) -> String:
+  cases(List) rest:
+    | empty => applyk(k, acc)
+    | link(v, vrest) =>
+      op = ops.first
+      orest = ops.rest
+      cases(Option) op-cps-helper(op):
+        | some(helper) =>
+          inner = k-fn(lam(r): cps-fold-binop(r, vrest, orest, k) end)
+          helper + "(" + acc + ", " + v + ", " + reifyk(inner) + ")"
+        | none =>
+          cps-fold-binop("(" + acc + " " + op + " " + v + ")", vrest, orest, k)
+      end
+  end
 end
 
 fun app-arg-nodes(node :: CstNode) -> List<CstNode>:
@@ -553,11 +589,10 @@ end
 # A method `field` (in a `with:`/`sharing:` block) shares the obj-field CST shape, so
 # `cps-obj-method` transforms it (CPS body + trailing continuation param), which is what
 # a method CALL SITE `obj.m(args)` expects (t-app's a-dot case appends reifyk(k)).
-# OPERATOR methods (`_plus`/`_lessthan`/...) are SEED-BLOCKED: the seed's operator
-# dispatch calls them with FIXED arity (no continuation slot), so a CPS'd operator method
-# would arity-mismatch. We emit only NAMED methods; operator methods are dropped — list
-# `+` etc. stay non-interruptible in stoppable mode (no regression: ALL methods were
-# dropped before; named methods now survive).
+# OPERATOR methods (`_plus`/`_lessthan`/...) are ALSO CPS-transformed now: the call site
+# `a + b` is routed through the `cps-op-*` seed intrinsic (see t-binop/op-cps-helper),
+# which dispatches the operator method WITH the continuation — so list/data `+` works and
+# is interruptible in stoppable mode (numeric/string `+` stays a direct fast-path).
 fun field-method-name(f :: CstNode) -> String:
   child-bang(child-bang(f, "key"), "NAME").value.or-else("_")
 end
@@ -573,7 +608,11 @@ fun data-block-methods(blk :: Option<CstNode>) -> List<String>:
         | none => empty
         | some(fs) =>
           methods = filter(lam(x): (x.name == "field") and is-some(child(x, "METHOD")) end, fs.kids)
-          map(cps-obj-method, filter(lam(f): not(is-operator-method(f)) end, methods))
+          # ALL methods are CPS-transformed (take a trailing continuation) — including
+          # OPERATOR methods (`_plus`/`_lessthan`/...). The call site `a + b` is routed
+          # (see t-binop) through the `cps-op-*` seed intrinsic, which dispatches the
+          # operator method WITH the continuation, so list/data `+` is interruptible.
+          map(cps-obj-method, methods)
       end
   end
 end
