@@ -289,6 +289,9 @@ class Compiler {
     if (this.fnNames.length > 0) {
       m.addActiveElementSegment("$tab", "$seg", this.fnNames, m.i32.const(0));
     }
+    // $variant_match (Pyret's `_match`, the basis of `.visit()`) lives here rather
+    // than in the standalone runtime because it uses the `$tab` function table.
+    this.emitVariantMatch();
 
     if (!m.validate()) throw new CompileError("generated module failed validation");
     if (typeof process !== "undefined" && process.env?.PYRET_DUMP) console.error(m.emitText());
@@ -1826,6 +1829,15 @@ class Compiler {
   // $Method, or a plain field-as-closure).
   private compileMethodOnValue(objVal: number, name: string, argVals: number[], ctx: Ctx, tail: boolean): number {
     const m = this.m;
+    // `obj._match(handlers, els)` is Pyret's auto-generated data dispatcher (the
+    // basis of `.visit()`). It isn't a user method — route it to the runtime
+    // `$variant_match`, which dispatches `obj` on `handlers` by variant name.
+    if (name === "_match" && argVals.length === 2) {
+      const operands = [objVal, argVals[0]!, argVals[1]!];
+      return tail
+        ? m.return_call("$variant_match", operands, binaryen.anyref)
+        : m.call("$variant_match", operands, binaryen.anyref);
+    }
     const objLocal = ctx.addLocal(binaryen.anyref);
     const fieldLocal = ctx.addLocal(binaryen.anyref);
     const argLocals = argVals.map(() => ctx.addLocal(binaryen.anyref));
@@ -1872,6 +1884,76 @@ class Compiler {
       m.local.set(closureLocal, m.ref.cast(closureValue, this.t.ClosureRef)),
       callExpr,
     ], binaryen.anyref);
+  }
+
+  // $variant_match(self, handlers, els) — Pyret's auto-generated `_match` (cf.
+  // runtime.js makeMatch), the basis of `.visit()`. Dispatch the variant `self` on
+  // `handlers` by VARIANT NAME: if handlers has a field with self's variant name,
+  // call it with self's fields (a $Method binds handlers as self then takes the
+  // fields; a plain function field takes just the fields); otherwise call `els`
+  // (a closure) with self. The uniform closure convention (call_indirect with a
+  // $Fields args array) lets us forward the variant's field array directly, so no
+  // per-arity dispatch is needed. Emitted here (not in the standalone runtime)
+  // because it uses the `$tab` function table + the closure signature.
+  private emitVariantMatch(): void {
+    const m = this.m, t = this.t, I = binaryen.i32;
+    const self = () => m.local.get(0, binaryen.anyref);
+    const handlers = () => m.local.get(1, binaryen.anyref);
+    const els = () => m.local.get(2, binaryen.anyref);
+    const v = () => m.local.get(3, t.VariantRef);
+    const name = () => m.local.get(4, t.StrRef);
+    const flds = () => m.local.get(5, t.FieldsRefNull);
+    const ho = () => m.local.get(6, t.ObjectRef);
+    const hn = () => m.local.get(7, t.NamesRef);
+    const i = () => m.local.get(8, I), n = () => m.local.get(9, I);
+    const handler = () => m.local.get(10, binaryen.anyref);
+    const args = () => m.local.get(11, t.FieldsRef);
+    const flen = () => m.local.get(12, I);
+    // tail-call a closure value (set local 13 first to avoid double-eval)
+    const callTail = (cloExpr: number, argsArr: number) => m.block(null, [
+      m.local.set(13, cloExpr),
+      m.return_call_indirect("$tab",
+        m.struct.get(0, m.local.get(13, t.ClosureRef), I, false),
+        [m.local.get(13, t.ClosureRef), argsArr], this.sig, binaryen.anyref),
+    ], binaryen.unreachable);
+    // handler is a $Method: call its closure with [handlers] ++ self.fields
+    const methodCall = m.block(null, [
+      m.local.set(12, m.if(m.ref.is_null(flds()), m.i32.const(0), m.array.len(m.ref.cast(flds(), t.FieldsRef)))),
+      m.local.set(11, m.array.new(t.Fields, m.i32.add(m.i32.const(1), flen()), m.ref.null(binaryen.anyref))),
+      m.array.set(args(), m.i32.const(0), handlers()),
+      m.if(m.i32.gt_s(flen(), m.i32.const(0)),
+        m.array.copy(args(), m.i32.const(1), m.ref.cast(flds(), t.FieldsRef), m.i32.const(0), flen())),
+      callTail(m.call("$method_closure", [m.ref.cast(handler(), t.MethodRef)], t.ClosureRef), args()),
+    ], binaryen.unreachable);
+    // handler is a plain function field: call it with self.fields directly
+    const plainCall = callTail(m.ref.cast(handler(), t.ClosureRef), flds());
+    const found = m.block(null, [
+      m.local.set(10, m.array.get(m.struct.get(1, ho(), t.FieldsRef, false), i(), binaryen.anyref, false)),
+      m.if(m.ref.test(handler(), t.MethodRefNull), methodCall, plainCall, binaryen.unreachable),
+    ], binaryen.unreachable);
+    const body = m.block(null, [
+      m.local.set(3, m.ref.cast(self(), t.VariantRef)),
+      m.local.set(4, m.struct.get(1, v(), t.StrRef, false)),
+      m.local.set(5, m.struct.get(2, v(), t.FieldsRefNull, false)),
+      m.local.set(6, m.ref.cast(handlers(), t.ObjectRef)),
+      m.local.set(7, m.struct.get(0, ho(), t.NamesRef, false)),
+      m.local.set(9, m.array.len(hn())),
+      m.local.set(8, m.i32.const(0)),
+      m.block("search_done", [
+        m.loop("lp", m.block(null, [
+          m.if(m.i32.ge_s(i(), n()), m.br("search_done")),
+          m.if(m.call("$str_equal", [m.array.get(hn(), i(), t.StrRef, false), name()], I), found),
+          m.local.set(8, m.i32.add(i(), m.i32.const(1))),
+          m.br("lp"),
+        ])),
+      ]),
+      // not found: els(self)
+      callTail(m.ref.cast(els(), t.ClosureRef), m.array.new_fixed(t.Fields, [self()])),
+    ], binaryen.unreachable);
+    m.addFunction("$variant_match",
+      binaryen.createType([binaryen.anyref, binaryen.anyref, binaryen.anyref]), binaryen.anyref,
+      [t.VariantRef, t.StrRef, t.FieldsRefNull, t.ObjectRef, t.NamesRef, I, I, binaryen.anyref, t.FieldsRef, I, t.ClosureRef],
+      body);
   }
 
   private isBound(name: string, ctx: Ctx): boolean {
