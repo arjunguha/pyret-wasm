@@ -303,3 +303,17 @@ test("self-hosted: type alias is erased (compiles + runs)", async () => {
   expect(result.error).toBeUndefined();
   expect(result.output).toContain("1 test passed");
 });
+
+// ─── Level 11: short-circuit and/or ───────────────────────────────────────────
+// `a and b` -> if a: b else: false end ; `a or b` -> if a: true else: b end
+test("self-hosted: `and` short-circuits and compiles", async () => {
+  const { result } = await selfHostRun("check:\n  (true and true) is true\n  (true and false) is false\n  (false and true) is false\nend");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("3 tests passed");
+});
+
+test("self-hosted: `or` short-circuits and compiles", async () => {
+  const { result } = await selfHostRun("check:\n  (true or false) is true\n  (false or true) is true\n  (false or false) is false\nend");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("3 tests passed");
+});
