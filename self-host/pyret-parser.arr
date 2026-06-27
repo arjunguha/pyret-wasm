@@ -531,13 +531,19 @@ fun peek2-kind(st :: PState, k :: String) -> Boolean: p-peek2(st).kind == k end
 
 fun expect(st :: PState, k :: String) -> Token:
   if at-kind(st, k): p-advance(st)
-  else: raise("parse error: expected " + k + " but got " + p-peek(st).kind + " '" + p-peek(st).value + "'")
+  else:
+    t = p-peek(st)
+    raise("parse error: expected " + k + " but got " + t.kind + " '" + t.value
+        + "' at line " + to-string(t.s-line) + " col " + to-string(t.s-col))
   end
 end
 
 fun expect-name(st :: PState, v :: String) -> Token:
   if at-name(st, v): p-advance(st)
-  else: raise("parse error: expected '" + v + "' but got '" + p-peek(st).value + "'")
+  else:
+    t = p-peek(st)
+    raise("parse error: expected '" + v + "' but got '" + t.value
+        + "' at line " + to-string(t.s-line) + " col " + to-string(t.s-col))
   end
 end
 
@@ -952,8 +958,43 @@ fun parse-postfix-noapp(st :: PState) -> A.Expr:
   start = p-peek(st)
   parse-postfix-noapp-rest(st, start, parse-atom(st))
 end
+### Does the LPAREN at the cursor delimit `for`-binds (`(b from e, ...)` or `()`)
+### rather than a function application?  Scans for a top-level `from` before the
+### matching `)`.  Lets a `for` iterator itself be an application, e.g.
+### `for left-right-check(loc)(lv from left, rv from right): ...`.
+fun forbinds-ahead(st :: PState) -> Boolean:
+  cases(List) tok-stream:
+    | empty => false
+    | link(_, inner) =>
+      cases(List) inner:
+        | empty => false
+        | link(t0, _) =>
+          if t0.kind == "RPAREN": true   # empty () => for-binds
+          else: forbinds-scan(inner, 0)
+          end
+      end
+  end
+end
+fun forbinds-scan(toks :: List<Token>, depth :: Number) -> Boolean:
+  cases(List) toks:
+    | empty => false
+    | link(t, r) =>
+      k = t.kind
+      if (depth == 0) and (k == "RPAREN"): false        # paren closed, no top-level `from` => app
+      else if (depth == 0) and (k == "NAME") and (t.value == "from"): true
+      else if (k == "LPAREN") or (k == "LBRACK") or (k == "LBRACE"): forbinds-scan(r, depth + 1)
+      else if (k == "RPAREN") or (k == "RBRACK") or (k == "RBRACE"): forbinds-scan(r, depth - 1)
+      else: forbinds-scan(r, depth)
+      end
+  end
+end
 fun parse-postfix-noapp-rest(st :: PState, start :: Token, e :: A.Expr) -> A.Expr:
-  if at-kind(st, "DOT"):
+  if at-kind(st, "LPAREN") and not(p-peek(st).ws-before) and not(forbinds-ahead(st)):
+    # an application within the `for` iterator (`f(x)(...binds)`); the for-binds
+    # paren is recognized by `forbinds-ahead` and left for `parse-for`.
+    args = parse-app-args(st)
+    parse-postfix-noapp-rest(st, start, A.s-app(node-loc(start), e, args))
+  else if at-kind(st, "DOT"):
     p-advance(st)
     fld = expect(st, "NAME").value
     parse-postfix-noapp-rest(st, start, A.s-dot(node-loc(start), e, fld))
@@ -1118,6 +1159,33 @@ fun parse-construct(st :: PState) -> A.Expr:
   A.s-construct(node-loc(start), modifier, ctor, values)
 end
 
+### Given the cursor is at a `(`, return the kind of the token immediately AFTER
+### its matching `)`.  Used to tell a curly-brace lambda `{(args): ...}` (a `:` or
+### `->` follows the params) from a tuple whose first item is parenthesized,
+### e.g. `{(a + b) - c; d}` (an operator follows).
+fun after-paren-tok(toks :: List<Token>, depth :: Number) -> Token:
+  cases(List) toks:
+    | empty => tok-eof
+    | link(t, r) =>
+      k = t.kind
+      nd = if (k == "LPAREN") or (k == "LBRACK") or (k == "LBRACE"): depth + 1
+        else if (k == "RPAREN") or (k == "RBRACK") or (k == "RBRACE"): depth - 1
+        else: depth end
+      if ((k == "RPAREN") or (k == "RBRACK") or (k == "RBRACE")) and (nd == 0):
+        cases(List) r:
+          | empty => tok-eof
+          | link(t2, _) => t2
+        end
+      else: after-paren-tok(r, nd)
+      end
+  end
+end
+fun brace-lambda-ahead(st :: PState) -> Boolean:
+  # lambda params are followed by `:` (block), `->` (ret ann), or `block:`.
+  t = after-paren-tok(tok-stream, 0)
+  (t.kind == "COLON") or (t.kind == "THINARROW") or ((t.kind == "NAME") and (t.value == "block"))
+end
+
 ### brace: distinguish {obj-fields} from {tuple ; ...}
 fun parse-brace(st :: PState) -> A.Expr:
   start = p-peek(st)
@@ -1133,8 +1201,10 @@ fun parse-brace(st :: PState) -> A.Expr:
     fields = parse-fields(st)
     expect(st, "RBRACE")
     A.s-obj(node-loc(start), fields)
-  else if at-kind(st, "LPAREN") or at-op(st, "<"):
+  else if at-op(st, "<") or (at-kind(st, "LPAREN") and brace-lambda-ahead(st)):
     # curly-brace lambda:  { [ty-params] args [-> ann] : block }
+    # (a `(` that is NOT followed by `:`/`->` after its `)` is a parenthesized
+    # first tuple item, e.g. `{(a + b) - c; d}`, handled by the tuple branch.)
     params = parse-ty-params(st)
     args = parse-args(st)
     ret = parse-return-ann(st)
@@ -1169,7 +1239,11 @@ fun parse-fields(st :: PState) -> List<A.Member>:
   f = parse-field(st)
   if at-kind(st, "COMMA"):
     p-advance(st)
-    if at-kind(st, "RBRACE"): link(f, empty)
+    # a trailing comma may precede an obj-literal `}` OR a data with-block
+    # terminator (`|` next variant / `sharing:` / `where:` / `end`).
+    if at-kind(st, "RBRACE") or at-kind(st, "BAR")
+        or at-name(st, "end") or at-name(st, "sharing") or at-name(st, "where"):
+      link(f, empty)
     else: link(f, parse-fields(st))
     end
   else:

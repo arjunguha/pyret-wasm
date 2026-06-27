@@ -107,45 +107,54 @@ grammar (see below). Gaps closed:
   `module` specs, `* ` and `type *`/`data *`, optional `as`.
 - (ty-params on `fun`/`method`/`data` declarations were already supported.)
 
-## Done in round 5 (grammar is now complete for the real compiler source)
+## Done in round 5 (table literal + the grammar gaps the scale-fix exposed)
+
+Once the SCALE blockers were fixed elsewhere (the parser became constant-stack — tail-
+recursive `lex`/`parse-stmts` — and the runtime now auto-grows linear memory for big
+sources), the 80–130KB files ran far enough to reveal real grammar gaps that scale had been
+masking.  All of these are now closed:
 
 - **`table:` literal** (`table-expr`): `table: hdr [:: ann] (, hdr)* (row: e (, e)*)* end`
-  → `s-table(l, headers :: List<FieldName>, rows :: List<TableRow>)` via `parse-table` /
-  `parse-table-headers` / `parse-table-header` / `parse-table-rows` / `parse-table-row`
-  (dispatched from `parse-name-atom` when `table` is followed by `:`, mirroring `block:`).
-  `tables.arr` was the LAST grammar-blocked file; it now parses (21 stmts).
+  → `s-table(l, List<FieldName>, List<TableRow>)` via `parse-table` & helpers (dispatched
+  from `parse-name-atom` when `table` is followed by `:`, mirroring `block:`).  `tables.arr`.
+- **Trailing comma in a `with:` block** before the next variant / `sharing:` / `where:` /
+  `end` — `parse-fields` now stops a trailing comma at `BAR`/`end`/`sharing`/`where`, not
+  just `}`.  This was the dominant gap: `ast.arr`, `lists.arr`, `compile-structs.arr`,
+  `checker.arr`, `charts.arr` all hit it.
+- **`for` iterator that is an application**: `for f(loc)(b from e, ...): ...` — the iterator
+  postfix now consumes app-parens but stops at the for-binds paren, recognized by a
+  `from`-lookahead (`forbinds-ahead`/`forbinds-scan`).  `checker.arr`.
+- **`{(a + b) - c; d}` parenthesized first tuple item vs `{(args): ...}` lambda** —
+  `parse-brace` now looks past the leading `(`'s matching `)` (`after-paren-tok`): it's a
+  curly-lambda only if `:` / `->` / `block` follows, else a tuple.  `charts.arr`, `error.arr`.
+- Parser errors (`expect`/`expect-name`) now carry `line`/`col`, which made locating all of
+  the above fast.
 
-**Status: GRAMMAR = 0 across all 84 real `self-compiler/**.arr` + `self-host/*.arr` files.**
-55 parse; the other 29 fail ONLY on SCALE (call stack / linear-memory buffer on 80–130KB
-files), which is a runtime/architecture task, not grammar (see below).
+**Status: 83 of 84 real `self-compiler/**.arr` + `self-host/*.arr` files parse.** Every CORE
+compiler file parses (ast / lists / compile-structs / checker / anf / desugar / well-formed /
+resolve-scope / …).  Exactly ONE file remains:
 
-## TODO(grammar) — remaining, but NOT exercised by any real compiler/trove file
+## TODO(grammar) — the one remaining gap + unexercised forms
 
+- **`matrices.arr`** — generic **instantiation** in expression / for-iterator position:
+  `for raw-array-fold2<Number, Number, Number>(acc from ..., ...): ...`.  Needs `s-instantiate`
+  parsing of `name<ann, ...>`, which is the genuinely-ambiguous LANGLE-vs-LT case (`<`/`>`
+  also lex as comparison ops; the real tokenizer uses a whitespace distinction).  Tractable
+  in the for-iterator (gated on `<` with no `ws-before`), but a peripheral trove file (matrix
+  ops), not used by the compiler core — deferred to avoid the ambiguity risk for one file.
 - The other **table operations** (`select`/`sieve`/`order`/`extract`/`transform`/`extend`/
-  `update`/`load-table`) and `reactor` — the compiler source uses only the `table:` literal,
-  so these are unimplemented but currently block no file. Add when a consumer needs them.
-- **Decimal exponents** (`3.14e5`) and full string escapes (`\u`, `\x`, octal) — deferred:
-  unexercised by the compiler source, and Pyret's exact-vs-rough semantics for exponents
-  should be pinned against the reference parser before implementing (no failing file to
-  validate against yet).
-- **Generics/instantiation** `f<T>(...)` in expression position — genuinely ambiguous for
-  plain recursive descent (`<`/`>` lex as comparison ops; needs the real tokenizer's
-  LANGLE-vs-LT whitespace distinction). Unexercised by the compiler source.
+  `update`/`load-table`) and `reactor` — only `table:` is used by the compiler source.
+- **Decimal exponents** (`3.14e5`), full string escapes (`\u`, `\x`, octal) — unexercised;
+  pin the exact-vs-rough semantics against the reference parser before implementing.
 - Reject mixed operators without parens (defer to well-formedness, as real Pyret).
 - The last couple of secondary `dummy-loc`s (pat-loc on cases binds, where-loc).
 
-## REMAINING BLOCKER: SCALE, not grammar (per-file findings)
+## (historical) SCALE blocker — RESOLVED
 
-Of all 84 real `self-compiler/**.arr` + `self-host/*.arr` files, **55 parse**; **0** have a
-grammar gap (the `table:` literal closed the last one); the other **29 fail at RUNTIME on
-large inputs**, NOT on grammar:
-- `JS-ERROR: Maximum call stack size exceeded` — the recursive-descent parser + its
-  cons-list builders (`tokenize`/`lex`/`parse-stmts`/`string-to-code-points`) recurse to a
-  depth proportional to file size; 80–130KB files (anf/desugar/well-formed/resolve-scope/
-  type-check/ast.arr/lists/sets/contracts/…) overflow the stack.
-- `JS-ERROR: Length out of range of buffer` — the seed runtime's linear-memory string path
-  hits its limit on the largest files (independent of how much the host pre-grows memory).
-These are the SAME big compiler files the no-JS fixpoint ultimately needs.  Fixing them is a
+The 80–130KB files used to fail with `Maximum call stack size exceeded` (size-proportional
+recursion) and `Length out of range of buffer` (linear-memory limit).  Both are fixed: the
+tokenizer/statement loops are tail-recursive (the seed does native tail calls) and the
+runtime auto-grows memory.  Original wording kept below for context:
 RUNTIME/architecture task (make the tokenizer + statement/list loops iterative / tail-
 recursive so they run in constant stack — the seed does native tail calls — and/or raise the
 seed's memory/string limits), out of scope for grammar work.  Tracked here as the next step

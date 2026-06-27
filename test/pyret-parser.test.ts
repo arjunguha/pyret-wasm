@@ -40,7 +40,7 @@ async function parseRealFile(probeWasm: Uint8Array, srcPath: string): Promise<st
   const { instance } = await WebAssembly.instantiate(probeWasm as BufferSource, buildHostImports(state));
   state.instance = instance;
   state.memory = instance.exports.memory as WebAssembly.Memory;
-  try { state.memory.grow(400); } catch { /* already large enough */ }
+  try { state.memory.grow(1500); } catch { /* already large enough */ }
   try { (instance.exports.main as () => void)(); }
   catch (e) { if (!(e instanceof PyretError)) throw e; state.stdout((e as Error).message + "\n"); }
   return state.captured;
@@ -132,10 +132,29 @@ test("pure-Pyret parser: parses real compiler source files", async () => {
   expect(mu).toContain("ok stmts=34");
 
   // tables.arr: the `table:` literal grammar (table-expr: headers + `row:` rows).
-  // This was the LAST grammar-blocked real file; now every real compiler/trove
-  // file parses for grammar (the remaining failures are scale, not grammar).
   const tbl = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/trove/tables.arr"));
   expect(tbl).toContain("ok stmts=21");
+});
+
+// The LARGE core compiler/library files (80–130KB) parse end-to-end with the
+// pure-Pyret parser — combining constant-stack tokenizing/parsing, the runtime's
+// linear-memory auto-grow, and the grammar gaps closed here (trailing comma in a
+// `with:` block before the next variant; `for f(loc)(b from e)` iterator-as-app;
+// `{(a + b) - c; d}` parenthesized first tuple item vs `{(args): ...}` lambda).
+// 83 of 84 real `self-compiler/**`+`self-host/*` files now parse for grammar; only
+// matrices.arr (generic instantiation `f<T>(...)` — ambiguous LANGLE/LT) remains.
+test("pure-Pyret parser: parses the large core compiler files", async () => {
+  const wasm = await buildSourceFile(REALFILE_PROBE);
+  for (const f of [
+    "../self-compiler/trove/ast.arr",
+    "../self-compiler/trove/lists.arr",
+    "../self-compiler/compiler/compile-structs.arr",
+    "../self-compiler/trove/checker.arr",
+  ]) {
+    const out = await parseRealFile(wasm, resolve(import.meta.dir, f));
+    expect(out).toContain("ok stmts=");  // parsed without a grammar error
+    expect(out).toContain("first=");
+  }
 });
 
 // LARGE files that previously overflowed the WASM call stack ("Maximum call stack
