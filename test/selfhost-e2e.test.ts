@@ -156,6 +156,32 @@ test("self-hosted: a WRONG cases dispatch traps (sanity: the trap-pattern catche
   expect(threw).toBe(true);
 });
 
+// ─── `.visit()` / `_match` (the auto data dispatcher) ───────────────────────────
+// Every ast.arr variant's `visit` method is `self._match(handlers, els)`; `_match`
+// (runtime `$variant_match`) dispatches the variant on `handlers` by variant name —
+// the basis of the visitor-heavy real compiler passes. Here a `sharing:` `visit`
+// method calls `self._match(v, els)`, exercising the new self-hosted kernel.
+const VISIT_PRELUDE =
+  "data Foo:\n  | bar(x)\n  | baz\nsharing:\n" +
+  "  method visit(self, v): self._match(v, lam(s): 7 end) end\nend\n" +
+  "fun expect(v, e): if v == e: 0 else: 1 / 0 end end\n" +
+  "h = { method bar(self, x): x + 100 end, method baz(self): 99 end }\n";
+
+test("self-hosted: _match dispatches a variant-with-fields (bar(5).visit -> 105)", async () => {
+  const { result } = await selfHostRun(VISIT_PRELUDE + "expect(bar(5).visit(h), 105)");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: _match dispatches a singleton (baz.visit -> 99)", async () => {
+  const { result } = await selfHostRun(VISIT_PRELUDE + "expect(baz.visit(h), 99)");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: _match falls to the else handler when no variant matches (-> 7)", async () => {
+  const { result } = await selfHostRun(VISIT_PRELUDE + "expect(bar(5).visit({ method baz(self): 1 end }), 7)");
+  expect(result.error).toBeUndefined();
+});
+
 // ─── Level 6: top-level `let` bindings and `[list: ...]` ────────────────────────
 // `x = e` at statement position desugars to s-let-expr over the rest (previously it
 // reached ANF as a bare s-let and errored "s-let should have been desugared
