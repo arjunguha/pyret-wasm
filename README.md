@@ -286,19 +286,20 @@ as relative, not absolute.
 |---|---|---|---|
 | **direct Pyret→Wasm (seed)** | `buildSourceFile` (Pyret→CST→binaryen→wasm), then `WebAssembly.instantiate` + call `main` | `bun scripts/bench.ts` on **bun 1.3.14** | best of N; "run" excludes compile |
 | **stoppable Pyret→Wasm** | `buildStoppableSourceFile` (Pyret CPS transform first) run through `runStoppable` with `noYield:true` (raw throughput; still interruptible) | manual driver over the same programs, **bun 1.3.14** | best of 3 |
-| **original Pyret** | a rebuilt `phaseA` standalone (`--build-runnable`), executed with **Node** | `bash scripts/bench-pyret-baseline.sh` on **Node v24** | best of 3; total includes ~170 ms Node+runtime startup |
+| **original Pyret** | a rebuilt `phaseA` standalone (`--build-runnable`), executed with **Node** | `bash scripts/bench-pyret-baseline.sh` on **Node v24** | best of 3; total includes ~183 ms Node+runtime startup |
 
 ### Results (best of 3, this machine)
 
 | program | direct Pyret→Wasm (run) | stoppable Pyret→Wasm (run) | original Pyret (compute / total)¹ |
 |---|---|---|---|
-| `adding-ones-2000` | 8.1 ms | 10.3 ms | ~5 ms / ~175 ms |
-| `recursion-triangle-20000` | **stack overflow** | 8.7 ms | ~12 ms / ~182 ms |
-| `tail-sum-1000000` | 122.7 ms | 142.6 ms | ~78 ms / ~248 ms |
+| `adding-ones-2000` | 8.1 ms | 10.3 ms | 22 ms / 205 ms |
+| `recursion-triangle-20000` | **stack overflow** | 8.7 ms | 21 ms / 204 ms |
+| `tail-sum-1000000` | 122.7 ms | 142.6 ms | 97 ms / 280 ms |
 
-¹ original-Pyret figures are from an earlier run on this machine (the rebuild recipe above
-reproduces them); the direct/stoppable columns were freshly measured. Reproduce the WASM
-columns with `bun scripts/bench.ts 5`.
+¹ original-Pyret figures **freshly measured** (`bash scripts/bench-pyret-baseline.sh`, Node
+v24, best of 3, after rebuilding `phaseA` per the recipe above): *total* is wall-clock
+including a ~183 ms Node+runtime startup baseline (a trivial `print(1)`), and *compute* is
+total minus that baseline. The direct/stoppable columns are measured with `bun scripts/bench.ts 5`.
 
 ### Takeaways (honest)
 
@@ -307,7 +308,7 @@ columns with `bun scripts/bench.ts 5`.
 - **CPS *enables* deep non-tail recursion** (`recursion-triangle-20000`) that overflows the
   direct path's native stack; original Pyret survives the same case via its own Stopify
   trampoline.
-- Our WASM **beats original Pyret on the short programs** (no ~170 ms Node startup).
+- Our WASM **beats original Pyret on the short programs** (no ~183 ms Node startup).
 - Original Pyret **wins `tail-sum`**: `js-numbers` keeps sums under 2⁵³ *unboxed*, while our
   runtime allocates a `$Fixnum` every step — a concrete optimization target (see Next steps).
 
