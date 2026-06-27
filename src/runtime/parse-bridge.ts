@@ -73,6 +73,22 @@ export const TAGS = {
   MEMBERS: 55, // helper: a List<Member> (with: / sharing:)
   DATAFIELD: 56, // s-data-field: str = name, kids = [value]
   OBJ: 57, // s-obj: kids = [MEMBERS]
+  // --- round 4 ---
+  ARECORD: 58, // a-record: kids = [AFIELDS]
+  AFIELD: 59, // a-field: str = name, kids = [ann]
+  AFIELDS: 60, // helper: a List<AField>
+  APRED: 61, // a-pred: kids = [base-ann, pred-expr]
+  USERBLOCK: 62, // s-user-block: kids = [body-block]
+  TEMPLATE: 63, // s-template (`...`)
+  PAREN: 64, // s-paren: kids = [expr]
+  SPYBLOCK: 65, // s-spy-block: str = "msg" if a message is present, kids = [msg?, SPYFIELDS]
+  SPYFIELD: 66, // s-spy-expr (explicit `name: val`): str = name, kids = [value]
+  SPYFIELDIMPL: 67, // s-spy-expr (shorthand `id`): str = name, kids = [value]
+  SPYFIELDS: 68, // helper: a List<SpyField>
+  INCLUDEFILE: 69, // s-include of s-special-import: str = path
+  PROVIDEBLOCK: 70, // s-provide-block: kids = [PSPECS]
+  PSPEC: 71, // s-provide-name: str = name
+  PSPECS: 72, // helper: a List<ProvideSpec>
 } as const;
 
 // One node of the flat pre-order stream. `nkids` children follow immediately
@@ -161,8 +177,31 @@ function toAnn(annNode: CstNode): AstNode {
     }
     case "tuple-ann":
       return node(TAGS.ATUPLE, "", [node(TAGS.ANNS, "", annList(a))]);
+    case "record-ann": {
+      // { NAME :: ann (, NAME :: ann)* } -> a-record of a-field.
+      const fields: AstNode[] = [];
+      (function walkAF(x: CstNode) {
+        if (x.name === "ann-field") {
+          const nm = x.kids.find((k) => k.name === "NAME")?.value ?? "";
+          const annK = x.kids.find((k) => k.name === "ann");
+          fields.push(node(TAGS.AFIELD, nm, [annK ? toAnn(annK) : node(TAGS.ABLANK, "")]));
+          return;
+        }
+        for (const k of x.kids) walkAF(k);
+      })(a);
+      return node(TAGS.ARECORD, "", [node(TAGS.AFIELDS, "", fields)]);
+    }
+    case "pred-ann": {
+      // base-ann % ( id-expr ) -> a-pred.
+      const baseAnn = a.kids.find((k) => k.name === "ann");
+      const idE = a.kids.find((k) => k.name === "id-expr");
+      return node(TAGS.APRED, "", [
+        baseAnn ? toAnn(baseAnn) : node(TAGS.ABLANK, ""),
+        idE ? toExpr(idE) : node(TAGS.ID, ""),
+      ]);
+    }
     default:
-      return node(TAGS.ABLANK, ""); // TODO(grammar): record/pred anns
+      return node(TAGS.ABLANK, ""); // TODO(grammar): app-ann with dot-ann base
   }
 }
 
@@ -189,8 +228,15 @@ function toExpr(orig: CstNode): AstNode {
     case "id-expr":
       return node(TAGS.ID, n.kids[0]!.value ?? "");
     case "paren-expr":
-      // ( binop-expr ) — lower the inner expression.
-      return toExpr(n.kids.find((k) => k.name === "binop-expr") ?? n.kids[1]!);
+      // ( binop-expr ) -> s-paren of the inner expression.
+      return node(TAGS.PAREN, "", [toExpr(n.kids.find((k) => k.name === "binop-expr") ?? n.kids[1]!)]);
+    case "user-block-expr":
+      // block: ... end -> s-user-block of the inner block.
+      return node(TAGS.USERBLOCK, "", [toBlock(n.kids.find((k) => k.name === "block")!)]);
+    case "template-expr":
+      return node(TAGS.TEMPLATE, "");
+    case "spy-stmt":
+      return spyStmt(n);
     case "binop-expr":
       return binop(n);
     case "check-test":
@@ -206,7 +252,7 @@ function toExpr(orig: CstNode): AstNode {
       return ifExpr(n);
     case "lambda-expr": {
       const { binds, body } = funParts(n);
-      return node(TAGS.LAM, "", [binds, body]);
+      return node(TAGS.LAM, "", withWhere([binds, body], n));
     }
     case "construct-expr":
       return construct(n);
@@ -223,7 +269,7 @@ function toExpr(orig: CstNode): AstNode {
     case "fun-expr": {
       const name = n.kids.find((k) => k.name === "NAME")?.value ?? "";
       const { binds, body } = funParts(n);
-      return node(TAGS.FUN, name, [binds, body]);
+      return node(TAGS.FUN, name, withWhere([binds, body], n));
     }
     case "data-expr":
       return dataExpr(n);
@@ -300,11 +346,12 @@ function dataExpr(n: CstNode): AstNode {
   // sharing: members live under data-sharing's `fields`.
   const sharingNode = n.kids.find((k) => k.name === "data-sharing");
   const shared = sharingNode ? lowerFields(sharingNode) : [];
-  return node(TAGS.DATA, name, [
+  // NB: this grammar has no `deriving`/mixins production — s-data's mixins are
+  // always empty from surface syntax.
+  return node(TAGS.DATA, name, withWhere([
     node(TAGS.VARIANTS, "", variants),
     node(TAGS.MEMBERS, "", shared),
-  ]);
-  // TODO(grammar): mixins (`deriving`), where:
+  ], n));
 }
 
 // data-variant: `| ctor(members) with:...` or singleton `| NAME with:...`
@@ -344,7 +391,7 @@ function lowerField(f: CstNode): AstNode | null {
     ?? f.kids.find((k) => k.name === "NAME")?.value ?? "";
   if (f.kids.some((k) => k.name === "METHOD")) {
     const { binds, body } = funParts(f);
-    return node(TAGS.METHODFIELD, keyName, [binds, body]);
+    return node(TAGS.METHODFIELD, keyName, withWhere([binds, body], f));
   }
   // data field `k: value` -> s-data-field.
   const valNode = f.kids.find((k) => k.name === "binop-expr");
@@ -469,6 +516,41 @@ function toBlock(n: CstNode): AstNode {
   return node(TAGS.BLOCK, "", n.kids.map(toExpr));
 }
 
+// Append the where-clause body block (if any) as a trailing kid, so the rebuild
+// side can populate `_check` on s-fun/s-lam/s-method-field.
+function withWhere(kids: AstNode[], n: CstNode): AstNode[] {
+  const wc = n.kids.find((k) => k.name === "where-clause");
+  const blk = wc?.kids.find((k) => k.name === "block");
+  return blk ? [...kids, toBlock(blk)] : kids;
+}
+
+// spy-stmt: SPY [message] : (spy-field (, spy-field)*)? END  ->  s-spy-block.
+function spyStmt(n: CstNode): AstNode {
+  const msg = n.kids.find((k) => k.name === "binop-expr"); // optional message expr
+  const contents = n.kids.find((k) => k.name === "spy-contents");
+  const fields: AstNode[] = [];
+  if (contents) {
+    for (const sf of contents.kids) {
+      if (sf.name !== "spy-field") continue;
+      const valNode = sf.kids.find((k) => k.name === "binop-expr");
+      if (valNode) {
+        // `name: value` -> explicit field.
+        const nm = sf.kids.find((k) => k.name === "NAME")?.value ?? "";
+        fields.push(node(TAGS.SPYFIELD, nm, [toExpr(valNode)]));
+      } else {
+        // shorthand `id` -> implicit-label field (name = the id).
+        const idE = sf.kids.find((k) => k.name === "id-expr");
+        const nm = idE?.kids[0]?.value ?? "";
+        fields.push(node(TAGS.SPYFIELDIMPL, nm, [toExpr(idE!)]));
+      }
+    }
+  }
+  const fieldsNode = node(TAGS.SPYFIELDS, "", fields);
+  return msg
+    ? node(TAGS.SPYBLOCK, "msg", [toExpr(msg), fieldsNode])
+    : node(TAGS.SPYBLOCK, "", [fieldsNode]);
+}
+
 // Shared fun/lam parts: the arg binds + the body block.
 function funParts(n: CstNode): { binds: AstNode; body: AstNode } {
   const header = n.kids.find((k) => k.name === "fun-header");
@@ -509,21 +591,40 @@ function lowerPrelude(prelude: CstNode): {
   const imports: AstNode[] = [];
   for (const stmt of prelude.kids) {
     if (stmt.name === "provide-stmt") {
+      // `provide: a, b end` / `provide from M: ...` -> s-provide-block (check first,
+      // since a spec name-spec can itself contain STAR/TIMES).
+      const pblock = findFirst(stmt, "provide-block");
+      if (pblock) {
+        const specs: AstNode[] = [];
+        for (const sp of pblock.kids) {
+          if (sp.name !== "provide-spec") continue;
+          const mref = findFirst(sp, "module-ref");
+          specs.push(node(TAGS.PSPEC, mref ? (findFirst(mref, "NAME")?.value ?? "") : ""));
+          // TODO(grammar): provide type/data/module specs, `as`, star, `from` source
+        }
+        provideFlag = "pblock";
+        provideExpr = node(TAGS.PROVIDEBLOCK, "", [node(TAGS.PSPECS, "", specs)]);
+        continue;
+      }
       // `provide *` -> provide-all; `provide { ... } end` -> s-provide of the obj.
-      if (findFirst(stmt, "TIMES")) { provideFlag = "all"; continue; }
+      if (findFirst(stmt, "TIMES") || findFirst(stmt, "STAR")) { provideFlag = "all"; continue; }
       const objNode = findFirst(stmt, "obj-expr");
       if (objNode) { provideFlag = "block"; provideExpr = toExpr(objNode); }
-      continue; // TODO(grammar): provide-block spec form, provide-types
+      continue; // TODO(grammar): provide-types
     }
     if (stmt.name === "import-stmt") {
       const isInclude = stmt.kids[0]?.name === "INCLUDE";
-      // import file("path") as NAME  ->  s-special-import.
+      // file("path") special import -> s-special-import (as `include` or `import as`).
       const special = findFirst(stmt, "import-special");
-      if (special && !isInclude) {
+      if (special) {
         const strNode = special.kids.find((k) => k.name === "STRING");
         const path = strNode ? stripStr(strNode.value ?? "") : "";
-        const alias = stmt.kids.find((k) => k.name === "NAME")?.value ?? "";
-        imports.push(node(TAGS.IMPORTFILE, path, [node(TAGS.NAMESTR, alias)]));
+        if (isInclude) {
+          imports.push(node(TAGS.INCLUDEFILE, path));
+        } else {
+          const alias = stmt.kids.find((k) => k.name === "NAME")?.value ?? "";
+          imports.push(node(TAGS.IMPORTFILE, path, [node(TAGS.NAMESTR, alias)]));
+        }
         continue;
       }
       const srcName = findFirst(stmt, "import-name");

@@ -19,6 +19,7 @@ const ANN = resolve(import.meta.dir, "fixtures/surface-parse-ann.arr");
 const ANNLABEL = resolve(import.meta.dir, "fixtures/surface-parse-annlabel.arr");
 const IMPFILE = resolve(import.meta.dir, "fixtures/surface-parse-impfile.arr");
 const DATA = resolve(import.meta.dir, "fixtures/surface-parse-data.arr");
+const WHERE = resolve(import.meta.dir, "fixtures/surface-parse-where.arr");
 
 // Run a seed-compiled fixture with the host bridge primed to parse `src`.
 async function runWithSource(wasm: Uint8Array, src: string): Promise<string> {
@@ -79,6 +80,12 @@ const FORMS: Array<[string, string]> = [
   ["data D: | a(ref x) end", "s-data"],
   ["data D: | a(x) with: method m(self): 1 end end", "s-data"],
   ["data D: | a(x) sharing: method s(self): 1 end end", "s-data"],
+  // round 4
+  ["block: 1 end", "s-user-block"],
+  ["...", "s-template"],
+  ["(5)", "s-paren"],
+  ["spy: x end", "s-spy-block"],
+  ['spy "m": y: 2 end', "s-spy-block"],
 ];
 
 test("surface-parse: rebuilds the right ast.arr ctor for each core form", async () => {
@@ -169,6 +176,8 @@ const ANN_FORMS: Array<[string, string]> = [
   ["fun f(l :: List<Number>): l end", "a-app"],
   ["fun f(x :: a.B): x end", "a-dot"],
   ["fun f(p :: {Number; String}): p end", "a-tuple"],
+  ["fun f(r :: {a :: Number, b :: String}): r end", "a-record"],
+  ["fun f(x :: Number%(is-positive)): x end", "a-pred"],
 ];
 
 test("surface-parse: arrow/app/dot/tuple annotations rebuild the right Ann ctor", async () => {
@@ -208,4 +217,33 @@ test("surface-parse: data ref member + with/sharing methods", async () => {
   expect(out).toContain("wmlabel=s-method-field");
   expect(out).toContain("nshared=1");
   expect(out).toContain("shlabel=s-method-field");
+});
+
+// round 4: a `where:` clause populates `_check` on s-fun / s-data.
+test("surface-parse: where-clause populates _check", async () => {
+  const wasm = await buildSourceFile(WHERE);
+  const fun = await runWithSource(wasm, "fun f(x): x where: f(1) is 1 end");
+  expect(fun).toContain("label=s-fun");
+  expect(fun).toContain("haschk=true");
+  expect(fun).toContain("chklabel=s-block");
+  const data = await runWithSource(wasm, "data D: | a where: 1 is 1 end");
+  expect(data).toContain("label=s-data");
+  expect(data).toContain("haschk=true");
+});
+
+// round 4: `include file("...")` rebuilds an s-include of s-special-import.
+test("surface-parse: include file(...) rebuilds s-include", async () => {
+  const wasm = await buildSourceFile(INFO);
+  const out = await runWithSource(wasm, 'include file("foo.arr")\n5');
+  expect(out).toContain("nimports=1");
+  expect(out).toContain("imp0=s-include");
+  expect(out).toContain("label=s-num");
+});
+
+// round 4: `provide: a, b end` (provide-block spec form) rebuilds s-provide-block.
+test("surface-parse: provide-block (provide: ... end) rebuilds s-provide-block", async () => {
+  const wasm = await buildSourceFile(INFO);
+  const out = await runWithSource(wasm, "provide: x, y end\n5");
+  expect(out).toContain("provide=s-provide-block");
+  expect(out).toContain("label=s-num");
 });
