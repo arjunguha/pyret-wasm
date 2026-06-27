@@ -73,6 +73,21 @@ METHODFIELD = 54
 MEMBERS = 55
 DATAFIELD = 56
 OBJ = 57
+ARECORD = 58
+AFIELD = 59
+AFIELDS = 60
+APRED = 61
+USERBLOCK = 62
+TEMPLATE = 63
+PAREN = 64
+SPYBLOCK = 65
+SPYFIELD = 66
+SPYFIELDIMPL = 67
+SPYFIELDS = 68
+INCLUDEFILE = 69
+PROVIDEBLOCK = 70
+PSPEC = 71
+PSPECS = 72
 
 # Shared read cursor into the flat pre-order stream.
 var cursor = 0
@@ -101,6 +116,16 @@ fun check-op(l, s):
   end
 end
 
+# Optional `_check` value: the where-block at index `idx`, if the node carries one.
+fun opt-at(kids, idx):
+  if kids.length() > idx: some(kids.get(idx)) else: none end
+end
+
+# Matching `_check-loc`: present iff there is a where-block.
+fun check-loc(l, kids, idx):
+  if kids.length() > idx: some(l) else: none end
+end
+
 fun build-node(tag, s, kids):
   l = A.dummy-loc
   if tag == NUM: A.s-num(l, string-to-number(s).value)
@@ -116,9 +141,11 @@ fun build-node(tag, s, kids):
   else if tag == LET: A.s-let(l, mk-bind(l, s), kids.get(0), false)
   else if tag == VAR: A.s-var(l, mk-bind(l, s), kids.get(0))
   else if tag == FUN:
-    A.s-fun(l, s, empty, kids.get(0), A.a-blank, "", kids.get(1), none, none, false)
+    A.s-fun(l, s, empty, kids.get(0), A.a-blank, "", kids.get(1),
+      check-loc(l, kids, 2), opt-at(kids, 2), false)
   else if tag == LAM:
-    A.s-lam(l, "", empty, kids.get(0), A.a-blank, "", kids.get(1), none, none, false)
+    A.s-lam(l, "", empty, kids.get(0), A.a-blank, "", kids.get(1),
+      check-loc(l, kids, 2), opt-at(kids, 2), false)
   else if tag == IF:
     branches = kids.get(0)
     if kids.length() >= 2: A.s-if-else(l, branches, kids.get(1), false)
@@ -137,7 +164,7 @@ fun build-node(tag, s, kids):
   else if tag == EXPRS: kids   # a List<Expr>
   else if tag == DATA:
     shared = if kids.length() >= 2: kids.get(1) else: empty end
-    A.s-data(l, s, empty, empty, kids.get(0), shared, none, none)
+    A.s-data(l, s, empty, empty, kids.get(0), shared, check-loc(l, kids, 2), opt-at(kids, 2))
   else if tag == VARIANTS: kids   # a List<Variant>
   else if tag == VARIANT:
     with-members = if kids.length() >= 2: kids.get(1) else: empty end
@@ -189,10 +216,31 @@ fun build-node(tag, s, kids):
   else if tag == IMPORTFILE:
     A.s-import(l, A.s-special-import(l, "file", [list: s]), A.s-name(l, kids.get(0)))
   else if tag == METHODFIELD:
-    A.s-method-field(l, s, empty, kids.get(0), A.a-blank, "", kids.get(1), none, none, false)
+    A.s-method-field(l, s, empty, kids.get(0), A.a-blank, "", kids.get(1),
+      check-loc(l, kids, 2), opt-at(kids, 2), false)
   else if tag == MEMBERS: kids   # a List<Member>
   else if tag == DATAFIELD: A.s-data-field(l, s, kids.get(0))
   else if tag == OBJ: A.s-obj(l, kids.get(0))
+  else if tag == ARECORD: A.a-record(l, kids.get(0))
+  else if tag == AFIELD: A.a-field(l, s, kids.get(0))
+  else if tag == AFIELDS: kids   # a List<AField>
+  else if tag == APRED: A.a-pred(l, kids.get(0), kids.get(1))
+  else if tag == USERBLOCK: A.s-user-block(l, kids.get(0))
+  else if tag == TEMPLATE: A.s-template(l)
+  else if tag == PAREN: A.s-paren(l, kids.get(0))
+  else if tag == SPYBLOCK:
+    msg = if s == "msg": some(kids.get(0)) else: none end
+    contents = if s == "msg": kids.get(1) else: kids.get(0) end
+    A.s-spy-block(l, msg, contents)
+  else if tag == SPYFIELD: A.s-spy-expr(l, s, kids.get(0), false)
+  else if tag == SPYFIELDIMPL: A.s-spy-expr(l, s, kids.get(0), true)
+  else if tag == SPYFIELDS: kids   # a List<SpyField>
+  else if tag == INCLUDEFILE:
+    A.s-include(l, A.s-special-import(l, "file", [list: s]))
+  else if tag == PROVIDEBLOCK: A.s-provide-block(l, empty, kids.get(0))
+  else if tag == PSPEC:
+    A.s-provide-name(l, A.s-module-ref(l, [list: A.s-name(l, s)], none))
+  else if tag == PSPECS: kids   # a List<ProvideSpec>
   else if tag == BIND: mk-bind(l, s)
   else if tag == PROGRAM:
     # `provide { ... }` (flag "block") prepends the provide expr as a leading kid,
@@ -201,6 +249,7 @@ fun build-node(tag, s, kids):
     prov =
       if s == "all": A.s-provide-all(l)
       else if s == "block": A.s-provide(l, kids.get(0))
+      else if s == "pblock": kids.get(0)   # already an s-provide-block
       else: A.s-provide-none(l)
       end
     imports = if has-prov-expr: kids.get(1) else: kids.get(0) end
