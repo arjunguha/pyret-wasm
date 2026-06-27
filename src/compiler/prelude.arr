@@ -2,6 +2,7 @@ data List:
   | empty
   | link(first, rest)
 sharing:
+  method _plus(self, other): append(self, other) end,
   method map(self, f): map(f, self) end,
   method filter(self, p): filter(p, self) end,
   method foldl(self, f, init): foldl(f, init, self) end,

@@ -1720,8 +1720,10 @@ class Compiler {
     }
     if (op === "EQUALEQUAL") return this.mkBool(m.call("$equal", [left, right], binaryen.i32));
     if (op === "NEQ") return this.mkBool(m.i32.eqz(m.call("$equal", [left, right], binaryen.i32)));
-    if (op === "AND") return this.mkBool(m.i32.and(this.truthy(left), this.truthy(right)));
-    if (op === "OR") return this.mkBool(m.i32.or(this.truthy(left), this.truthy(right)));
+    // `and`/`or` MUST short-circuit: `right` only executes in the taken if-branch,
+    // so `is-s-op(x) and x.op` won't touch x.op when x isn't an s-op.
+    if (op === "AND") return m.if(this.truthy(left), this.mkBool(this.truthy(right)), this.mkBool(m.i32.const(0)), binaryen.anyref);
+    if (op === "OR") return m.if(this.truthy(left), this.mkBool(m.i32.const(1)), this.mkBool(this.truthy(right)), binaryen.anyref);
     throw new CompileError(`unsupported binop: ${op}`, opNode);
   }
 
