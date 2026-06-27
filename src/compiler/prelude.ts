@@ -367,6 +367,11 @@ sharing:
   method fold(self, f, init): foldl(f, init, self.elems) end
 end
 fun set-from-raw(arr): foldl(lam(acc, e): acc.add(e) end, p-set(empty), raw-array-to-list(arr)) end
+# Bare-identifier empty-set values used across the front-end (list-set/tree-set are
+# the same representation: an immutable dedup set).
+empty-set = p-set(empty)
+empty-list-set = p-set(empty)
+empty-tree-set = p-set(empty)
 
 fun make-string-dict(): s-str-dict(empty) end
 
