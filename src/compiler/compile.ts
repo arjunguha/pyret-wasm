@@ -391,10 +391,14 @@ class Compiler {
     captures.forEach((idx, name) => ctx.captures.set(name, idx));
     // boxed = vars declared here that nested closures capture, plus boxed vars
     // we inherited as captures (the cell is shared down the closure chain).
-    this.boxedVarsFor(bodyBlock).forEach((n) => ctx.boxed.add(n));
+    // A param can shadow an outer (inherited) boxed var — that param is NOT boxed.
+    // But a local `var` may itself shadow a param (`var shadow n = n`) and be
+    // captured; that var MUST stay boxed — so add local var boxing AFTER the
+    // param-delete (the param read before the var decl resolves to the param slot,
+    // which is never unboxed; references after the var decl hit the boxed local).
     if (inheritedBoxed) inheritedBoxed.forEach((n) => ctx.boxed.add(n));
-    // a param can shadow an outer var name; a param is never boxed.
     allParamNames.forEach((p) => ctx.boxed.delete(p));
+    this.boxedVarsFor(bodyBlock).forEach((n) => ctx.boxed.add(n));
     // Each binding occupies one arg slot. Simple names map directly to the slot;
     // a tuple-binding param destructures its slot value into locals at entry.
     const prelude: number[] = [];
@@ -575,7 +579,10 @@ class Compiler {
       const b2 = new Set(bound);
       for (const stmt of node.kids.filter((k) => k.name === "stmt")) {
         const inner = this.only(stmt);
-        if (inner.name === "let-expr") for (const nm of this.bindingNames(this.letBinding(inner))) b2.add(nm);
+        // let/var/rec all introduce block-scoped bindings; omitting var here made a
+        // `var n` look free, spuriously propagating it upward as a captured var.
+        if (inner.name === "let-expr" || inner.name === "var-expr" || inner.name === "rec-expr")
+          for (const nm of this.bindingNames(this.letBinding(inner))) b2.add(nm);
         else if (inner.name === "fun-expr") { const nm = this.childNamed(inner, "NAME"); if (nm) b2.add(nm.value!); }
       }
       for (const k of node.kids) add(this.freeVars(k, b2));
@@ -601,8 +608,35 @@ class Compiler {
       if (body) add(this.freeVars(body, bound)); // type binds erased
       return out;
     }
+    if (node.name === "for-expr") {
+      // for ITER(x from e1, y from e2 ...): body end -- x,y bound in the body;
+      // e1,e2 and ITER are evaluated in the enclosing scope. (The body becomes a
+      // lambda at compile time, so its loop vars are NOT visible outside.)
+      const b2 = new Set(bound);
+      for (const fb of node.kids.filter((k) => k.name === "for-bind")) {
+        const fe = fb.kids.find((k) => k.name === "binop-expr");
+        if (fe) add(this.freeVars(fe, bound));
+        const b = this.childNamed(fb, "binding");
+        if (b) for (const nm of this.bindingNames(b)) b2.add(nm);
+      }
+      const iter = node.kids.find((k) => k.name === "expr");
+      if (iter) add(this.freeVars(iter, bound));
+      const body = this.childNamed(node, "block");
+      if (body) add(this.freeVars(body, b2));
+      return out;
+    }
     for (const k of node.kids) add(this.freeVars(k, bound));
     return out;
+  }
+
+  // The loop-variable names bound by a `for` expression's for-binds.
+  private forBindVars(node: CstNode): Set<string> {
+    const params = new Set<string>();
+    for (const fb of node.kids.filter((k) => k.name === "for-bind")) {
+      const b = this.childNamed(fb, "binding");
+      if (b) for (const nm of this.bindingNames(b)) params.add(nm);
+    }
+    return params;
   }
 
   // ---- mutable-variable capture (boxing) ----
@@ -614,15 +648,30 @@ class Compiler {
   // Names declared via `var` within `node`, NOT descending into nested closures.
   private varDeclsIn(node: CstNode, out: Set<string>): void {
     if (node.name === "lambda-expr" || node.name === "fun-expr") return; // separate scope
+    if (node.name === "for-expr") {
+      // the for body is a separate (closure) scope; only the iter/source exprs are here.
+      for (const fb of node.kids.filter((k) => k.name === "for-bind")) {
+        const fe = fb.kids.find((k) => k.name === "binop-expr");
+        if (fe) this.varDeclsIn(fe, out);
+      }
+      const iter = node.kids.find((k) => k.name === "expr");
+      if (iter) this.varDeclsIn(iter, out);
+      return;
+    }
     if (node.name === "var-expr") for (const nm of this.bindingNames(this.letBinding(node))) out.add(nm);
     for (const k of node.kids) this.varDeclsIn(k, out);
   }
   // Free variables referenced inside ANY closure nested in `node` (i.e. names a
-  // nested lambda/fun would capture from an enclosing scope).
+  // nested lambda/fun — or a `for` body, which becomes a lambda — would capture).
   private freeInNestedClosures(node: CstNode, out: Set<string>): void {
     if (node.name === "lambda-expr" || node.name === "fun-expr") {
       this.freeVars(node, new Set()).forEach((n) => out.add(n));
       // still descend so we also see closures nested inside this one
+    }
+    if (node.name === "for-expr") {
+      // for body compiles to a lambda -> it captures its free vars (minus loop vars).
+      const body = this.childNamed(node, "block");
+      if (body) this.freeVars(body, this.forBindVars(node)).forEach((n) => out.add(n));
     }
     for (const k of node.kids) this.freeInNestedClosures(k, out);
   }
