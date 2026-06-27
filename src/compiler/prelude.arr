@@ -689,6 +689,8 @@ fun num-is-positive(n): n > 0 end
 fun num-is-negative(n): n < 0 end
 fun num-is-non-positive(n): n <= 0 end
 fun num-is-non-negative(n): n >= 0 end
+# num-equal: Boolean numeric equality (Pyret builtin; corpus uses it as a HOF arg too)
+fun num-equal(a, b): a == b end
 # PI as a roughnum constant (irrational)
 PI = ~3.141592653589793
 # join-str: like string-join but tostrings each element first
