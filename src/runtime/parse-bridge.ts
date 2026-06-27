@@ -89,6 +89,17 @@ export const TAGS = {
   PROVIDEBLOCK: 70, // s-provide-block: kids = [PSPECS]
   PSPEC: 71, // s-provide-name: str = name
   PSPECS: 72, // helper: a List<ProvideSpec>
+  // --- round 5 (corpus blockers) ---
+  CHECK: 73, // s-check: str = "check"|"examples" (keyword-check), kids = [body] | [NAMESTR(name), body]
+  TYPE: 74, // s-type: str = name, kids = [ann]
+  ASSIGN: 75, // s-assign: str = name, kids = [value]
+  INST: 76, // s-instantiate: kids = [expr, ANNS(params)]
+  UPDATE: 77, // s-update: kids = [supe, MEMBERS]
+  TABLE: 78, // s-table: kids = [HEADERS, ROWS]
+  FIELDNAME: 79, // s-field-name: str = name
+  HEADERS: 80, // helper: a List<FieldName>
+  TABLEROW: 81, // s-table-row: kids = [EXPRS(elems)]
+  ROWS: 82, // helper: a List<TableRow>
 } as const;
 
 // One node of the flat pre-order stream. `nkids` children follow immediately
@@ -293,6 +304,34 @@ function toExpr(orig: CstNode): AstNode {
       return node(TAGS.OBJ, "", [
         node(TAGS.MEMBERS, "", lowerFields(n, "obj-fields", "obj-field")),
       ]);
+    case "check-expr":
+      return checkExpr(n);
+    case "type-expr": {
+      // TYPE NAME ty-params = ann  ->  s-type (params dropped for now).
+      const name = n.kids.find((k) => k.name === "NAME")?.value ?? "";
+      const annNode = n.kids.find((k) => k.name === "ann");
+      return node(TAGS.TYPE, name, [annNode ? toAnn(annNode) : node(TAGS.ABLANK, "")]);
+    }
+    case "assign-expr": {
+      // NAME := binop-expr  ->  s-assign.
+      const name = n.kids.find((k) => k.name === "NAME")?.value ?? "";
+      const value = toExpr(n.kids.find((k) => k.name === "binop-expr")!);
+      return node(TAGS.ASSIGN, name, [value]);
+    }
+    case "inst-expr": {
+      // expr < ann (, ann)* >  ->  s-instantiate.
+      const base = toExpr(n.kids.find((k) => k.name === "expr")!);
+      const params = n.kids.filter((k) => k.name === "ann").map(toAnn);
+      return node(TAGS.INST, "", [base, node(TAGS.ANNS, "", params)]);
+    }
+    case "update-expr": {
+      // expr ! { fields }  ->  s-update (fields are s-data-field members).
+      const supe = toExpr(n.kids.find((k) => k.name === "expr")!);
+      const members = lowerFields(n);
+      return node(TAGS.UPDATE, "", [supe, node(TAGS.MEMBERS, "", members)]);
+    }
+    case "table-expr":
+      return tableExpr(n);
     default:
       if (n.kids.length === 1) return toExpr(n.kids[0]!);
       throw new Error(`parse-bridge: unhandled CST node '${n.name}'`);
@@ -337,6 +376,44 @@ function construct(n: CstNode): AstNode {
   const valsNode = n.kids.find((k) => k.name === "trailing-opt-comma-binops");
   const values = valsNode ? commaBinops(valsNode) : [];
   return node(TAGS.CONSTRUCT, "", [ctor, node(TAGS.EXPRS, "", values)]);
+}
+
+// check-expr: `check:`/`check "name":`/`examples:` block END  ->  s-check.
+function checkExpr(n: CstNode): AstNode {
+  const isExamples = n.kids.some((k) => k.name === "EXAMPLESCOLON");
+  const keyword = isExamples ? "examples" : "check"; // keyword-check boolean
+  const body = toBlock(n.kids.find((k) => k.name === "block")!);
+  const strNode = n.kids.find((k) => k.name === "STRING");
+  if (strNode) {
+    return node(TAGS.CHECK, keyword, [node(TAGS.NAMESTR, stripStr(strNode.value ?? "")), body]);
+  }
+  return node(TAGS.CHECK, keyword, [body]);
+}
+
+// table-expr: TABLE table-headers table-rows END  ->  s-table.
+function tableExpr(n: CstNode): AstNode {
+  const headers: AstNode[] = [];
+  const headersNode = n.kids.find((k) => k.name === "table-headers");
+  if (headersNode) {
+    (function walkH(x: CstNode) {
+      if (x.name === "table-header") {
+        headers.push(node(TAGS.FIELDNAME, x.kids.find((k) => k.name === "NAME")?.value ?? ""));
+        return;
+      }
+      for (const k of x.kids) walkH(k);
+    })(headersNode);
+  }
+  const rows: AstNode[] = [];
+  const rowsNode = n.kids.find((k) => k.name === "table-rows");
+  if (rowsNode) {
+    for (const r of rowsNode.kids) {
+      if (r.name !== "table-row") continue;
+      const itemsNode = r.kids.find((k) => k.name === "table-items");
+      const elems = itemsNode ? commaBinops(itemsNode) : [];
+      rows.push(node(TAGS.TABLEROW, "", [node(TAGS.EXPRS, "", elems)]));
+    }
+  }
+  return node(TAGS.TABLE, "", [node(TAGS.HEADERS, "", headers), node(TAGS.ROWS, "", rows)]);
 }
 
 // data-expr: DATA NAME ty-params : data-variant* data-with? data-sharing where? END

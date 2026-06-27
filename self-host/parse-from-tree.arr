@@ -88,6 +88,16 @@ INCLUDEFILE = 69
 PROVIDEBLOCK = 70
 PSPEC = 71
 PSPECS = 72
+CHECK = 73
+TYPE = 74
+ASSIGN = 75
+INST = 76
+UPDATE = 77
+TABLE = 78
+FIELDNAME = 79
+HEADERS = 80
+TABLEROW = 81
+ROWS = 82
 
 # Shared read cursor into the flat pre-order stream.
 var cursor = 0
@@ -241,6 +251,21 @@ fun build-node(tag, s, kids):
   else if tag == PSPEC:
     A.s-provide-name(l, A.s-module-ref(l, [list: A.s-name(l, s)], none))
   else if tag == PSPECS: kids   # a List<ProvideSpec>
+  else if tag == CHECK:
+    # str = "check"|"examples" (keyword-check); name present iff 2 kids.
+    has-name = kids.length() >= 2
+    name = if has-name: some(kids.get(0)) else: none end
+    body = if has-name: kids.get(1) else: kids.get(0) end
+    A.s-check(l, name, body, s == "check")
+  else if tag == TYPE: A.s-type(l, A.s-name(l, s), empty, kids.get(0))
+  else if tag == ASSIGN: A.s-assign(l, A.s-name(l, s), kids.get(0))
+  else if tag == INST: A.s-instantiate(l, kids.get(0), kids.get(1))
+  else if tag == UPDATE: A.s-update(l, kids.get(0), kids.get(1))
+  else if tag == TABLE: A.s-table(l, kids.get(0), kids.get(1))
+  else if tag == FIELDNAME: A.s-field-name(l, s, A.a-blank)
+  else if tag == HEADERS: kids   # a List<FieldName>
+  else if tag == TABLEROW: A.s-table-row(l, kids.get(0))
+  else if tag == ROWS: kids   # a List<TableRow>
   else if tag == BIND: mk-bind(l, s)
   else if tag == PROGRAM:
     # `provide { ... }` (flag "block") prepends the provide expr as a leading kid,

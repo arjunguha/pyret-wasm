@@ -86,6 +86,15 @@ const FORMS: Array<[string, string]> = [
   ["(5)", "s-paren"],
   ["spy: x end", "s-spy-block"],
   ['spy "m": y: 2 end', "s-spy-block"],
+  // round 5 (corpus blockers)
+  ["check: 5 is 5 end", "s-check"],
+  ['check "n": 5 is 5 end', "s-check"],
+  ["examples: 5 is 5 end", "s-check"],
+  ["type N = Number", "s-type"],
+  ["x := 5", "s-assign"],
+  ["f<Number>", "s-instantiate"],
+  ["o!{a: 1}", "s-update"],
+  ["table: a, b\n  row: 1, 2\nend", "s-table"],
 ];
 
 test("surface-parse: rebuilds the right ast.arr ctor for each core form", async () => {
