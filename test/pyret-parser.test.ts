@@ -31,15 +31,11 @@ test("pure-Pyret parser compiles clean under the seed (-> valid wasm)", async ()
   expect(Array.from(wasm.slice(0, 4))).toEqual([0, 0x61, 0x73, 0x6d]); // \0asm
 });
 
-// TRIPWIRE: end-to-end parsing is gated on the front-end module-init fix (every
-// ast.arr-importing program null-refs at load today).  Delete this test and
-// uncomment the real one below once that lane lands.
-test("pure-Pyret parser: end-to-end is gated on the ast-load fix (tripwire)", async () => {
-  const wasm = await buildSourceFile(PROBE);
-  await expect(run(wasm)).rejects.toThrow(/null reference/);
+// END-TO-END: the pure-Pyret parser parses real source into the real ast.arr AST,
+// entirely in Pyret (no JS).  (ast.arr loads fine in the seed — only desugar/
+// well-formed/resolve-scope hit the module-init null-ref, which the parser doesn't
+// import — so this runs today.)
+test("pure-Pyret parser: parses fun + app into the real AST", async () => {
+  const r = await run(await buildSourceFile(PROBE));
+  expect(r.output.trim()).toBe("s-fun s-app");
 });
-
-// test("pure-Pyret parser: parses fun + app into the real AST", async () => {
-//   const r = await run(await buildSourceFile(PROBE));
-//   expect(r.output.trim()).toBe("s-fun s-app");
-// });
