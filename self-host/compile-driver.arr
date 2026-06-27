@@ -83,6 +83,19 @@ end
 
 # ── cases-based AST desugaring (no visit()) ──────────────────────────────────
 #
+# FUTURE: switch to Pyret's REAL desugar pass (self-compiler/compiler/desugar.arr).
+#   `desugar(program)` (desugar.arr:116) is cases-based and natively handles s-op,
+#   s-id, s-check/s-check-test, s-data-expr, etc. — it would collapse most of the
+#   hand-written cases below AND give full-language coverage.  `.visit()` now works
+#   (the seed's _match/$variant_match fix), so the visitor-based parts run.
+#   THE BLOCKER: desugar expects the AST in resolve-scope's OUTPUT shape — resolved
+#   id forms (s-id-letrec/s-id-var/s-global), s-data-expr (not s-data), core
+#   let/letrec.  Producing that means running desugar-scope(prog, env) +
+#   resolve-names(p, uri, env) (resolve-scope.arr:576/667) first, both of which take
+#   a C.CompileEnvironment.  So the remaining work is constructing a minimal
+#   CompileEnvironment (globals + module provides) — not the visitor mechanism.
+#   Until then this hand-written desugar covers the supported subset.
+#
 # Converts forms that ANF doesn't handle to forms it does:
 #   s-op        -> s-app-enriched( s-id(s-global(…)), [lhs, rhs] )
 #   s-app       -> s-app-enriched( f, args )
