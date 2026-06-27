@@ -317,6 +317,47 @@ class Compiler {
     throw new CompileError("could not extract binding name", binding);
   }
 
+  // Tuple-binding `{a; b; ...}` -> its component binding nodes, else null.
+  private tupleComponents(binding: CstNode): CstNode[] | null {
+    let n: CstNode | undefined = binding;
+    while (n && (n.name === "toplevel-binding" || n.name === "binding")) {
+      const tb = this.childNamed(n, "tuple-binding");
+      if (tb) return tb.kids.filter((k) => k.name === "binding");
+      if (this.childNamed(n, "name-binding")) break;
+      n = n.kids[0];
+    }
+    return null;
+  }
+
+  // All names introduced by a binding (recursively flattening tuple bindings).
+  private bindingNames(binding: CstNode): string[] {
+    const comps = this.tupleComponents(binding);
+    if (comps) return comps.flatMap((c) => this.bindingNames(c));
+    return [this.bindingName(binding)];
+  }
+
+  // Bind `value` to `binding` (a name, or a tuple-destructure) as local(s), appending
+  // the resulting local.set statements to `parts`. Tuple: store in a temp, then bind
+  // each component to `temp.{i}` via $variant_field (tuples are variant id 0).
+  private emitBinding(binding: CstNode, value: number, ctx: Ctx, parts: number[]): void {
+    const m = this.m;
+    const comps = this.tupleComponents(binding);
+    if (comps) {
+      const tmp = ctx.addLocal(binaryen.anyref);
+      parts.push(m.local.set(tmp, value));
+      comps.forEach((c, i) => {
+        const field = m.call("$variant_field",
+          [m.ref.cast(m.local.get(tmp, binaryen.anyref), this.t.VariantRef), m.i32.const(i)], binaryen.anyref);
+        this.emitBinding(c, field, ctx, parts);
+      });
+    } else {
+      const name = this.bindingName(binding);
+      const idx = ctx.addLocal(binaryen.anyref);
+      ctx.locals.set(name, idx);
+      parts.push(m.local.set(idx, ctx.boxed.has(name) ? this.makeBox(value) : value));
+    }
+  }
+
   private headerParams(fnLike: CstNode): string[] {
     const header = this.childNamed(fnLike, "fun-header");
     const args = header && this.childNamed(header, "args");
@@ -508,7 +549,7 @@ class Compiler {
       const b2 = new Set(bound);
       for (const stmt of node.kids.filter((k) => k.name === "stmt")) {
         const inner = this.only(stmt);
-        if (inner.name === "let-expr") b2.add(this.bindingName(inner.kids[0]!));
+        if (inner.name === "let-expr") for (const nm of this.bindingNames(this.letBinding(inner))) b2.add(nm);
         else if (inner.name === "fun-expr") { const nm = this.childNamed(inner, "NAME"); if (nm) b2.add(nm.value!); }
       }
       for (const k of node.kids) add(this.freeVars(k, b2));
@@ -518,14 +559,14 @@ class Compiler {
       const b2 = new Set(bound);
       const argsNode = this.childNamed(node, "cases-args");
       if (argsNode) for (const cb of argsNode.kids.filter((k) => k.name === "cases-binding")) {
-        b2.add(this.bindingName(this.childNamed(cb, "binding") ?? cb));
+        for (const nm of this.bindingNames(this.childNamed(cb, "binding") ?? cb)) b2.add(nm);
       }
       for (const k of node.kids) add(this.freeVars(k, b2));
       return out;
     }
     if (node.name === "multi-let-expr" || node.name === "letrec-expr") {
       const b2 = new Set(bound);
-      for (const b of this.multiLetBinds(node)) b2.add(this.bindingName(this.letBinding(b)));
+      for (const b of this.multiLetBinds(node)) for (const nm of this.bindingNames(this.letBinding(b))) b2.add(nm);
       for (const k of node.kids) add(this.freeVars(k, b2));
       return out;
     }
@@ -547,7 +588,7 @@ class Compiler {
   // Names declared via `var` within `node`, NOT descending into nested closures.
   private varDeclsIn(node: CstNode, out: Set<string>): void {
     if (node.name === "lambda-expr" || node.name === "fun-expr") return; // separate scope
-    if (node.name === "var-expr") out.add(this.bindingName(this.letBinding(node)));
+    if (node.name === "var-expr") for (const nm of this.bindingNames(this.letBinding(node))) out.add(nm);
     for (const k of node.kids) this.varDeclsIn(k, out);
   }
   // Free variables referenced inside ANY closure nested in `node` (i.e. names a
@@ -1283,10 +1324,10 @@ class Compiler {
       const savedLocals = new Map(ctx.locals);
       const prep: number[] = [];
       bindings.forEach((cb, j) => {
-        const bname = this.bindingName(this.childNamed(cb, "binding") ?? cb);
-        const slot = ctx.addLocal(binaryen.anyref);
-        ctx.locals.set(bname, slot);
-        prep.push(m.local.set(slot, m.call("$variant_field", [scrutGet(), m.i32.const(j)], binaryen.anyref)));
+        // bind the j-th field to this pattern binding (name or tuple-destructure).
+        const cbBinding = this.childNamed(cb, "binding") ?? cb;
+        const fieldVal = m.call("$variant_field", [scrutGet(), m.i32.const(j)], binaryen.anyref);
+        this.emitBinding(cbBinding, fieldVal, ctx, prep);
       });
       const branchBlock = this.childNamed(br, "block")!;
       const branchBody = m.block(null, [...prep, this.compileBlock(branchBlock, ctx, tail)], binaryen.anyref);
@@ -1404,13 +1445,13 @@ class Compiler {
   }
 
   private compileLet(letExpr: CstNode, ctx: Ctx): number {
-    const name = this.bindingName(this.letBinding(letExpr));
+    const binding = this.letBinding(letExpr);
     const value = this.compileExpr(letExpr.kids[letExpr.kids.length - 1]!, ctx, false);
-    const idx = ctx.addLocal(binaryen.anyref);
-    ctx.locals.set(name, idx);
-    // a captured `var` is stored in a shared box cell (see resolveName/unbox).
-    const stored = ctx.boxed.has(name) ? this.makeBox(value) : value;
-    return this.m.local.set(idx, stored);
+    // emitBinding handles both a plain name and tuple destructuring `{a; b} = e`.
+    // (a captured `var` is boxed in a shared cell — see resolveName/unbox.)
+    const parts: number[] = [];
+    this.emitBinding(binding, value, ctx, parts);
+    return parts.length === 1 ? parts[0]! : this.m.block(null, parts, binaryen.none);
   }
 
   // `let a = e1, b = e2 (block|:) body end` / `letrec ...`. Desugar to a block whose

@@ -40,6 +40,18 @@ test("type-let-expr (erased) and var binding in a let", async () => {
   expect(await result("let var c = 0: block: c := c + 7\n c end end")).toBe("7");
 });
 
+// tuple-binding destructuring: in a let and in a cases pattern (incl. `_` + nested).
+test("tuple-binding destructuring (let + cases)", async () => {
+  expect(await result("block:\n  {a; b} = {10; 32}\n  a + b\nend")).toBe("42");
+  expect(await result("block:\n  {a; b; c} = {1; 2; 3}\n  (a + b) + c\nend")).toBe("6");
+  expect(await result("block:\n  {x; _} = {7; 99}\n  x\nend")).toBe("7");
+  const cs = `
+data Box: | bx(t) end
+fun f(v): cases(Box) v: | bx({a; b}) => a + b end end
+f(bx({3; 4}))`;
+  expect(await result(cs)).toBe("7");
+});
+
 // letrec: names in scope for all bind values -> (mutual) recursion via boxed cells.
 test("letrec-expr supports self- and mutual recursion", async () => {
   expect(await result("letrec a = 3, b = 4: a * b end")).toBe("12");
