@@ -1127,6 +1127,17 @@ class Compiler {
     if (name === "identical" && args.length === 2) {
       return this.mkBool(m.ref.eq(m.ref.cast(args[0]!, binaryen.eqref), m.ref.cast(args[1]!, binaryen.eqref)));
     }
+    // equal-always / equal-now: structural equality (the same runtime fn `==` uses).
+    if ((name === "equal-always" || name === "equal-now") && args.length === 2) {
+      return this.mkBool(m.call("$equal", [args[0]!, args[1]!], binaryen.i32));
+    }
+    // string-to-code-point: the (byte) code point of a 1-char string -> a fixnum.
+    // (string-to-code-points yields byte values, so this is the singular form.)
+    if (name === "string-to-code-point" && args.length === 1) {
+      return m.call("$make_fix",
+        [m.i64.extend_u(m.array.get(m.ref.cast(args[0]!, this.t.StrRef), m.i32.const(0), binaryen.i32, false))],
+        this.t.FixnumRef);
+    }
     // Raw arrays = a $Fields (array (mut anyref)). The rest of the raw-array library
     // (to-list/map/each/fold) is built on these in the prelude.
     if (name === "raw-array-get" && args.length === 2) {
@@ -1244,6 +1255,22 @@ class Compiler {
       if (name === "num-to-scientific") {
         return m.call("$tostring", [this.asNum(args[0]!)], this.t.StrRef);
       }
+      // num-to-rational: exact -> passthrough; roughnum -> nearest exact integer (best-effort).
+      if (name === "num-to-rational") {
+        const v = ctx.addLocal(this.t.NumRef);
+        const get = () => m.local.get(v, this.t.NumRef);
+        return m.block(null, [
+          m.local.set(v, this.asNum(args[0]!)),
+          m.if(m.i32.eq(m.struct.get(0, get(), binaryen.i32, false), m.i32.const(2)),
+            m.call("$make_fix", [m.i64.trunc_s.f64(m.f64.nearest(m.call("$to_f64", [get()], binaryen.f64)))], this.t.FixnumRef),
+            get(), this.t.NumRef),
+        ], binaryen.anyref);
+      }
+    }
+    // num-to-string-digits(n, d): stub — ignores the digit count, returns the plain
+    // numeric string. (2-arg, so outside the args.length===1 block above.)
+    if (name === "num-to-string-digits" && args.length === 2) {
+      return m.call("$tostring", [this.asNum(args[0]!)], this.t.StrRef);
     }
     if ((name === "print" || name === "display" || name === "print-error") && args.length === 1) {
       const argLocal = ctx.addLocal(binaryen.anyref);
