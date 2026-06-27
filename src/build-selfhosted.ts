@@ -36,12 +36,15 @@ export async function compileSelfHostedDriver(): Promise<Uint8Array> {
 }
 
 // Run the self-hosted compiler driver MODULE on a source string, returning the WASM
-// module bytes it emits. The driver reads its input via `read-source()`
-// (state.sourceBytes) and the surface parser via the JS-GLR bridge (state.parseNodes).
+// module bytes it emits. The driver parses its input with the pure-Pyret parser via
+// `read-source()` (state.sourceBytes) — NO JavaScript. The JS-GLR bridge
+// (state.parseNodes) is vestigial (surface-parse no longer uses it); we still prime it
+// best-effort, but a bridge gap must NOT abort the build — the no-JS parser handles
+// forms (contract-stmt/newtype/...) the old bridge can't serialize.
 export async function compileWithDriver(driverWasm: Uint8Array, src: string): Promise<Uint8Array> {
   const state = newHostState(() => {}); // discard the compiler's own stdout
   state.sourceBytes = new TextEncoder().encode(src);
-  state.parseNodes = serializeCst(await parsePyret(src)); // prime the JS-GLR surface-parse bridge
+  try { state.parseNodes = serializeCst(await parsePyret(src)); } catch { /* vestigial JS-GLR bridge; the no-JS parser reads sourceBytes */ }
   const { instance } = await WebAssembly.instantiate(driverWasm as BufferSource, buildHostImports(state));
   state.instance = instance;
   state.memory = instance.exports.memory as WebAssembly.Memory;

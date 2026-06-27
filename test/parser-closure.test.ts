@@ -38,6 +38,12 @@ const CLOSURE_FILES = [
   "../self-compiler/trove/ast.arr",               // the 3739-LOC AST (memory + constant-stack)
   "../self-compiler/compiler/desugar.arr",
   "../self-host/wasm-of-pyret.arr",
+  // These were FALSELY flagged as parse blockers by the obsolete JS-GLR bridge
+  // (serializeCst: "unhandled CST node contract-stmt" / "Parse error near import").
+  // The no-JS parser (which surface-parse now uses) handles them fine.
+  "../self-compiler/trove/tables.arr",            // top-level `contract-stmt` declarations
+  "../self-compiler/trove/timing.arr",            // top-level `contract-stmt` declarations
+  "../self-compiler/trove/starter2024.arr",       // an import spec the bridge rejected
 ];
 
 test("pure-Pyret parser parses the whole self-hosted closure (representative files)", async () => {
