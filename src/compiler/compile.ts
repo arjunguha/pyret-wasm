@@ -96,8 +96,8 @@ class Compiler {
   topScope = new Map<string, string>(); // pyret name -> wasm global name
   moduleAliases = new Set<string>();    // `import lib as N` -> N (resolved to globals)
   fnNames: string[] = [];               // table entries (index = position)
-  ctorFns = new Map<string, number>();  // variant name -> table index of its constructor wrapper
-  predFns = new Map<string, number>();  // variant name -> table index of its is-<v> predicate wrapper
+  ctorFns = new Map<number, number>();  // variant ID -> table index of its constructor wrapper
+  predFns = new Map<number, number>();  // variant ID -> table index of its is-<v> predicate wrapper
   typePredFns = new Map<string, number>(); // data TYPE name -> table index of its is-<Type> predicate
   dataTypeRanges = new Map<string, { min: number; max: number }>(); // data type name -> [min,max] variant id range
   tostringFns = new Map<string, number>(); // tostring/torepr reified as first-class fns
@@ -427,6 +427,25 @@ class Compiler {
     return this.variantGens.get(name)?.find((g) => g.mod === mod)?.info;
   }
 
+  // Module-aware BARE variant lookup: a bare reference to variant `name` inside module
+  // M resolves to M's OWN variant of that name (true module scoping), so two modules
+  // that legitimately define the same variant name (e.g. `a-app` in both ast.arr and
+  // ast-anf.arr) don't alias under flat-namespace merging — each module's bare refs use
+  // its own variant id, so construction/cases/predicate dispatch is correct. Falls back
+  // to the last-wins entry when the referrer module doesn't define it (included/prelude/
+  // global names, single-definer variants, or Infinity/entry contexts).
+  private variantFor(name: string): VariantInfo | undefined {
+    const gens = this.variantGens.get(name);
+    if (!gens || gens.length === 0) return this.variants.get(name);
+    if (gens.length === 1) return gens[0]!.info;
+    const mod = this.orderToMod.get(this.resolveOrder);
+    if (mod !== undefined) {
+      const own = gens.find((g) => g.mod === mod);
+      if (own) return own.info;
+    }
+    return this.variants.get(name); // last-wins fallback (referrer doesn't define it)
+  }
+
   // The module a `N.member` access targets: importer = the module of the top-level
   // item currently compiling (orderToMod[resolveOrder]); look its alias up. Undefined
   // when unknown -> caller falls back to legacy first/last-wins resolution.
@@ -715,7 +734,7 @@ class Compiler {
   // Reify a data constructor as a first-class function (uniform calling convention:
   // reads its args from the args array and builds the variant). Generated once.
   private constructorFnIndex(name: string, info: VariantInfo): number {
-    if (this.ctorFns.has(name)) return this.ctorFns.get(name)!;
+    if (this.ctorFns.has(info.id)) return this.ctorFns.get(info.id)!;
     const m = this.m;
     const fnIndex = this.fnNames.length;
     const wasmName = "$ctor_" + fnIndex + "_" + name;
@@ -723,14 +742,14 @@ class Compiler {
     const argAt = (i: number) => m.array.get(m.local.get(1, this.t.FieldsRefNull), m.i32.const(i), binaryen.anyref, false);
     const body = this.makeVariant(name, info, info.fields.map((_, i) => argAt(i)));
     m.addFunction(wasmName, this.sig, binaryen.anyref, [], body);
-    this.ctorFns.set(name, fnIndex);
+    this.ctorFns.set(info.id, fnIndex);
     return fnIndex;
   }
   // Reify an is-<variant> predicate as a first-class function.
-  private predicateFnIndex(vname: string): number {
-    if (this.predFns.has(vname)) return this.predFns.get(vname)!;
+  private predicateFnIndex(vname: string, info: VariantInfo): number {
+    if (this.predFns.has(info.id)) return this.predFns.get(info.id)!;
     const m = this.m;
-    const v = this.variants.get(vname)!;
+    const v = info;
     const fnIndex = this.fnNames.length;
     const wasmName = "$is_" + fnIndex + "_" + vname;
     this.fnNames.push(wasmName);
@@ -739,7 +758,7 @@ class Compiler {
       m.i32.eq(m.call("$variant_id", [m.ref.cast(arg(), this.t.VariantRef)], binaryen.i32), m.i32.const(v.id)),
       m.i32.const(0), binaryen.i32));
     m.addFunction(wasmName, this.sig, binaryen.anyref, [], body);
-    this.predFns.set(vname, fnIndex);
+    this.predFns.set(info.id, fnIndex);
     return fnIndex;
   }
 
@@ -785,7 +804,7 @@ class Compiler {
       return vv.fields.length === 0 ? this.makeVariant(name, vv, []) : this.makeClosure(this.constructorFnIndex(name, vv), [], ctx);
     }
     if (this.topScope.has(name)) return m.global.get(this.globalFor(name)!, binaryen.anyref);
-    const v = this.variants.get(name);
+    const v = this.variantFor(name);
     if (v) {
       // nullary variant -> the singleton value; with fields -> a constructor function.
       if (v.fields.length === 0) return this.makeVariant(name, v, []);
@@ -793,7 +812,8 @@ class Compiler {
     }
     // bare `is-<variant>` -> a first-class predicate function.
     if (name.startsWith("is-") && this.variants.has(name.slice(3))) {
-      return this.makeClosure(this.predicateFnIndex(name.slice(3)), [], ctx);
+      const pv = this.variantFor(name.slice(3))!;
+      return this.makeClosure(this.predicateFnIndex(name.slice(3), pv), [], ctx);
     }
     // bare `is-<TypeName>` -> the data-type predicate (any variant of that type).
     if (name.startsWith("is-") && this.dataTypeRanges.has(name.slice(3))) {
@@ -1547,11 +1567,11 @@ class Compiler {
     // resolveModuleMember/variantForMod). See test/module-collision.test.ts + the
     // analysis in self-host/NAMESPACE-NOTES.md.
     if (name && this.variants.has(name) && !this.isLocallyBound(name, ctx)
-        && this.variants.get(name)!.fields.length === args.length) {
-      return this.makeVariant(name, this.variants.get(name)!, args);
+        && this.variantFor(name)!.fields.length === args.length) {
+      return this.makeVariant(name, this.variantFor(name)!, args);
     }
     if (name && name.startsWith("is-") && this.variants.has(name.slice(3)) && args.length === 1 && !this.isBound(name, ctx)) {
-      const v = this.variants.get(name.slice(3))!;
+      const v = this.variantFor(name.slice(3))!;
       const arg = args[0]!;
       return this.mkBool(m.if(m.ref.test(arg, this.t.VariantRefNull),
         m.i32.eq(m.call("$variant_id", [m.ref.cast(arg, this.t.VariantRef)], binaryen.i32), m.i32.const(v.id)),
@@ -2233,7 +2253,7 @@ class Compiler {
     for (let i = branches.length - 1; i >= 0; i--) {
       const br = branches[i]!;
       const vname = this.childNamed(br, "NAME")!.value!;
-      const info = this.variants.get(vname);
+      const info = this.variantFor(vname);
       // Real Pyret tolerates a cases branch naming a variant that isn't a
       // constructor of the scrutinee's type — a dead branch that can never match
       // (e.g. ast-anf.arr's `cases(ALettable) ... | a-array` where ALettable has
