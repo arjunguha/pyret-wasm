@@ -1625,6 +1625,12 @@ class Compiler {
     if (name === "num-expt" && args.length === 2) {
       return m.call("$num_expt", [this.asNum(args[0]!), this.asNum(args[1]!)], this.t.NumRef);
     }
+    // num-atan2(y, x): transcendental, host-computed, roughnum result (2-arg).
+    if (name === "num-atan2" && args.length === 2) {
+      return m.call("$make_rough", [m.call("$math2",
+        [m.i32.const(0), m.call("$to_f64", [this.asNum(args[0]!)], binaryen.f64),
+         m.call("$to_f64", [this.asNum(args[1]!)], binaryen.f64)], binaryen.f64)], this.t.RoughnumRef);
+    }
     if (name === "string-equal" && args.length === 2) {
       return this.mkBool(m.call("$str_equal",
         [m.ref.cast(args[0]!, this.t.StrRef), m.ref.cast(args[1]!, this.t.StrRef)], binaryen.i32));
@@ -1749,6 +1755,21 @@ class Compiler {
       if (name === "num-sqrt") {
         return m.call("$make_rough",
           [m.f64.sqrt(m.call("$to_f64", [this.asNum(args[0]!)], binaryen.f64))], this.t.RoughnumRef);
+      }
+      // Transcendentals: no native WASM op, computed by the host (JS Math) via the
+      // $math1/$math2 imports; always return roughnums. op codes mirror run.ts/runtime.ts.
+      {
+        const f64Of = (x: number) => m.call("$to_f64", [this.asNum(x)], binaryen.f64);
+        const math1 = (op: number) => m.call("$make_rough",
+          [m.call("$math1", [m.i32.const(op), f64Of(args[0]!)], binaryen.f64)], this.t.RoughnumRef);
+        if (name === "num-exp") return math1(0);
+        if (name === "num-log") return math1(1);
+        if (name === "num-sin") return math1(2);
+        if (name === "num-cos") return math1(3);
+        if (name === "num-tan") return math1(4);
+        if (name === "num-atan") return math1(5);
+        if (name === "num-asin") return math1(6);
+        if (name === "num-acos") return math1(7);
       }
       // number-kind predicates (NUM_TAG: FIX=0, RATIONAL=1, ROUGH=2, BIGNUM=3)
       {
@@ -2324,6 +2345,26 @@ class Compiler {
         m.call("$check_pred", [op === "RAISESNOT" ? m.i32.eqz(raised) : raised], binaryen.none),
       ]);
     }
+    if (op === "ISROUGHLY" || op === "ISNOTROUGHLY") {
+      // lhs is-roughly rhs: numeric comparison within a DEFAULT relative tolerance
+      // (1e-6), the implicit refinement Pyret uses for `is-roughly`. Reuses the
+      // refine check path so both values are rendered on failure.
+      const isNeg = op === "ISNOTROUGHLY";
+      const lLoc = ctx.addLocal(binaryen.anyref);
+      const rLoc = ctx.addLocal(binaryen.anyref);
+      const fa = () => m.call("$to_f64", [this.asNum(m.local.get(lLoc, binaryen.anyref))], binaryen.f64);
+      const fb = () => m.call("$to_f64", [this.asNum(m.local.get(rLoc, binaryen.anyref))], binaryen.f64);
+      const diff = m.f64.abs(m.f64.sub(fa(), fb()));
+      const scale = m.f64.max(m.f64.max(m.f64.abs(fa()), m.f64.abs(fb())), m.f64.const(1));
+      const ok = m.f64.le(diff, m.f64.mul(m.f64.const(1e-6), scale));
+      const okI = isNeg ? m.i32.eqz(ok) : ok;
+      return m.block(null, [
+        m.local.set(lLoc, this.compileExpr(lhs, ctx, false)),
+        m.local.set(rLoc, this.compileExpr(rhs, ctx, false)),
+        m.call(isNeg ? "$check_isnot_refine" : "$check_is_refine",
+          [m.local.get(lLoc, binaryen.anyref), m.local.get(rLoc, binaryen.anyref), okI], binaryen.none),
+      ]);
+    }
     throw new CompileError(`unsupported check operator: ${op}`, opNode);
   }
 
@@ -2451,7 +2492,15 @@ class Compiler {
     const m = this.m;
     let s = text, rough = false;
     if (s.startsWith("~")) { rough = true; s = s.slice(1); }
-    if (rough || /[.eE]/.test(s)) return m.call("$make_rough", [m.f64.const(parseFloat(s))], this.t.RoughnumRef);
+    // `~3.14` is a roughnum; a bare decimal like `3.14` / `0.1` / `1e3` is an EXACT
+    // rational in Pyret (NOT a float): 3.14 = 157/50, 0.1 = 1/10. Only `~`-prefixed
+    // literals are roughnums.
+    if (rough) return m.call("$make_rough", [m.f64.const(parseFloat(s))], this.t.RoughnumRef);
+    if (/[.eE]/.test(s)) {
+      const [num, den] = decimalToRational(s);
+      if (den === 1n) return this.intLiteral(num);
+      return m.call("$make_rat", [this.intLiteral(num), this.intLiteral(den)], this.t.NumRef);
+    }
     return this.intLiteral(BigInt(s));
   }
 
@@ -2483,6 +2532,26 @@ class Compiler {
     if (rough) return m.call("$make_rough", [m.f64.const(Number(n) / Number(d))], this.t.RoughnumRef);
     return m.call("$make_rat", [this.intLiteral(BigInt(n!)), this.intLiteral(BigInt(d!))], this.t.NumRef);
   }
+}
+
+// Parse a bare decimal / scientific literal (e.g. "3.14", "0.1", "1e3", "1.5e-2")
+// into an EXACT rational numerator/denominator (Pyret semantics: decimals are exact).
+// make_rat reduces, so the result is e.g. 0.1 -> 1/10, 3.14 -> 157/50, 2.0 -> 2/1.
+function decimalToRational(text: string): [bigint, bigint] {
+  let s = text, sign = 1n;
+  if (s[0] === "+") s = s.slice(1);
+  else if (s[0] === "-") { sign = -1n; s = s.slice(1); }
+  let exp = 0;
+  const eIdx = s.search(/[eE]/);
+  if (eIdx >= 0) { exp = parseInt(s.slice(eIdx + 1), 10); s = s.slice(0, eIdx); }
+  const dot = s.indexOf(".");
+  let fracLen = 0;
+  if (dot >= 0) { fracLen = s.length - dot - 1; s = s.slice(0, dot) + s.slice(dot + 1); }
+  let num = (s === "" ? 0n : BigInt(s)) * sign;
+  let den = 10n ** BigInt(fracLen);
+  if (exp > 0) num *= 10n ** BigInt(exp);
+  else if (exp < 0) den *= 10n ** BigInt(-exp);
+  return [num, den];
 }
 
 export function compile(program: CstNode, opts: {

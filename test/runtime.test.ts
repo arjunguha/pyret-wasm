@@ -45,6 +45,7 @@ async function instantiate() {
       read_source_into: () => 0,
       parse_source: () => 0, parse_node_tag: () => 0,
       parse_node_nkids: () => 0, parse_node_str_into: () => 0,
+      math1: () => 0, math2: () => 0,
     },
   });
   return instance.exports as any;

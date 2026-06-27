@@ -79,6 +79,13 @@ export class Runtime {
       binaryen.createType([binaryen.i32]), binaryen.i32);
     m.addFunctionImport("$parse_node_str_into", "host", "parse_node_str_into",
       binaryen.createType([binaryen.i32, binaryen.i32]), binaryen.i32);
+    // Transcendental math (no native WASM ops): the host computes via JS Math.
+    //   math1(op, x)    -> f64  (op: 0 exp,1 log,2 sin,3 cos,4 tan,5 atan,6 asin,7 acos)
+    //   math2(op, x, y) -> f64  (op: 0 atan2)
+    m.addFunctionImport("$math1", "host", "math1",
+      binaryen.createType([binaryen.i32, binaryen.f64]), binaryen.f64);
+    m.addFunctionImport("$math2", "host", "math2",
+      binaryen.createType([binaryen.i32, binaryen.f64, binaryen.f64]), binaryen.f64);
   }
 
   // $num_to_i32(anyref) -> i32 : low 32 bits of a fixnum (used by emit-byte etc.)
