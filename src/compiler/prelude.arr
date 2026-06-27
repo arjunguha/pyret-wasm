@@ -502,3 +502,42 @@ fun string-split(s, sep):
   end
 end
 fun string-replace(s, find, repl): string-join(string-split-all(s, find), repl) end
+
+# take-while: returns a 2-tuple {longest-prefix-where-pred-holds ; the-rest}
+fun take-while(pred, lst):
+  cases(List) lst:
+    | empty => { empty; empty }
+    | link(f, r) =>
+      if pred(f):
+        tw = take-while(pred, r)
+        { link(f, tw.{0}); tw.{1} }
+      else: { empty; lst }
+      end
+  end
+end
+
+# split-at: returns a record with .prefix (first n) and .suffix (the rest)
+data SplitAtResult: | split-at-result(prefix, suffix) end
+fun split-at(n, lst):
+  if n <= 0: split-at-result(empty, lst)
+  else:
+    cases(List) lst:
+      | empty => split-at-result(empty, empty)
+      | link(f, r) =>
+        sub = split-at(n - 1, r)
+        split-at-result(link(f, sub.prefix), sub.suffix)
+    end
+  end
+end
+
+# fold2: fold over two lists in lockstep; f(acc, e1, e2). Stops at the shorter list.
+fun fold2(f, base, l1, l2):
+  cases(List) l1:
+    | empty => base
+    | link(a, ra) =>
+      cases(List) l2:
+        | empty => base
+        | link(b, rb) => fold2(f, f(base, a, b), ra, rb)
+      end
+  end
+end
