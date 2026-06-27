@@ -185,6 +185,14 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         A.s-if-else(loc,
           [list: A.s-if-branch(loc, desugar-expr(lhs), A.s-bool(loc, true))],
           desugar-expr(rhs), false)
+      else if op-str == "op^":
+        # reverse application: `a ^ f` -> f(a)
+        A.s-app-enriched(loc, desugar-expr(rhs), [list: desugar-expr(lhs)], no-info)
+      else if op-str == "op<>":
+        # not-equal: `a <> b` -> not(a == b)   (mirrors the seed's NEQ = eqz($equal))
+        eq-app = A.s-app-enriched(loc, A.s-id(loc, A.s-global("equal-always")),
+          [list: desugar-expr(lhs), desugar-expr(rhs)], no-info)
+        A.s-prim-app(loc, "not", [list: eq-app], A.prim-app-info-c(false))
       else:
         gname = op-to-global(op-str)
         A.s-app-enriched(loc, A.s-id(loc, A.s-global(gname)),
@@ -206,7 +214,12 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), info)
 
     | s-block(loc, stmts) =>
-      A.s-block(loc, desugar-stmts(stmts))
+      ds = desugar-stmts(stmts)
+      # anf raises "Empty block" on an empty stmt list (e.g. a block whose only
+      # statements were erased type-aliases) — emit `nothing` instead.
+      if is-empty(ds): A.s-id(loc, A.s-name(loc, "nothing"))
+      else: A.s-block(loc, ds)
+      end
 
     | s-if-else(loc, branches, _else, blocky) =>
       A.s-if-else(loc,
@@ -219,6 +232,27 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         branches.map(lam(b): A.s-if-branch(b.l, desugar-expr(b.test), desugar-expr(b.body)) end),
         A.s-prim-app(loc, "throwNonBooleanCondition", [list:], A.prim-app-info-c(false)),
         blocky)
+
+    | s-when(loc, test, blk, blocky) =>
+      # `when c: body end` -> `if c: body ; nothing else: nothing end` (when yields nothing)
+      nothing-id = A.s-id(loc, A.s-name(loc, "nothing"))
+      A.s-if-else(loc,
+        [list: A.s-if-branch(loc, desugar-expr(test),
+            A.s-block(loc, [list: desugar-expr(blk), nothing-id]))],
+        nothing-id, blocky)
+
+    | s-if-pipe(loc, branches, blocky) =>
+      # `ask: | t then: b ... end` (no otherwise) -> nested if-else; no-match raises.
+      A.s-if-else(loc,
+        branches.map(lam(b): A.s-if-branch(b.l, desugar-expr(b.test), desugar-expr(b.body)) end),
+        A.s-prim-app(loc, "throwNoBranchesMatched", [list:], A.prim-app-info-c(false)),
+        blocky)
+
+    | s-if-pipe-else(loc, branches, _else, blocky) =>
+      # `ask: ... | otherwise: e end` -> nested if-else with `e` as the else.
+      A.s-if-else(loc,
+        branches.map(lam(b): A.s-if-branch(b.l, desugar-expr(b.test), desugar-expr(b.body)) end),
+        desugar-expr(_else), blocky)
 
     | s-lam(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
       A.s-lam(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), chk-loc, chk, blocky)
