@@ -66,21 +66,35 @@ Parser:
 - **`~` rough fractions** → `s-rfrac`.
 - **Real source locations** (see Design above) — line/col/char + source name.
 
+## Done in round 3
+
+- **`multi-let` / `letrec` / `type-let`** expressions (`let a = 1, b = 2: ... end`,
+  `letrec f = ...: ... end`, `type-let T = Ann: ... end` incl. `newtype` binds) →
+  `s-let-expr` / `s-letrec` / `s-type-let-expr`.
+- **Tuple-destructuring let** at statement position (`{a; b} [as n] = e`), via a
+  brace-depth lookahead (`tuple-let-ahead`) that tells `{...} =` (a tuple-let) apart
+  from a `{...}` tuple/object expression.
+- **`spy`** blocks (`spy [msg]: NAME, NAME: expr end`) → `s-spy-block` with
+  implicit-label and explicit `s-spy-expr` fields.
+- **Full check-op set**: `is` / `is==` / `is=~` / `is<=>` / `is-not` / `is-not==` /
+  `is-not=~` / `is-not<=>` / `is-roughly` / `is-not-roughly` / `raises` /
+  `raises-other-than` / `raises-satisfies` / `raises-violates` / `does-not-raise`
+  (postfix, no RHS) / `satisfies` / `violates`, plus the `%(refinement)` clause and
+  the `because <cause>` clause.  Check-op locs are now **real** (no longer dummy).
+- **Exact decimals** (`3.14` → `s-num` holding the exact rational `numer / 10^k`) and
+  **rough integers** (`~5` → `s-num` holding a roughnum, no longer an exact int).
+
 ## TODO(grammar) — to reach the full grammar
 
-- `type-let` / `multi-let` / `letrec` expressions; tuple-destructuring lets
-  (`{a; b} = e` at statement position — currently only binding positions).
-- `spy`, tables (`table:`/`select`/`sieve`/`order`/`extract`/`transform`/
-  `extend`/`load-table`), `reactor`.
-- Full check-op set (`is=~`, `is<=>`, `is-roughly`, `raises-satisfies`,
-  `because`, refinements `%(...)` on check-ops).
-- Real number literals (decimals/exponents → exact rationals; rough *integers*
-  currently fall back to `s-num`), full string escapes (`\u`, `\x`, octal),
-  triple-backtick strings.
-- Generics/instantiation `f<T>(...)` in expression position (currently `<`/`>` are
-  only comparison ops outside annotations).
+- tables (`table:`/`select`/`sieve`/`order`/`extract`/`transform`/`extend`/
+  `load-table`), `reactor`.
+- Decimal **exponents** (`3.14e5` — currently the integer part only), full string
+  escapes (`\u`, `\x`, octal), triple-backtick strings.
+- Generics/instantiation `f<T>(...)` in expression position (`<`/`>` lex as
+  comparison ops; needs the LANGLE-vs-LT whitespace distinction the real tokenizer
+  makes — genuinely ambiguous for plain recursive descent).
 - Reject mixed operators without parens (defer to well-formedness, as real Pyret).
-- The few remaining secondary `dummy-loc`s (check-op locs, pat-loc, where-loc).
+- The last couple of secondary `dummy-loc`s (pat-loc on cases binds, where-loc).
 
 ## Testing
 
