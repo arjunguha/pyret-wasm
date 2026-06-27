@@ -37,5 +37,6 @@ test("pure-Pyret parser compiles clean under the seed (-> valid wasm)", async ()
 // import — so this runs today.)
 test("pure-Pyret parser: parses fun + app into the real AST", async () => {
   const r = await run(await buildSourceFile(PROBE));
-  expect(r.output.trim()).toBe("s-fun s-app");
+  // output also carries ast.arr's own check-block footer; assert the parse result line
+  expect(r.output.trim().startsWith("s-fun s-app")).toBe(true);
 });
