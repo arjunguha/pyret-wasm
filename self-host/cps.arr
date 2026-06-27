@@ -565,9 +565,69 @@ fun t-stmts(stmts :: List<CstNode>, i :: Number, k :: Cont) -> String:
         t(val-node, k-fn(lam(v): "block: " + name + " = " + v + " " + t-stmts(stmts, i + 1, k) + " end" end))
       | s.name == "fun-expr" then: "block: " + cps-fun-def(s) + " " + t-stmts(stmts, i + 1, k) + " end"
       | s.name == "data-expr" then: "block: " + render-data(s) + " " + t-stmts(stmts, i + 1, k) + " end"
+      | s.name == "check-expr" then:
+        cont = if last: k else: k-fn(lam(_v): t-stmts(stmts, i + 1, k) end) end
+        t-check-block(s, cont)
       | last then: t(s, k)
       | otherwise: t(s, k-fn(lam(_v): t-stmts(stmts, i + 1, k) end))
     end
+  end
+end
+
+# ---- check: blocks ----
+# A `check:`/`check "name":`/`examples:` block. We CPS-evaluate each test's operands
+# (so calls inside them stay interruptible), bind them to value-vars, then emit a check
+# block comparing those VALUES — so the seed's check harness records pass/fail + renders
+# messages exactly as for the direct compiler. Only EQUALITY-comparison ops are supported:
+# the harness compares the two pre-computed values with built-in equality (no user
+# predicate/thunk call). satisfies/violates/is%/raises* call a user fn/thunk that, after
+# CPS, takes a continuation the harness can't supply — so those raise a clear error.
+fun check-op-supported(op-name :: String) -> Boolean:
+  # is / is-not / is== / is=~ / is<=> / is-not== / ... / is-roughly / is-not-roughly
+  (string-substring(op-name, 0, 2) == "is") and
+    not(string-contains(op-name, "%"))
+end
+
+fun t-check-block(node :: CstNode, kont :: Cont) -> String:
+  name-part = cases(Option) child(node, "STRING"):
+    | some(s) => " " + s.value.or-else("\"\"")
+    | none => ""
+  end
+  inner = child-bang(node, "block")
+  tests = map(only, filter(lam(x): x.name == "stmt" end, inner.kids))
+  fun do-tests(ts :: List<CstNode>, acc :: List<String>) -> String:
+    cases(List) ts:
+      | empty =>
+        "block: check" + name-part + ": " + string-join(acc, " ") + " end "
+          + applyk(kont, "nothing") + " end"
+      | link(ct, rest) =>
+        cps-check-test(ct, lam(line): do-tests(rest, acc + [list: line]) end)
+    end
+  end
+  do-tests(tests, empty)
+end
+
+# CPS-eval a check-test's operands, then call `kont` with the rendered "lval OP rval" line.
+fun cps-check-test(ct :: CstNode, kont :: (String -> String)) -> String:
+  binops = filter(lam(x): x.name == "binop-expr" end, ct.kids)
+  if ct.kids.length() == 1:
+    t(ct.kids.first, k-fn(lam(v): kont(v) end))
+  else if binops.length() < 2:
+    t(binops.first, k-fn(lam(v): kont(v) end))
+  else:
+    cop = child-bang(ct, "check-op")
+    op-name = cop.kids.first.value.or-else("is")
+    when not(check-op-supported(op-name)) or is-some(child(ct, "PERCENT")):
+      raise("check-op not yet supported in CPS: " + op-name
+        + (if is-some(child(ct, "PERCENT")): "%(refinement)" else: "" end))
+    end
+    lhs = binops.first
+    rhs = binops.get(binops.length() - 1)
+    t(lhs, k-fn(lam(lv):
+        t(rhs, k-fn(lam(rv):
+            kont(lv + " " + op-name + " " + rv)
+          end))
+      end))
   end
 end
 
