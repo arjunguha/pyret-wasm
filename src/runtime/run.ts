@@ -58,6 +58,18 @@ export function buildHostImports(state: HostState) {
   const readString = (ptr: number, len: number): string =>
     decoder.decode(new Uint8Array(state.memory!.buffer, ptr, len));
   let stashedLhs = "";
+  // Grow linear memory so a write covering [0, end) fits. The module declares a
+  // bounded maximum (seed: setMemory(1, 256)); growth past it leaves the write to
+  // throw a clear "Length out of range" error. Large self-hosted inputs (e.g. the
+  // compiler's own ~130KB source files via read-source) need more than the 1-page
+  // initial, so callers no longer have to pre-grow `state.memory` themselves.
+  const ensureCapacity = (end: number): void => {
+    const mem = state.memory!;
+    if (end > mem.buffer.byteLength) {
+      const pages = Math.ceil((end - mem.buffer.byteLength) / 65536);
+      try { mem.grow(pages); } catch { /* exceeds declared max; the write surfaces the error */ }
+    }
+  };
   return {
     host: {
       emit_byte: (b: number) => { state.emitted.push(b & 0xff); },
@@ -88,6 +100,7 @@ export function buildHostImports(state: HostState) {
       raise: (ptr: number, len: number) => { throw new PyretError(readString(ptr, len)); },
       do_pause: () => { throw new PauseSignal(); },
       read_source_into: (addr: number): number => {
+        ensureCapacity(addr + state.sourceBytes.length);
         new Uint8Array(state.memory!.buffer, addr, state.sourceBytes.length).set(state.sourceBytes);
         return state.sourceBytes.length;
       },
@@ -106,6 +119,7 @@ export function buildHostImports(state: HostState) {
       parse_node_nkids: (i: number): number => state.parseNodes[i]!.nkids,
       parse_node_str_into: (i: number, addr: number): number => {
         const bytes = new TextEncoder().encode(state.parseNodes[i]!.str);
+        ensureCapacity(addr + bytes.length);
         new Uint8Array(state.memory!.buffer, addr, bytes.length).set(bytes);
         return bytes.length;
       },
