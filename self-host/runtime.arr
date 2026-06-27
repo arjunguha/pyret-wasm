@@ -677,6 +677,71 @@ fun emit-lookup-method() -> RtFun:
     .append(E.end-instr)
   rt-fun("$lookup_method", [list: anyref, E.reft(T-STR)], [list: anyref], empty, body)
 end
+# Closure-call func type index — MIRRORS wasm-of-pyret.arr `closure-call-type-idx`
+# (= NUM-GC-TYPES + length(RT-FUNS)). NUM-GC-TYPES-RT MUST equal that file's NUM-GC-TYPES
+# (13). $variant_match (below) is appended to all-runtime-funs, so both counts include it
+# and stay consistent.
+NUM-GC-TYPES-RT = 13
+fun closure-call-tyidx() -> Number: NUM-GC-TYPES-RT + length(all-runtime-funs) end
+# $variant_match(self, handlers, els) -> anyref : Pyret's auto-generated `_match` (the
+# basis of `.visit()`; cf. seed compile.ts emitVariantMatch / runtime.js makeMatch).
+# Dispatch the variant `self` on `handlers` (an $Object) by VARIANT NAME: if `handlers`
+# has a field named like self's variant, call it with self's fields (a $Method binds
+# handlers as self then the fields; a plain function field takes just the fields);
+# otherwise call `els` (a closure) with self. Uses return_call_indirect (tail) so deep
+# AST traversals run in constant stack. locals: 3=name(Str), 4=flds(?Fields),
+# 5=ho(Object), 6=hn(Names), 7=i(i32), 8=n(i32), 9=handler(anyref), 10=clo(Closure),
+# 11=args(Fields), 12=flen(i32).
+fun emit-variant-match() -> RtFun:
+  # tail-call a closure VALUE `clo-e` (anyref) with args $Fields `args-e` (via local 10).
+  ct = lam(clo-e, args-e):
+    seq([list:
+      clo-e, E.ref-cast(T-CLOSURE), E.local-set(10),
+      E.local-get(10),
+      args-e,
+      E.local-get(10), E.struct-get(T-CLOSURE, 0),
+      E.i-return-call-indirect(closure-call-tyidx(), 0) ])
+  end
+  # handler is a $Method: call its closure with [handlers] ++ self.fields.
+  method-path = seq([list:
+    E.local-get(4), E.ref-is-null,
+    ifel-bt(i32t, [list: E.i32-const(0)],
+            [list: seq([list: E.local-get(4), E.ref-cast(T-FIELDS), E.array-len])]),
+    E.local-set(12),
+    E.i-ref-null(110), E.i32-const(1), E.local-get(12), E.i32-add, E.array-new(T-FIELDS), E.local-set(11),
+    E.local-get(11), E.i32-const(0), E.local-get(1), E.array-set(T-FIELDS),
+    E.local-get(12), E.i32-const(0), E.i32-gt-s,
+    iff([list: E.local-get(11), E.i32-const(1), E.local-get(4), E.ref-cast(T-FIELDS),
+               E.i32-const(0), E.local-get(12), E.array-copy(T-FIELDS, T-FIELDS)]),
+    ct(seq([list: E.local-get(9), E.ref-cast(T-METHOD), E.struct-get(T-METHOD, 0)]), E.local-get(11)) ])
+  # handler is a plain function field: call it with self.fields directly.
+  plain-path = ct(E.local-get(9), E.local-get(4))
+  found-dispatch = seq([list:
+    E.local-get(5), E.struct-get(T-OBJECT, 1), E.local-get(7), E.array-get(T-FIELDS), E.local-set(9),
+    E.local-get(9), E.ref-test-null(T-METHOD),
+    ifel-bt(E.bt-empty, [list: method-path], [list: plain-path]) ])
+  body = seq([list:
+    E.local-get(0), E.ref-cast(T-VARIANT), E.struct-get(T-VARIANT, 1), E.local-set(3),  # name
+    E.local-get(0), E.ref-cast(T-VARIANT), E.struct-get(T-VARIANT, 2), E.local-set(4),  # flds
+    E.local-get(1), E.ref-cast(T-OBJECT), E.local-set(5),                                # ho
+    E.local-get(5), E.struct-get(T-OBJECT, 0), E.local-set(6),                           # hn
+    E.local-get(6), E.array-len, E.local-set(8),                                         # n
+    E.i32-const(0), E.local-set(7),                                                      # i = 0
+    blk(E.bt-empty, [list:
+      lp([list:
+        E.local-get(7), E.local-get(8), E.i32-ge-s, iff([list: E.i-br(2)]),  # i>=n -> exit search
+        E.local-get(6), E.local-get(7), E.array-get(T-NAMES), E.local-get(3), rt-call("$str_equal"),
+        iff([list: found-dispatch]),                                          # match -> dispatch (returns)
+        E.local-get(7), E.i32-const(1), E.i32-add, E.local-set(7),
+        E.i-br(0) ]) ]),
+    ct(E.local-get(2), seq([list: E.local-get(0), E.array-new-fixed(T-FIELDS, 1)])) ]).append(E.end-instr)  # not found: els(self)
+  rt-fun("$variant_match", [list: anyref, anyref, anyref], [list: anyref],
+    [list: E.local-decl(1, E.reft(T-STR)), E.local-decl(1, E.reftnull(T-FIELDS)),
+           E.local-decl(1, E.reft(T-OBJECT)), E.local-decl(1, E.reft(T-NAMES)),
+           E.local-decl(2, i32t), E.local-decl(1, anyref),
+           E.local-decl(1, E.reft(T-CLOSURE)), E.local-decl(1, E.reft(T-FIELDS)),
+           E.local-decl(1, i32t) ], body)
+end
 # $empty_list() -> $Variant : the List `empty` (id = $empty_id global, null fields).
 # (Correct once main sets $empty_id to List's empty variant id; -1 until then.)
 fun emit-empty-list() -> RtFun:
@@ -912,7 +977,8 @@ all-runtime-funs :: List<String> = [list:
   "$equal","$render","$val_to_string",
   "$check_is","$check_is_not","$check_pred","$yield",
   # renderer helpers + decimal writer + str-copy (appended; order parallels build-runtime)
-  "$render_num","$write_i64","$str_copy","$render_variant","$render_list","$render_tuple","$render_object" ]
+  "$render_num","$write_i64","$str_copy","$render_variant","$render_list","$render_tuple","$render_object",
+  "$variant_match" ]
 
 # Assemble all runtime functions in order. TODO bodies trap; fleshed ones are real.
 fun build-runtime() -> List<RtFun>:
@@ -931,5 +997,6 @@ fun build-runtime() -> List<RtFun>:
     emit-equal(), emit-render(), emit-val-to-string(),
     emit-check-is(), emit-check-is-not(), emit-check-pred(), emit-yield(),
     emit-render-num(), emit-write-i64(), emit-str-copy(),
-    emit-render-variant(), emit-render-list(), emit-render-tuple(), emit-render-object() ]
+    emit-render-variant(), emit-render-list(), emit-render-tuple(), emit-render-object(),
+    emit-variant-match() ]
 end

@@ -535,6 +535,16 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(E.array-set(T-FIELDS))
         .append(E.i32-const(2)).append(E.ref-i31)
     | a-method-app(l, obj, meth, args) =>
+      if (meth == "_match") and (length(args) == 2):
+        # `obj._match(handlers, els)` is Pyret's auto-generated data dispatcher (the basis
+        # of `.visit()`). Route to the runtime `$variant_match`, which dispatches obj on
+        # handlers by variant name. Mirrors the seed's compileMethodOnValue.
+        compile-aval(obj, c)
+          .append(compile-aval(args.get(0), c))
+          .append(compile-aval(args.get(1), c))
+          .append(if tail: E.i-return-call(rt-funcidx("$variant_match"))
+                  else: E.i-call(rt-funcidx("$variant_match")) end)
+      else:
       # method dispatch: stash obj in a temp, look up the method via $lookup_method
       # (variant -> $variant_methods[id]; object -> itself), then if the field is a
       # $Method call its closure with [self, ...args]; else call the plain field-closure
@@ -565,6 +575,7 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(E.local-set(fldl))
         .append(E.local-get(fldl)).append(E.ref-test-null(T-METHOD))
         .append(E.i-if(ANYREF-BT)).append(method-path).append(E.i-else).append(plain-path).append(E.i-end)
+      end
     | a-data-expr(l, name, namet, variants, shared) =>
       # the variant registry (id/arity/fields) is collected up front (collect-data, in
       # Ctx.dreg); the per-variant constructor FUNCTIONS are emitted by the assembler into
