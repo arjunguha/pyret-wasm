@@ -1,9 +1,9 @@
 #lang pyret
-# PORT of src/compiler/cps.ts — the Pyret->Pyret CPS transform for STOPPABLE codegen.
+# PORT of src/compiler/cps.ts — the Pyret->Pyret CPS cps-transform for STOPPABLE codegen.
 # Written in Pyret so the self-hosted compiler can produce stoppable code itself.
 #
 # SKETCH STATUS: faithful 1:1 port of cps.ts. Not yet run end-to-end (no parser
-# binding here yet — `transform` takes an already-parsed CstNode). Mirrors cps.ts
+# binding here yet — `cps-transform` takes an already-parsed CstNode). Mirrors cps.ts
 # function-for-function so a side-by-side diff is legible. TODO(port) marks the few
 # spots that need wiring (gensym state, CstNode provider).
 #
@@ -19,7 +19,7 @@ data Cont:
   | k-fn(apply :: (String -> String))
 end
 
-# ---- transform state (mirrors the Cps class fields) ----
+# ---- cps-transform state (mirrors the Cps class fields) ----
 var g :: Number = 0
 var ctors :: List<String> = empty           # data constructor names (primitive calls)
 var fun-defs :: List<String> = empty         # names defined by `fun` (shadow ctors)
@@ -165,7 +165,7 @@ fun reifyk(k :: Cont) -> String:
   end
 end
 
-# ---- the core transform: emit source that computes `node` and feeds it to k ----
+# ---- the core cps-transform: emit source that computes `node` and feeds it to k ----
 fun t(node :: CstNode, k :: Cont) -> String:
   ask:
     | (node.name == "expr") or (node.name == "prim-expr") then: t(only(node), k)
@@ -442,7 +442,7 @@ fun render-data(node :: CstNode) -> String:
 end
 
 # ---- top level ----
-fun transform(program :: CstNode) -> String block:
+fun cps-transform(program :: CstNode) -> String block:
   g := 0
   ctors := empty
   fun-defs := empty
