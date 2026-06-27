@@ -11,7 +11,20 @@ provide *
 import file("../self-compiler/compiler/parse-pyret.arr") as P
 import ast as A
 import anf as ANF
+import srcloc as S
 import file("./wasm-of-pyret.arr") as W
+
+# ── unique lambda locs ───────────────────────────────────────────────────────
+# The JS-GLR surface-parse gives every node `dummy-loc` (S.builtin("dummy location")).
+# The backend keys each lambda's fnIndex/table-slot by tostring(its loc), so two
+# sibling lambdas sharing dummy-loc COLLIDE — both resolve to the first one's slot,
+# so calling the second runs the first's body.  Give every lambda/method a unique
+# synthetic loc during desugar so the keys are distinct.
+var lam-uid :: Number = 0
+fun fresh-loc() -> A.Loc block:
+  lam-uid := lam-uid + 1
+  S.builtin("lam#" + tostring(lam-uid))
+end
 
 # ── op-string → global arithmetic function name ─────────────────────────────
 
@@ -44,7 +57,7 @@ fun desugar-member(m) -> A.Member:
   cases(A.Member) m:
     | s-data-field(l, name, value) => A.s-data-field(l, name, desugar-expr(value))
     | s-method-field(l, name, params, args, ann, doc, body, cl, ck, bl) =>
-      A.s-method-field(l, name, params, args, ann, doc, desugar-expr(body), cl, ck, bl)
+      A.s-method-field(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), cl, ck, bl)
     | else => m
   end
 end
@@ -69,6 +82,19 @@ fun build-link-chain(loc, vals, no-info):
 end
 
 # ── cases-based AST desugaring (no visit()) ──────────────────────────────────
+#
+# FUTURE: switch to Pyret's REAL desugar pass (self-compiler/compiler/desugar.arr).
+#   `desugar(program)` (desugar.arr:116) is cases-based and natively handles s-op,
+#   s-id, s-check/s-check-test, s-data-expr, etc. — it would collapse most of the
+#   hand-written cases below AND give full-language coverage.  `.visit()` now works
+#   (the seed's _match/$variant_match fix), so the visitor-based parts run.
+#   THE BLOCKER: desugar expects the AST in resolve-scope's OUTPUT shape — resolved
+#   id forms (s-id-letrec/s-id-var/s-global), s-data-expr (not s-data), core
+#   let/letrec.  Producing that means running desugar-scope(prog, env) +
+#   resolve-names(p, uri, env) (resolve-scope.arr:576/667) first, both of which take
+#   a C.CompileEnvironment.  So the remaining work is constructing a minimal
+#   CompileEnvironment (globals + module provides) — not the visitor mechanism.
+#   Until then this hand-written desugar covers the supported subset.
 #
 # Converts forms that ANF doesn't handle to forms it does:
 #   s-op        -> s-app-enriched( s-id(s-global(…)), [lhs, rhs] )
@@ -122,11 +148,11 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         blocky)
 
     | s-lam(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
-      A.s-lam(loc, name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+      A.s-lam(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
 
     | s-fun(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
       # s-fun in non-statement position: turn into a self-named lambda
-      A.s-lam(loc, name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+      A.s-lam(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
 
     | s-let(loc, bind, expr, closure-val) =>
       A.s-let(loc, bind, desugar-expr(expr), closure-val)
@@ -195,6 +221,29 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-check-expr(loc, expr, ann) =>
       A.s-check-expr(loc, desugar-expr(expr), ann)
 
+    | s-check(loc, name, body, kw) =>
+      # a `check:`/`examples:` block — keep only its body (the s-check-tests),
+      # which desugar to check-harness prim-apps below.
+      desugar-expr(body)
+
+    | s-check-test(loc, op, refinement, left, right, cause) =>
+      # `lhs is rhs` / `lhs is-not rhs` -> a prim-app the backend maps to the
+      # runtime check harness ($check_is / $check_is_not), which bumps $passed/$total.
+      dleft = desugar-expr(left)
+      cases(Option) right:
+        | none =>
+          # postfix ops (does-not-raise, etc.) not yet supported self-hosted
+          raise("self-hosted check: unsupported postfix check op")
+        | some(r) =>
+          dright = desugar-expr(r)
+          pname = cases(A.CheckOp) op:
+            | s-op-is(_) => "check-is"
+            | s-op-is-not(_) => "check-is-not"
+            | else => raise("self-hosted check: unsupported check op " + op.label())
+          end
+          A.s-prim-app(loc, pname, [list: dleft, dright], A.prim-app-info-c(false))
+      end
+
     | s-prim-app(loc, fname, args, info) =>
       A.s-prim-app(loc, fname, args.map(desugar-expr), info)
 
@@ -247,7 +296,7 @@ end
 fun fun-to-letrec-bind(fn :: A.Expr) -> A.LetrecBind:
   cases(A.Expr) fn:
     | s-fun(fl, fname, fparams, fargs, fann, fdoc, fbody, fchk-loc, fchk, fblocky) =>
-      lam-val = A.s-lam(fl, fname, fparams, fargs, fann, fdoc, desugar-expr(fbody),
+      lam-val = A.s-lam(fresh-loc(), fname, fparams, fargs, fann, fdoc, desugar-expr(fbody),
                         fchk-loc, fchk, fblocky)
       A.s-letrec-bind(fl, A.s-bind(fl, false, A.s-name(fl, fname), A.a-blank), lam-val)
   end

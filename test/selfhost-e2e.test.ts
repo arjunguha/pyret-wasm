@@ -193,11 +193,9 @@ test("self-hosted: non-recursive cases over a [list: ...] (head -> 7)", async ()
 // ─── Level 7: recursion over lists (length / sum) ───────────────────────────────
 // A self-recursive function over a `[list: ...]` — recursing on the variant's `rest`
 // field — compiles and runs with the CORRECT value.  We verify with an inline `if`
-// (`if v == expected: 0 else: 1 / 0 end`) rather than a sibling `expect` helper: a
-// recursive function PLUS a sibling helper of different arity in the same top-level
-// group currently hits a separate backend trap (documented in the driver); a single
-// recursive function is fine.  `if cond: 0 else: 1 / 0` makes a wrong value TRAP, so
-// `result.error === undefined` confirms the value is right.
+// (`if v == expected: 0 else: 1 / 0 end`) so a wrong value TRAPS and
+// `result.error === undefined` confirms the value is right.  (Sibling helpers of a
+// different arity now also work — see Level 9 — after the unique-lambda-loc fix.)
 const LIST_LEN =
   "data List:\n  | empty\n  | link(first, rest)\nend\n" +
   "fun len(l):\n  cases(List) l:\n    | empty => 0\n    | link(f, r) => 1 + len(r)\n  end\nend\n";
@@ -220,4 +218,64 @@ test("self-hosted: a WRONG length traps (sanity)", async () => {
 test("self-hosted: recursive sum over a [list:] (== 60)", async () => {
   const { result } = await selfHostRun(LIST_SUM + "if lsum([list: 10, 20, 30]) == 60: 0 else: 1 / 0 end");
   expect(result.error).toBeUndefined();
+});
+
+// ─── Level 8: `check:` blocks ───────────────────────────────────────────────────
+// `check: lhs is rhs end` desugars (driver) to a `check-is` prim-app -> the runtime
+// $check_is harness (bumps $passed/$total, reports failures); main emits a guarded
+// check_summary($passed,$total) host call so the Pyret-style summary prints.
+test("self-hosted: a passing check: block prints the shipshape summary", async () => {
+  const { result } = await selfHostRun("check: 1 is 1 end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("Looks shipshape");
+});
+
+test("self-hosted: a failing check: block reports the failure + results line", async () => {
+  const { result } = await selfHostRun("check: 1 is 2 end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("test failed");
+  expect(result.output).toContain("0 passed, 1 failed");
+});
+
+test("self-hosted: is-not + multiple tests in one check: block", async () => {
+  const { result } = await selfHostRun("check:\n  2 + 3 is 5\n  4 is-not 5\nend");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("all 2 tests passed");
+});
+
+test("self-hosted: a program with no check: blocks prints no test summary", async () => {
+  const { result } = await selfHostRun("2 + 3");
+  expect(result.error).toBeUndefined();
+  expect(result.output).not.toContain("test");
+});
+
+// ─── Level 9: multiple functions in one top-level group (mixed arity / siblings) ─
+// Regression: the JS-GLR surface-parse gives every node `dummy-loc`, and the backend
+// keyed each lambda's table slot by tostring(loc) — so sibling lambdas COLLIDED and a
+// call dispatched to the FIRST lambda's body (e.g. `a2(3,4)` ran `a1`'s `x+1` -> 4).
+// Fixed by giving each lambda a unique synthetic loc in the driver's desugar.
+test("self-hosted: sibling functions of different arity dispatch correctly", async () => {
+  // a1(3)=4 and a2(3,4)=7 — before the fix a2 ran a1's body and yielded 4.
+  const { result } = await selfHostRun(
+    "fun a1(x): x + 1 end\nfun a2(x, y): x + y end\ncheck:\n  a1(3) is 4\n  a2(3, 4) is 7\nend");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("all 2 tests passed");
+});
+
+test("self-hosted: recursive function + a sibling helper of different arity", async () => {
+  const { result } = await selfHostRun(
+    "data List:\n  | empty\n  | link(first, rest)\nend\n" +
+    "fun len(l):\n  cases(List) l:\n    | empty => 0\n    | link(f, r) => 1 + len(r)\n  end\nend\n" +
+    "fun g(a, b, c): a end\ncheck: len([list: 1, 2, 3]) is 3 end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("1 test passed");
+});
+
+test("self-hosted: mutual recursion (even/odd) with a sibling helper", async () => {
+  const { result } = await selfHostRun(
+    "fun ev(n): if n == 0: true else: od(n - 1) end end\n" +
+    "fun od(n): if n == 0: false else: ev(n - 1) end end\n" +
+    "fun k(a, b): a end\ncheck: k(ev(4), 9) is true end");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("1 test passed");
 });

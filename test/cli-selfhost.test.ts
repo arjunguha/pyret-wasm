@@ -30,9 +30,9 @@ test("self-hosted compiler compiles + runs a program in its subset (a literal)",
 });
 
 test("self-hosted compiler rejects programs outside its subset (triggers the CLI's seed fallback)", async () => {
-  // `check:` blocks aren't handled by the self-hosted driver's anf yet (s-check) -> throws.
-  // (NB: `[list: ...]`, `var`/`:=` now DO compile via the self-hosted driver.)
-  await expect(buildSelfHosted("check: 1 is 1 end")).rejects.toThrow();
+  // `for` loops aren't handled by the self-hosted driver's anf yet (s-for) -> throws.
+  // (NB: `[list: ...]`, `var`/`:=`, and `check:` blocks now DO compile self-hosted.)
+  await expect(buildSelfHosted("for each(x from [list: 1, 2]): x end")).rejects.toThrow();
   // ...and the seed handles a program, so the fallback always works
   const seed = await buildSource("print(1 + 1)");
   const r = await run(seed);
