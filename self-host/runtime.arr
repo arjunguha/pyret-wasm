@@ -11,13 +11,20 @@
 # $variant_field/$num_to_i32/$string_length), strings ($str_concat, $str_equal),
 # objects/variants ($make_object, $make_method, $obj_get, $obj_equal, $variant_equal,
 # $variant_field_by_name [via the $variant_names global]), and structural equality
-# ($equal, dispatching str/num/variant/object/i31). build-runtime() executes and emits
-# 42 functions / ~1KB of real body bytes.
-# STILL TODO(port): the rough/rational/bignum number tower (all $mag_*, $make_rat,
-# $to_f64, $num_expt, $num_to_string), the linear-memory RENDERER ($render/$render_*/
-# $val_to_string) and the CHECK HARNESS ($check_is/$check_is_not/$check_pred) that
-# depends on it, $obj_extend, $cons/$empty_list (need $link_id/$empty_id globals),
-# $str_from_mem/$str_to_codepoints, and the CPS $yield primitive.
+# ($equal, dispatching str/num/variant/object/i31). The linear-memory RENDERER
+# ($render/$render_num/$render_variant/$render_list/$render_tuple/$render_object/
+# $val_to_string + $write_i64/$str_copy/$num_to_string), the CHECK HARNESS
+# ($check_is/$check_is_not/$check_pred via the $passed/$total globals + host imports),
+# $obj_extend, $cons/$empty_list, $str_from_mem, $str_to_codepoints, $num_expt (fixnum),
+# and $to_f64 (fixnum+rough) are now implemented (faithful ports of runtime.ts).
+# build-runtime() executes and emits 49 functions / ~3KB of body bytes. The assembler
+# (wasm-of-pyret.arr) now sets $link_id/$empty_id from List's link/empty variant ids at
+# the start of `main`, so the renderer shows [list: ...] and $cons/$empty_list build
+# well-formed variants.
+# STILL TODO(port): the rational/bignum tower ($make_rat, all $mag_*, the rough/rational
+# contagion in $plus/$num_compare/$render_num, and rat/big cases in $to_f64); the CPS
+# $yield primitive (NB: runtime.ts has no standalone $yield function — it lives in the
+# {stoppable} codegen path); and is-<variant> predicates (in wasm-of-pyret.arr a-data-expr).
 # NB: the backend can't yet RUN these end-to-end (the seed flat-namespace collision
 # blocks co-importing the backend with ast.arr to drive compile-prog), so byte-level
 # correctness is verified by mirroring runtime.ts + clean compile, not execution.
@@ -46,6 +53,30 @@ TAG-FIX = 0
 TAG-RAT = 1
 TAG-ROUGH = 2
 TAG-BIG = 3
+
+# ===== global layout (must match wasm-of-pyret.arr's assembler) =====
+# A fixed block of runtime globals occupies the LOWEST indices, so both runtime.arr
+# (here) and the assembler agree by name. $variant_names + the per-top-level globals
+# follow this block. ($link_id/$empty_id are set by main to List's link/empty ids so
+# the renderer shows lists as [list: ...]; -1 until then. $passed/$total drive checks.)
+GI-LINK-ID = 0
+GI-EMPTY-ID = 1
+GI-PASSED = 2
+GI-TOTAL = 3
+NUM-RT-GLOBALS = 4
+GI-VARIANT-NAMES = 4    # first global after the runtime block (when variants exist)
+
+# fixed scratch region in linear memory for marshalling strings to the host (runtime.ts).
+SCRATCH-OFFSET = 1024
+
+# the 4 fixed runtime globals, in index order, for the assembler to emit.
+fun rt-globals() -> List:
+  [list:
+    E.global-entry(i32t, 1, E.i32-const(0 - 1)),   # $link_id  = -1
+    E.global-entry(i32t, 1, E.i32-const(0 - 1)),   # $empty_id = -1
+    E.global-entry(i32t, 1, E.i32-const(0)),       # $passed   = 0
+    E.global-entry(i32t, 1, E.i32-const(0)) ]      # $total    = 0
+end
 
 # value-type byte shorthands
 i32t = [list: 127]
@@ -125,6 +156,19 @@ end
 fun fix-i64(idx :: Number) -> List<Number>:
   E.local-get(idx).append(E.ref-cast(T-FIX)).append(E.struct-get(T-FIX, 1))
 end
+# build a $Str literal value on the stack: array.new_fixed $Str of each ASCII byte.
+fun str-lit(s :: String) -> List<Number>:
+  codes = string-to-code-points(s)
+  E.concat(codes.map(lam(c): E.i32-const(c) end)).append(E.array-new-fixed(T-STR, length(codes)))
+end
+# emit i32.store8 of each ASCII byte of `s` at (local[addr-idx] + offset). Used by the
+# renderer to splat fixed literals (true/false/nothing/roughnum/"[list: ") into scratch.
+fun lit-at(addr-idx :: Number, s :: String) -> List<Number>:
+  codes = string-to-code-points(s)
+  E.concat(map2(lam(c, i):
+    E.local-get(addr-idx).append(E.i32-const(i)).append(E.i32-add).append(E.i32-const(c)).append(E.i32-store8)
+  end, codes, range(0, length(codes))))
+end
 
 # ===== number tower: construction =====
 # $make_fix(i64) -> (ref $Num) : struct.new $Fixnum {TAG-FIX, i64}
@@ -202,7 +246,25 @@ fun emit-num-modulo() -> RtFun:
   rt-fun("$num_modulo", [list: E.reft(T-NUM), E.reft(T-NUM)], [list: E.reft(T-NUM)],
          [list: E.local-decl(4, i64t)], body)
 end
-fun emit-num-expt() -> RtFun: todo("$num_expt", "repeated $num_mul loop, non-neg integer exponent") end
+# $num_expt(base, exp) = base^exp for a non-negative integer exp. runtime.ts loops over
+# $num_mul (full tower); since the fixnum fast path has no $num_mul, we inline an i64
+# fixnum multiply here (DEVIATION(port): fixnum-only, no tower contagion). locals:
+# result=2 (ref $Num), e=3 (i32), i=4 (i32).
+fun emit-num-expt() -> RtFun:
+  body = blk(E.reft(T-NUM), [list:
+      E.local-get(1), rt-call("$num_to_i32"), E.local-set(3),
+      E.i64-const(1), rt-call("$make_fix"), E.local-set(2),
+      E.i32-const(0), E.local-set(4),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(4), E.local-get(3), E.i32-ge-s, iff([list: E.i-br(2)]),
+          fix-i64(2), fix-i64(0), E.i64-mul, rt-call("$make_fix"), E.local-set(2),
+          E.local-get(4), E.i32-const(1), E.i32-add, E.local-set(4),
+          E.i-br(0) ]) ]),
+      E.local-get(2) ]).append(E.end-instr)
+  rt-fun("$num_expt", [list: E.reft(T-NUM), E.reft(T-NUM)], [list: E.reft(T-NUM)],
+         [list: E.local-decl(1, E.reft(T-NUM)), E.local-decl(2, i32t)], body)
+end
 
 # $num_to_i32(($Num)) -> i32 : assume fixnum, read i64 field, wrap to i32
 fun emit-num-to-i32() -> RtFun:
@@ -214,8 +276,72 @@ fun emit-num-to-i32() -> RtFun:
   rt-fun("$num_to_i32", [list: anyref], [list: i32t], empty, body)
 end
 
-fun emit-to-f64() -> RtFun: todo("$to_f64", "dispatch: fix -> f64.convert_i64; rough -> field; rat -> num/den; big -> limbs->f64") end
-fun emit-num-to-string() -> RtFun: todo("$num_to_string", "render number to $Str in scratch: int decimal / rational a/b / rough format") end
+# $to_f64(x :: $Num) -> f64 : rough -> the f64 field; else (fixnum) -> convert the i64
+# payload. TODO(port): rational (num/den) + bignum (limbs) cases — need $int_to_f64.
+fun emit-to-f64() -> RtFun:
+  body = E.local-get(0).append(E.struct-get(T-NUM, 0)).append(E.i32-const(TAG-ROUGH)).append(E.i32-eq)
+    .append(ifel-bt(f64t,
+        [list: E.local-get(0), E.ref-cast(T-ROUGH), E.struct-get(T-ROUGH, 1)],
+        [list: E.local-get(0), E.ref-cast(T-FIX), E.struct-get(T-FIX, 1), E.f64-convert-i64-s]))
+    .append(E.end-instr)
+  rt-fun("$to_f64", [list: E.reft(T-NUM)], [list: f64t], empty, body)
+end
+# $render_num(v :: $Num, addr :: i32) -> i32 end-addr. Roughnums print "roughnum";
+# everything else uses the fixnum decimal path (the tower is fixnum-only). locals: none.
+fun emit-render-num() -> RtFun:
+  body = blk(i32t, [list:
+      E.local-get(0), E.struct-get(T-NUM, 0), E.i32-const(TAG-ROUGH), E.i32-eq, iff([list:
+        lit-at(1, "roughnum"),
+        E.local-get(1), E.i32-const(8), E.i32-add, E.i-br(1) ]),
+      # fixnum: addr + $write_i64((cast $Fixnum).payload, addr)
+      E.local-get(1),
+      E.local-get(0), E.ref-cast(T-FIX), E.struct-get(T-FIX, 1), E.local-get(1), rt-call("$write_i64"),
+      E.i32-add ]).append(E.end-instr)
+  rt-fun("$render_num", [list: E.reft(T-NUM), i32t], [list: i32t], empty, body)
+end
+# $num_to_string(v) -> i32 length written at SCRATCH-OFFSET.
+fun emit-num-to-string() -> RtFun:
+  body = E.local-get(0).append(E.i32-const(SCRATCH-OFFSET)).append(rt-call("$render_num"))
+    .append(E.i32-const(SCRATCH-OFFSET)).append(E.i32-sub).append(E.end-instr)
+  rt-fun("$num_to_string", [list: E.reft(T-NUM)], [list: i32t], empty, body)
+end
+# $write_i64(value :: i64, addr :: i32) -> i32 bytes written (decimal ASCII, in place).
+# locals: neg=2,start=3,count=4,j=5,tmpLo=6,tmpHi=7 (all i32).
+fun emit-write-i64() -> RtFun:
+  body = blk(i32t, [list:
+      # zero
+      E.local-get(0), E.i64-eqz, iff([list:
+        E.local-get(1), E.i32-const(48), E.i32-store8, E.i32-const(1), E.i-br(1) ]),
+      # negative -> remember + negate
+      E.local-get(0), E.i64-const(0), E.i64-lt-s, iff([list:
+        E.i32-const(1), E.local-set(2),
+        E.i64-const(0), E.local-get(0), E.i64-sub, E.local-set(0) ]),
+      E.local-get(1), E.local-get(2), E.i32-add, E.local-set(3),   # start = addr + neg
+      E.i32-const(0), E.local-set(4),                              # count = 0
+      # emit digits least-significant-first
+      lp([list:
+        E.local-get(3), E.local-get(4), E.i32-add,
+        E.i32-const(48), E.local-get(0), E.i64-const(10), E.i64-rem-u, E.i32-wrap-i64, E.i32-add,
+        E.i32-store8,
+        E.local-get(0), E.i64-const(10), E.i64-div-u, E.local-set(0),
+        E.local-get(4), E.i32-const(1), E.i32-add, E.local-set(4),
+        E.local-get(0), E.i64-const(0), E.i64-ne, E.i-br-if(0) ]),
+      # reverse digits in place
+      E.i32-const(0), E.local-set(5),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(5), E.local-get(4), E.i32-const(2), E.i32-div-s, E.i32-ge-s, E.i-br-if(1),
+          E.local-get(3), E.local-get(5), E.i32-add, E.i32-load8-u, E.local-set(6),
+          E.local-get(3), E.local-get(4), E.i32-const(1), E.i32-sub, E.local-get(5), E.i32-sub, E.i32-add, E.i32-load8-u, E.local-set(7),
+          E.local-get(3), E.local-get(5), E.i32-add, E.local-get(7), E.i32-store8,
+          E.local-get(3), E.local-get(4), E.i32-const(1), E.i32-sub, E.local-get(5), E.i32-sub, E.i32-add, E.local-get(6), E.i32-store8,
+          E.local-get(5), E.i32-const(1), E.i32-add, E.local-set(5),
+          E.i-br(0) ]) ]),
+      # prepend '-' if negative
+      E.local-get(2), iff([list: E.local-get(1), E.i32-const(45), E.i32-store8 ]),
+      E.local-get(4), E.local-get(2), E.i32-add ]).append(E.end-instr)
+  rt-fun("$write_i64", [list: i64t, i32t], [list: i32t], [list: E.local-decl(6, i32t)], body)
+end
 
 # ===== bignum kernels — magnitude = (array (mut i32)) limbs =====
 fun emit-mag-add() -> RtFun: todo("$mag_add", "ripple-carry add of two i32-limb arrays -> normalized array") end
@@ -270,8 +396,59 @@ fun emit-str-equal() -> RtFun:
   rt-fun("$str_equal", [list: E.reft(T-STR), E.reft(T-STR)], [list: i32t],
          [list: E.local-decl(2, i32t)], body)
 end
-fun emit-str-from-mem() -> RtFun: todo("$str_from_mem", "build $Str from linear memory ptr/len (read-source)") end
-fun emit-str-to-codepoints() -> RtFun: todo("$str_to_codepoints", "build a Pyret list of fixnums from bytes") end
+# $str_from_mem(addr, len) -> ref $Str : copy `len` linear-memory bytes from `addr`
+# into a fresh $Str. locals: i=2(i32), res=3(ref $Str).
+fun emit-str-from-mem() -> RtFun:
+  body = blk(E.reft(T-STR), [list:
+      E.i32-const(0), E.local-get(1), E.array-new(T-STR), E.local-set(3),
+      E.i32-const(0), E.local-set(2),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(2), E.local-get(1), E.i32-ge-s, iff([list: E.i-br(2)]),
+          E.local-get(3), E.local-get(2),
+          E.local-get(0), E.local-get(2), E.i32-add, E.i32-load8-u,
+          E.array-set(T-STR),
+          E.local-get(2), E.i32-const(1), E.i32-add, E.local-set(2),
+          E.i-br(0) ]) ]),
+      E.local-get(3) ]).append(E.end-instr)
+  rt-fun("$str_from_mem", [list: i32t, i32t], [list: E.reft(T-STR)],
+         [list: E.local-decl(1, i32t), E.local-decl(1, E.reft(T-STR))], body)
+end
+# $str_copy(s, addr) -> i32 length : copy s's bytes into memory at `addr`; return length.
+# locals: i=2(i32), len=3(i32).
+fun emit-str-copy() -> RtFun:
+  body = blk(i32t, [list:
+      E.local-get(0), E.array-len, E.local-set(3),
+      E.i32-const(0), E.local-set(2),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(2), E.local-get(3), E.i32-ge-s, iff([list: E.i-br(2)]),
+          E.local-get(1), E.local-get(2), E.i32-add,
+          E.local-get(0), E.local-get(2), E.array-get-u(T-STR),
+          E.i32-store8,
+          E.local-get(2), E.i32-const(1), E.i32-add, E.local-set(2),
+          E.i-br(0) ]) ]),
+      E.local-get(3) ]).append(E.end-instr)
+  rt-fun("$str_copy", [list: E.reft(T-STR), i32t], [list: i32t], [list: E.local-decl(2, i32t)], body)
+end
+# $str_to_codepoints(s :: $Str) -> anyref (List<Number>) : build from the END so order
+# holds (acc = empty; for i = len-1 downto 0: acc = cons(make_fix(s[i]), acc)). Faithful
+# port of runtime.ts. locals: i=1 (i32), acc=2 (anyref).
+fun emit-str-to-codepoints() -> RtFun:
+  body = blk(anyref, [list:
+      rt-call("$empty_list"), E.local-set(2),
+      E.local-get(0), E.array-len, E.i32-const(1), E.i32-sub, E.local-set(1),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(1), E.i32-const(0), E.i32-lt-s, iff([list: E.i-br(2)]),
+          E.local-get(0), E.local-get(1), E.array-get-u(T-STR), E.i64-extend-u-i32, rt-call("$make_fix"),
+          E.local-get(2), rt-call("$cons"), E.local-set(2),
+          E.local-get(1), E.i32-const(1), E.i32-sub, E.local-set(1),
+          E.i-br(0) ]) ]),
+      E.local-get(2) ]).append(E.end-instr)
+  rt-fun("$str_to_codepoints", [list: E.reft(T-STR)], [list: anyref],
+         [list: E.local-decl(1, i32t), E.local-decl(1, anyref)], body)
+end
 
 # ===== variants / objects / closures =====
 # $make_variant(id :: i32, name :: $Str, fields :: $Fields) -> (ref $Variant)
@@ -300,7 +477,7 @@ end
 fun emit-variant-field-by-name() -> RtFun:
   body = blk(anyref, [list:
       E.local-get(0), E.ref-cast(T-VARIANT), E.struct-get(T-VARIANT, 0), E.local-set(2),  # id
-      E.global-get(0), E.local-get(2), E.array-get(T-FIELDS), E.ref-cast(T-NAMES), E.local-set(3),
+      E.global-get(GI-VARIANT-NAMES), E.local-get(2), E.array-get(T-FIELDS), E.ref-cast(T-NAMES), E.local-set(3),
       E.local-get(3), E.array-len, E.local-set(4),
       E.i32-const(0), E.local-set(5),
       blk(E.bt-empty, [list:
@@ -389,14 +566,49 @@ fun emit-obj-equal() -> RtFun:
   rt-fun("$obj_equal", [list: E.reft(T-OBJECT), E.reft(T-OBJECT)], [list: i32t],
          [list: E.local-decl(2, i32t), E.local-decl(2, E.reft(T-NAMES))], body)
 end
-fun emit-obj-extend() -> RtFun: todo("$obj_extend", "prepend override names/values into a fresh $Object") end
+# $obj_extend(obj, nn, nv) -> $Object. New fields PREPENDED before base fields, so
+# $obj_get's first-match returns the override (override + add). locals: bn=3(Names),
+# bv=4(Fields), rn=5(Names), rv=6(Fields), nl=7(i32), bl=8(i32).
+fun emit-obj-extend() -> RtFun:
+  body = blk(E.reft(T-OBJECT), [list:
+      E.local-get(0), E.struct-get(T-OBJECT, 0), E.local-set(3),
+      E.local-get(0), E.struct-get(T-OBJECT, 1), E.local-set(4),
+      E.local-get(1), E.array-len, E.local-set(7),
+      E.local-get(3), E.array-len, E.local-set(8),
+      # rn = array.new $Names (init = nn[0], size = nl+bl)
+      E.local-get(1), E.i32-const(0), E.array-get(T-NAMES),
+      E.local-get(7), E.local-get(8), E.i32-add, E.array-new(T-NAMES), E.local-set(5),
+      # rv = array.new $Fields (init = null, size = nl+bl)
+      E.i-ref-null(110),
+      E.local-get(7), E.local-get(8), E.i32-add, E.array-new(T-FIELDS), E.local-set(6),
+      E.local-get(5), E.i32-const(0), E.local-get(1), E.i32-const(0), E.local-get(7), E.array-copy(T-NAMES, T-NAMES),
+      E.local-get(5), E.local-get(7), E.local-get(3), E.i32-const(0), E.local-get(8), E.array-copy(T-NAMES, T-NAMES),
+      E.local-get(6), E.i32-const(0), E.local-get(2), E.i32-const(0), E.local-get(7), E.array-copy(T-FIELDS, T-FIELDS),
+      E.local-get(6), E.local-get(7), E.local-get(4), E.i32-const(0), E.local-get(8), E.array-copy(T-FIELDS, T-FIELDS),
+      E.local-get(5), E.local-get(6), E.struct-new(T-OBJECT) ]).append(E.end-instr)
+  rt-fun("$obj_extend", [list: E.reft(T-OBJECT), E.reft(T-NAMES), E.reft(T-FIELDS)], [list: E.reft(T-OBJECT)],
+         [list: E.local-decl(1, E.reft(T-NAMES)), E.local-decl(1, E.reft(T-FIELDS)),
+                E.local-decl(1, E.reft(T-NAMES)), E.local-decl(1, E.reft(T-FIELDS)), E.local-decl(2, i32t)], body)
+end
 # $make_method(closure) -> $Method
 fun emit-make-method() -> RtFun:
   body = E.local-get(0).append(E.struct-new(T-METHOD)).append(E.end-instr)
   rt-fun("$make_method", [list: E.reft(T-CLOSURE)], [list: E.reft(T-METHOD)], empty, body)
 end
-fun emit-cons() -> RtFun: todo("$cons", "make link variant using $link_id global + 2-field $Fields") end
-fun emit-empty-list() -> RtFun: todo("$empty_list", "make empty variant using $empty_id global") end
+# $empty_list() -> $Variant : the List `empty` (id = $empty_id global, null fields).
+# (Correct once main sets $empty_id to List's empty variant id; -1 until then.)
+fun emit-empty-list() -> RtFun:
+  body = E.global-get(GI-EMPTY-ID).append(str-lit("empty")).append(E.i-ref-null(T-FIELDS))
+    .append(rt-call("$make_variant")).append(E.end-instr)
+  rt-fun("$empty_list", empty, [list: E.reft(T-VARIANT)], empty, body)
+end
+# $cons(head, tail) -> $Variant : the List `link` (id = $link_id global, 2-field $Fields).
+fun emit-cons() -> RtFun:
+  body = E.global-get(GI-LINK-ID).append(str-lit("link"))
+    .append(E.local-get(0)).append(E.local-get(1)).append(E.array-new-fixed(T-FIELDS, 2))
+    .append(rt-call("$make_variant")).append(E.end-instr)
+  rt-fun("$cons", [list: anyref, anyref], [list: E.reft(T-VARIANT)], empty, body)
+end
 
 # ===== equality + rendering =====
 # $equal(a, b) -> i32 : dispatch on a's representation (str/num/variant/object), each
@@ -423,13 +635,182 @@ fun emit-equal() -> RtFun:
     .append(E.end-instr)
   rt-fun("$equal", [list: anyref, anyref], [list: i32t], empty, body)
 end
-fun emit-render() -> RtFun: todo("$render", "render any value to $Str (recursive; lists as [list: ...])") end
-fun emit-val-to-string() -> RtFun: todo("$val_to_string", "render result into scratch memory; return length for $print") end
+HT-I31 = 108   # abstract i31 heaptype (for ref.cast / i31.get_s of bools/nothing)
+# $render(v :: anyref, addr :: i32) -> i32 end-addr. Cursor renderer: dispatch on the
+# value's representation, append text at `addr`, return the new cursor.
+fun emit-render() -> RtFun:
+  body = blk(i32t, [list:
+      E.local-get(0), E.ref-test-null(T-STR), iff([list:
+        E.local-get(1), E.local-get(0), E.ref-cast(T-STR), E.local-get(1), rt-call("$str_copy"), E.i32-add, E.i-br(1) ]),
+      E.local-get(0), E.ref-test-null(T-NUM), iff([list:
+        E.local-get(0), E.ref-cast(T-NUM), E.local-get(1), rt-call("$render_num"), E.i-br(1) ]),
+      E.local-get(0), E.ref-test-null(T-VARIANT), iff([list:
+        E.local-get(0), E.ref-cast(T-VARIANT), E.local-get(1), rt-call("$render_variant"), E.i-br(1) ]),
+      E.local-get(0), E.ref-test-null(T-OBJECT), iff([list:
+        E.local-get(0), E.ref-cast(T-OBJECT), E.local-get(1), rt-call("$render_object"), E.i-br(1) ]),
+      # i31 immediates: 1 -> "true", 0 -> "false", else "nothing"
+      E.local-get(0), E.ref-cast(HT-I31), E.i31-get-s, E.i32-const(1), E.i32-eq, iff([list:
+        lit-at(1, "true"), E.local-get(1), E.i32-const(4), E.i32-add, E.i-br(1) ]),
+      E.local-get(0), E.ref-cast(HT-I31), E.i31-get-s, E.i32-const(0), E.i32-eq, iff([list:
+        lit-at(1, "false"), E.local-get(1), E.i32-const(5), E.i32-add, E.i-br(1) ]),
+      lit-at(1, "nothing"), E.local-get(1), E.i32-const(7), E.i32-add ]).append(E.end-instr)
+  rt-fun("$render", [list: anyref, i32t], [list: i32t], empty, body)
+end
+# $render_variant(v, addr) -> end addr.  tuples -> {..}, lists -> [list: ..], else
+# name "(" f0 ", " f1 ... ")".  locals: a=2, fields=3(reftnull Fields), i=4, n=5.
+fun emit-render-variant() -> RtFun:
+  body = blk(i32t, [list:
+      E.local-get(0), E.struct-get(T-VARIANT, 0), E.i32-eqz, iff([list:
+        E.local-get(0), E.local-get(1), rt-call("$render_tuple"), E.i-br(1) ]),
+      E.local-get(0), E.struct-get(T-VARIANT, 0), E.global-get(GI-LINK-ID), E.i32-eq,
+      E.local-get(0), E.struct-get(T-VARIANT, 0), E.global-get(GI-EMPTY-ID), E.i32-eq, E.i32-or, iff([list:
+        E.local-get(0), E.local-get(1), rt-call("$render_list"), E.i-br(1) ]),
+      E.local-get(1), E.local-get(0), E.struct-get(T-VARIANT, 1), E.local-get(1), rt-call("$str_copy"), E.i32-add, E.local-set(2),
+      E.local-get(0), E.struct-get(T-VARIANT, 2), E.local-set(3),
+      E.local-get(3), E.ref-is-null, iff([list: E.local-get(2), E.i-br(1) ]),
+      E.local-get(3), E.array-len, E.local-set(5),
+      E.local-get(5), E.i32-eqz, iff([list: E.local-get(2), E.i-br(1) ]),
+      E.local-get(2), E.i32-const(40), E.i32-store8,
+      E.local-get(2), E.i32-const(1), E.i32-add, E.local-set(2),
+      E.i32-const(0), E.local-set(4),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(4), E.local-get(5), E.i32-ge-s, iff([list: E.i-br(2)]),
+          E.local-get(4), E.i32-const(0), E.i32-gt-s, iff([list:
+            E.local-get(2), E.i32-const(44), E.i32-store8,
+            E.local-get(2), E.i32-const(1), E.i32-add, E.i32-const(32), E.i32-store8,
+            E.local-get(2), E.i32-const(2), E.i32-add, E.local-set(2) ]),
+          E.local-get(3), E.local-get(4), E.array-get(T-FIELDS), E.local-get(2), rt-call("$render"), E.local-set(2),
+          E.local-get(4), E.i32-const(1), E.i32-add, E.local-set(4),
+          E.i-br(0) ]) ]),
+      E.local-get(2), E.i32-const(41), E.i32-store8,
+      E.local-get(2), E.i32-const(1), E.i32-add ]).append(E.end-instr)
+  rt-fun("$render_variant", [list: E.reft(T-VARIANT), i32t], [list: i32t],
+         [list: E.local-decl(1, i32t), E.local-decl(1, E.reftnull(T-FIELDS)), E.local-decl(2, i32t)], body)
+end
+# $render_list(v, addr) -> end addr.  "[list: a, b, c]". locals: a=2, cur=3(Variant), first=4.
+fun emit-render-list() -> RtFun:
+  body = blk(i32t, [list:
+      E.local-get(1), E.local-set(2),
+      lit-at(2, "[list: "),
+      E.local-get(2), E.i32-const(7), E.i32-add, E.local-set(2),
+      E.local-get(0), E.local-set(3),
+      E.i32-const(1), E.local-set(4),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(3), E.struct-get(T-VARIANT, 0), E.global-get(GI-EMPTY-ID), E.i32-eq, iff([list: E.i-br(2)]),
+          E.local-get(4), E.i32-eqz, iff([list:
+            E.local-get(2), E.i32-const(44), E.i32-store8,
+            E.local-get(2), E.i32-const(1), E.i32-add, E.i32-const(32), E.i32-store8,
+            E.local-get(2), E.i32-const(2), E.i32-add, E.local-set(2) ]),
+          E.i32-const(0), E.local-set(4),
+          E.local-get(3), E.struct-get(T-VARIANT, 2), E.i32-const(0), E.array-get(T-FIELDS), E.local-get(2), rt-call("$render"), E.local-set(2),
+          E.local-get(3), E.struct-get(T-VARIANT, 2), E.i32-const(1), E.array-get(T-FIELDS), E.ref-cast(T-VARIANT), E.local-set(3),
+          E.i-br(0) ]) ]),
+      E.local-get(2), E.i32-const(93), E.i32-store8,
+      E.local-get(2), E.i32-const(1), E.i32-add ]).append(E.end-instr)
+  rt-fun("$render_list", [list: E.reft(T-VARIANT), i32t], [list: i32t],
+         [list: E.local-decl(1, i32t), E.local-decl(1, E.reft(T-VARIANT)), E.local-decl(1, i32t)], body)
+end
+# $render_tuple(v, addr) -> end addr.  "{a; b; c}". locals: a=2, flds=3(reftnull Fields), i=4, n=5.
+fun emit-render-tuple() -> RtFun:
+  body = blk(i32t, [list:
+      E.local-get(1), E.local-set(2),
+      E.local-get(2), E.i32-const(123), E.i32-store8,
+      E.local-get(2), E.i32-const(1), E.i32-add, E.local-set(2),
+      E.local-get(0), E.struct-get(T-VARIANT, 2), E.local-set(3),
+      E.local-get(3), E.ref-is-null, iff([list:
+        E.local-get(2), E.i32-const(125), E.i32-store8,
+        E.local-get(2), E.i32-const(1), E.i32-add, E.i-br(1) ]),
+      E.local-get(3), E.array-len, E.local-set(5),
+      E.i32-const(0), E.local-set(4),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(4), E.local-get(5), E.i32-ge-s, iff([list: E.i-br(2)]),
+          E.local-get(4), E.i32-const(0), E.i32-gt-s, iff([list:
+            E.local-get(2), E.i32-const(59), E.i32-store8,
+            E.local-get(2), E.i32-const(1), E.i32-add, E.i32-const(32), E.i32-store8,
+            E.local-get(2), E.i32-const(2), E.i32-add, E.local-set(2) ]),
+          E.local-get(3), E.local-get(4), E.array-get(T-FIELDS), E.local-get(2), rt-call("$render"), E.local-set(2),
+          E.local-get(4), E.i32-const(1), E.i32-add, E.local-set(4),
+          E.i-br(0) ]) ]),
+      E.local-get(2), E.i32-const(125), E.i32-store8,
+      E.local-get(2), E.i32-const(1), E.i32-add ]).append(E.end-instr)
+  rt-fun("$render_tuple", [list: E.reft(T-VARIANT), i32t], [list: i32t],
+         [list: E.local-decl(1, i32t), E.local-decl(1, E.reftnull(T-FIELDS)), E.local-decl(2, i32t)], body)
+end
+# $render_object(obj, addr) -> end addr.  "{name: value, ...}". a is param local 1.
+# locals: names=2(Names), i=3, n=4.
+fun emit-render-object() -> RtFun:
+  body = blk(i32t, [list:
+      E.local-get(0), E.struct-get(T-OBJECT, 0), E.local-set(2),
+      E.local-get(2), E.array-len, E.local-set(4),
+      E.local-get(1), E.i32-const(123), E.i32-store8,
+      E.local-get(1), E.i32-const(1), E.i32-add, E.local-set(1),
+      E.i32-const(0), E.local-set(3),
+      blk(E.bt-empty, [list:
+        lp([list:
+          E.local-get(3), E.local-get(4), E.i32-ge-s, iff([list: E.i-br(2)]),
+          E.local-get(3), E.i32-const(0), E.i32-gt-s, iff([list:
+            E.local-get(1), E.i32-const(44), E.i32-store8,
+            E.local-get(1), E.i32-const(1), E.i32-add, E.i32-const(32), E.i32-store8,
+            E.local-get(1), E.i32-const(2), E.i32-add, E.local-set(1) ]),
+          E.local-get(1), E.local-get(2), E.local-get(3), E.array-get(T-NAMES), E.local-get(1), rt-call("$str_copy"), E.i32-add, E.local-set(1),
+          E.local-get(1), E.i32-const(58), E.i32-store8,
+          E.local-get(1), E.i32-const(1), E.i32-add, E.i32-const(32), E.i32-store8,
+          E.local-get(1), E.i32-const(2), E.i32-add, E.local-set(1),
+          E.local-get(0), E.struct-get(T-OBJECT, 1), E.local-get(3), E.array-get(T-FIELDS), E.local-get(1), rt-call("$render"), E.local-set(1),
+          E.local-get(3), E.i32-const(1), E.i32-add, E.local-set(3),
+          E.i-br(0) ]) ]),
+      E.local-get(1), E.i32-const(125), E.i32-store8,
+      E.local-get(1), E.i32-const(1), E.i32-add ]).append(E.end-instr)
+  rt-fun("$render_object", [list: E.reft(T-OBJECT), i32t], [list: i32t],
+         [list: E.local-decl(1, E.reft(T-NAMES)), E.local-decl(2, i32t)], body)
+end
+# $val_to_string(v) -> i32 length written at SCRATCH-OFFSET.
+fun emit-val-to-string() -> RtFun:
+  body = E.local-get(0).append(E.i32-const(SCRATCH-OFFSET)).append(rt-call("$render"))
+    .append(E.i32-const(SCRATCH-OFFSET)).append(E.i32-sub).append(E.end-instr)
+  rt-fun("$val_to_string", [list: anyref], [list: i32t], empty, body)
+end
 
-# ===== check harness ===== (drive scoreboard via host imports)
-fun emit-check-is() -> RtFun: todo("$check_is", "compare via $equal; call host check_stash/check_fail") end
-fun emit-check-is-not() -> RtFun: todo("$check_is_not", "negated $check_is") end
-fun emit-check-pred() -> RtFun: todo("$check_pred", "call predicate; host check_fail_pred on false") end
+# ===== check harness ===== (drive scoreboard globals + report via host imports)
+# bump $total; on success bump $passed; on failure stash both rendered values to the host.
+fun bump(gi :: Number) -> List<Number>:
+  E.global-get(gi).append(E.i32-const(1)).append(E.i32-add).append(E.global-set(gi))
+end
+fun emit-check-is() -> RtFun:
+  body = bump(GI-TOTAL)
+    .append(E.local-get(0)).append(E.local-get(1)).append(rt-call("$equal"))
+    .append(ifel-bt(E.bt-empty, [list: bump(GI-PASSED)],
+        [list:
+          E.local-get(0), rt-call("$val_to_string"), E.local-set(2),
+          E.i32-const(SCRATCH-OFFSET), E.local-get(2), E.i-call(host-import-index("check_stash")),
+          E.local-get(1), rt-call("$val_to_string"), E.local-set(2),
+          E.i32-const(SCRATCH-OFFSET), E.local-get(2), E.i-call(host-import-index("check_fail")) ]))
+    .append(E.end-instr)
+  rt-fun("$check_is", [list: anyref, anyref], empty, [list: E.local-decl(1, i32t)], body)
+end
+fun emit-check-is-not() -> RtFun:
+  body = bump(GI-TOTAL)
+    .append(E.local-get(0)).append(E.local-get(1)).append(rt-call("$equal")).append(E.i32-eqz)
+    .append(ifel-bt(E.bt-empty, [list: bump(GI-PASSED)],
+        [list:
+          E.local-get(0), rt-call("$val_to_string"), E.local-set(2),
+          E.i32-const(SCRATCH-OFFSET), E.local-get(2), E.i-call(host-import-index("check_stash")),
+          E.local-get(1), rt-call("$val_to_string"), E.local-set(2),
+          E.i32-const(SCRATCH-OFFSET), E.local-get(2), E.i-call(host-import-index("check_fail_isnot")) ]))
+    .append(E.end-instr)
+  rt-fun("$check_is_not", [list: anyref, anyref], empty, [list: E.local-decl(1, i32t)], body)
+end
+fun emit-check-pred() -> RtFun:
+  body = bump(GI-TOTAL)
+    .append(E.local-get(0))
+    .append(ifel-bt(E.bt-empty, [list: bump(GI-PASSED)],
+        [list: E.i32-const(0), E.i32-const(0), E.i-call(host-import-index("check_fail_pred"))]))
+    .append(E.end-instr)
+  rt-fun("$check_pred", [list: i32t], empty, empty, body)
+end
 
 # ===== CPS stop-button primitives (compile.arr adds these in {stoppable}) =====
 fun emit-yield() -> RtFun: todo("$yield", "decrement $gas; if>0 tail-call thunk closure; else reset+store paused_thunk+call $do_pause; unreachable") end
@@ -443,7 +824,9 @@ all-runtime-funs :: List<String> = [list:
   "$make_variant","$variant_id","$variant_field","$variant_field_by_name","$variant_equal",
   "$make_object","$obj_get","$obj_equal","$obj_extend","$make_method","$cons","$empty_list",
   "$equal","$render","$val_to_string",
-  "$check_is","$check_is_not","$check_pred","$yield" ]
+  "$check_is","$check_is_not","$check_pred","$yield",
+  # renderer helpers + decimal writer + str-copy (appended; order parallels build-runtime)
+  "$render_num","$write_i64","$str_copy","$render_variant","$render_list","$render_tuple","$render_object" ]
 
 # Assemble all runtime functions in order. TODO bodies trap; fleshed ones are real.
 fun build-runtime() -> List<RtFun>:
@@ -456,5 +839,7 @@ fun build-runtime() -> List<RtFun>:
     emit-make-variant(), emit-variant-id(), emit-variant-field(), emit-variant-field-by-name(), emit-variant-equal(),
     emit-make-object(), emit-obj-get(), emit-obj-equal(), emit-obj-extend(), emit-make-method(), emit-cons(), emit-empty-list(),
     emit-equal(), emit-render(), emit-val-to-string(),
-    emit-check-is(), emit-check-is-not(), emit-check-pred(), emit-yield() ]
+    emit-check-is(), emit-check-is-not(), emit-check-pred(), emit-yield(),
+    emit-render-num(), emit-write-i64(), emit-str-copy(),
+    emit-render-variant(), emit-render-list(), emit-render-tuple(), emit-render-object() ]
 end

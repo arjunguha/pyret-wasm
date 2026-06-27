@@ -797,6 +797,16 @@ fun collect-toplevel(e, acc):
 end
 
 # ===== program assembler =====
+# main sets $link_id/$empty_id from List's link/empty variant ids (looked up in the data
+# registry) so the renderer shows lists as [list: ...] and $cons/$empty_list build
+# well-formed variants. If the program defines no such variant, the global stays -1.
+fun gid-init(dreg, name :: String, gi :: Number) -> List<Number>:
+  cases(Option) dreg-find(dreg, name):
+    | none => empty
+    | some(d) => E.i32-const(d.id).append(E.global-set(gi))
+  end
+end
+
 fun compile-prog(prog) -> List<Number>:
   cases(N.AProg) prog:
     | a-program(l, provides, imports, body) =>
@@ -806,8 +816,9 @@ fun compile-prog(prog) -> List<Number>:
       num-rt = length(RT-FUNS)
       num-ctors = length(dreg)
       ordered = ctors-by-id(dreg, 0, num-ctors)             # ctors in id order
-      # top-level globals follow $variant_names (global 0 when there are variants).
-      gbase = if num-ctors == 0: 0 else: 1 end
+      # globals: [runtime block 0..NUM-RT-GLOBALS-1][$variant_names?][top-level...].
+      # top-level globals follow the runtime block and $variant_names (when variants exist).
+      gbase = R.NUM-RT-GLOBALS + (if num-ctors == 0: 0 else: 1 end)
       tl-keys = collect-toplevel(body, empty).reverse()
       num-tl = length(tl-keys)
       gmap = map2(lam(k, gi): {k: k, gi: gbase + gi} end, tl-keys, range(0, num-tl))
@@ -820,7 +831,10 @@ fun compile-prog(prog) -> List<Number>:
 
       # ----- main (() -> anyref), the lambda bodies, and the ctor bodies -----
       main-ctx = ctx(empty, 0, empty, gmap, lam-map, dreg, gvars, num-lams)
-      main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], compile-aexpr(body, main-ctx, true))
+      # set $link_id/$empty_id from the data registry before running the program body.
+      list-id-init = gid-init(dreg, "link", R.GI-LINK-ID).append(gid-init(dreg, "empty", R.GI-EMPTY-ID))
+      main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)],
+        list-id-init.append(compile-aexpr(body, main-ctx, true)))
       lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry
@@ -856,19 +870,24 @@ fun compile-prog(prog) -> List<Number>:
       vn-global = if num-ctors == 0: empty
                   else: [list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))] end
       tl-globals = range(0, num-tl).map(lam(_): E.global-entry(E.anyref, 1, E.i-ref-null(110)) end)
-      all-globals = vn-global.append(tl-globals)
+      # runtime globals ($link_id/$empty_id/$passed/$total) occupy the lowest indices.
+      all-globals = R.rt-globals().append(vn-global.append(tl-globals))
       global-c = if is-empty(all-globals): empty else: E.vec(all-globals) end
 
       # ----- import section: host functions, module "host" (occupy the low funcidxs) -----
       import-c = E.vec(map2(lam(hi, k): E.import-func("host", hi.name, import-type-idx(k)) end,
                             R.host-imports, range(0, NUM-IMPORTS)))
 
-      # ----- export main -----
-      export-c = E.vec([list: E.export-entry("main", 0, main-funcidx)])
+      # ----- linear memory (scratch for string marshalling): 1..256 pages, exported -----
+      mem-c = E.vec([list: E.mem-type(1, 256)])
+
+      # ----- exports: main (func 0) + the memory (so the host reads rendered strings) -----
+      export-c = E.vec([list: E.export-entry("main", 0, main-funcidx),
+                              E.export-entry("memory", 2, 0)])
 
       # ----- code section -----
       code-c = E.vec(rt-code.append(lam-code).append(ctor-code).append([list: main-code]))
 
-      E.wasm-module-of(type-c, import-c, func-c, table-c, empty, global-c, export-c, elem-c, code-c)
+      E.wasm-module-of(type-c, import-c, func-c, table-c, mem-c, global-c, export-c, elem-c, code-c)
   end
 end

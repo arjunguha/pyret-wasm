@@ -48,10 +48,18 @@ end
 # MUST match compileIntrinsic in compile.arr / compile.ts.
 intrinsics :: List<String> = [list:
   "raise", "tostring", "to-string", "torepr", "to-repr",
-  "string-length", "string-to-code-points", "string-from-code-point",
-  "num-modulo", "num-quotient",
+  "string-length", "string-equal", "string-to-code-point", "string-to-code-points",
+  "string-from-code-point",
+  "num-modulo", "num-quotient", "num-ceiling", "num-floor", "num-round",
+  "num-sqrt", "num-exact", "num-expt", "num-to-roughnum", "num-to-scientific",
+  "num-is-fixnum", "num-is-integer", "num-is-rational", "num-is-roughnum",
+  "is-boolean", "is-nothing", "is-tuple",
+  "equal-always", "equal-now", "identical",
   "raw-array-get", "raw-array-length", "raw-array-set", "raw-array-of",
-  "emit-byte", "identical", "print", "display", "print-error" ]
+  "prim-raw-array-get", "prim-raw-array-length", "prim-raw-array-set", "prim-raw-array-of",
+  "parse-num-nodes", "parse-node-tag", "parse-node-nkids", "parse-node-str",
+  "read-source", "time-now", "emit-byte",
+  "print", "display", "print-error" ]
 
 # ---- CstNode helpers (mirror only/child) ----
 # NB: the shared prelude's `find` returns the bare element (or `false`), NOT an
@@ -196,6 +204,8 @@ fun t(node :: CstNode, k :: Cont) -> String:
     | node.name == "if-expr" then: t-if(node, k)
     | node.name == "cases-expr" then: t-cases(node, k)
     | node.name == "for-expr" then: t-for(node, k)
+    | node.name == "when-expr" then: t-when(node, k)
+    | node.name == "if-pipe-expr" then: t-ask(node, k)
     | node.name == "construct-expr" then: t-construct(node, k)
     | node.name == "dot-expr" then:
       t(node.kids.first, k-fn(lam(vo): applyk(k, vo + "." + child-bang(node, "NAME").value.or-else("_")) end))
@@ -351,8 +361,22 @@ fun t-cases(node :: CstNode, k :: Cont) -> String:
       "block: " + kf + " = " + reifyk(k) + " " + inner + " end"
   end
 end
-# TODO(port): faithful else-block extraction (TS slices kids after the ELSE token).
-fun find-else-block(node :: CstNode) -> Option<CstNode>: none end
+# Faithful else-block extraction: cases-expr ends with `[BAR ELSE THICKARROW block]`,
+# so the else block is the first direct `block` kid appearing AFTER the `ELSE` token
+# (the per-branch blocks live inside `cases-branch`, not as direct kids).
+fun find-else-block(node :: CstNode) -> Option<CstNode>:
+  fun loop(kids :: List<CstNode>, seen-else :: Boolean) -> Option<CstNode>:
+    cases(List) kids:
+      | empty => none
+      | link(x, rest) =>
+        new-seen = seen-else or (x.name == "ELSE")
+        if new-seen and (x.name == "block"): some(x)
+        else: loop(rest, new-seen)
+        end
+    end
+  end
+  loop(node.kids, false)
+end
 
 # for ITER(p from e, ...): body end  ==>  ITER(lam(p,...,KG): yield-check(...) end, e..., reify k)
 fun t-for(node :: CstNode, k :: Cont) -> String:
@@ -367,6 +391,54 @@ fun t-for(node :: CstNode, k :: Cont) -> String:
   t(iter-expr, k-fn(lam(v-iter):
       t-seq(from-exprs, empty, lam(vs):
           v-iter + "(" + join-args(link(lam-src, vs) + [list: reifyk(k)]) + ")" end) end))
+end
+
+# when COND: BODY end  ==>  if COND: <BODY, value discarded> ; nothing  else: nothing end
+# `when` always yields nothing; the body runs for effect and stays interruptible
+# (its calls are CPS-threaded). k is bound once so it isn't duplicated across branches.
+fun t-when(node :: CstNode, k :: Cont) -> String:
+  cond = find-bang(lam(x): x.name == "binop-expr" end, node.kids)
+  body = child-bang(node, "block")
+  fun emit(vc :: String, kf :: Cont) -> String:
+    "if " + vc + ": " + t-block(body, k-fn(lam(_): applyk(kf, "nothing") end))
+      + " else: " + applyk(kf, "nothing") + " end"
+  end
+  cases(Cont) k:
+    | k-var(_) => t(cond, k-fn(lam(vc): emit(vc, k) end))
+    | k-fn(_) =>
+      kf = gensym("k")
+      inner = t(cond, k-fn(lam(vc): emit(vc, k-var(kf)) end))
+      "block: " + kf + " = " + reifyk(k) + " " + inner + " end"
+  end
+end
+
+# ask: | t1 then: b1 | t2 then: b2 [ | otherwise: bo ] end  ==>  nested if/else.
+# Unlike if's else-if conditions (assumed pure), ask BRANCH TESTS sit in value
+# position and may contain calls, so each test is CPS-evaluated; the rest of the
+# chain becomes its else-branch. k is bound once and shared across all branch bodies.
+fun t-ask(node :: CstNode, k :: Cont) -> String:
+  branches = filter(lam(x): x.name == "if-pipe-branch" end, node.kids)
+  otherwise-blk = child(node, "block")   # the optional `| otherwise:` block (direct kid)
+  fun build(brs :: List<CstNode>, kf :: Cont) -> String:
+    cases(List) brs:
+      | empty =>
+        cases(Option) otherwise-blk:
+          | some(ob) => t-block(ob, kf)
+          | none => "raise(\"ask: no branch matched\")"
+        end
+      | link(br, rest) =>
+        test = find-bang(lam(x): x.name == "binop-expr" end, br.kids)
+        body = find-bang(lam(x): x.name == "block" end, br.kids)
+        t(test, k-fn(lam(vt):
+            "if " + vt + ": " + t-block(body, kf) + " else: " + build(rest, kf) + " end" end))
+    end
+  end
+  cases(Cont) k:
+    | k-var(_) => build(branches, k)
+    | k-fn(_) =>
+      kf = gensym("k")
+      "block: " + kf + " = " + reifyk(k) + " " + build(branches, k-var(kf)) + " end"
+  end
 end
 
 # render a call-free expression to source (else-if conditions) — mirror renderPure
