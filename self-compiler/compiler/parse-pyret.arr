@@ -1,18 +1,39 @@
 provide *
-# Surface parser for the self-hosted compiler. The real Pyret surface syntax is
-# parsed by the seed's JS GLR tokenizer+parser; that CST is lowered host-side
-# (src/runtime/parse-bridge.ts) and rebuilt into ast.arr AST by parse-from-tree.
+# Surface parser for the self-hosted compiler.
 #
-# NOTE (current scope): the host bridge parses the RUNTIME source buffer (what
-# `read-source` delivers) — lazily, the first time the parser walks it — so `src`
-# must be that same program. surface-parse does not yet parse an arbitrary string
-# independent of read-source: transmitting `src` to the host needs a string-passing
-# parse intrinsic in the seed (src/compiler/compile.ts), a one-line follow-up.
-# Forms wired: program/block, num/str/bool/id, binop, app, dot, method-call, if/
-# if-else, let/var, fun/lam, [list: ...] construct, and `is` check-tests. Growing
-# coverage means growing parse-bridge.ts + parse-from-tree.arr together.
-import file("../../self-host/parse-from-tree.arr") as PT
+# NO JAVASCRIPT: this delegates to the pure-Pyret parser (self-host/
+# pyret-parser.arr) — a hand-rolled tokenizer + recursive-descent parser written
+# entirely in Pyret that parses the whole compiler closure (96/96 files) into real
+# ast.arr ASTs with real srclocs. The deployable self-hosted compiler parses with
+# no JS.
+#
+# `src` is the program text (the driver passes `read-source()`); `uri` is recorded
+# as the source name in every srcloc.
+#
+# NAME-LOC CANONICALIZATION (temporary shim): the backend's free-variable analysis
+# (self-host/wasm-of-pyret.arr `name-key`) keys variable identity by `tostring(name)`,
+# which for `s-name` INCLUDES the srcloc — so with real srclocs a parameter's binding
+# `s-name` differs from its use `s-name`, params get misclassified as free vars and
+# captured as null (the driver doesn't run resolve-scope to assign atoms). We normalize
+# ONLY `s-name` locs to dummy here, leaving real srclocs on every other node (good error
+# locations).  Proper fix: make the backend use `A.Name.key()` (loc-independent) instead
+# of `tostring`, then drop this shim.  (The old JS-GLR bridge — src/runtime/parse-bridge.ts
+# + self-host/parse-from-tree.arr — stays for the seed/tests but is off the self-hosted path.)
+import ast as A
+import file("../../self-host/pyret-parser.arr") as PP
 
-fun surface-parse(src, uri):
-  PT.from-tree()
+fun surface-parse(src-in, uri):
+  # Parse `src-in`. Fall back to the host source buffer (`read-source()`) when given an
+  # empty string — some callers/tests prime the runtime source and pass "" (the old
+  # JS-GLR bridge ignored `src` entirely and always read the host buffer).
+  src = if string-length(src-in) == 0: read-source() else: src-in end
+  # `.visit(dummy-loc-visitor)` normalizes ALL locs to dummy. We must dummy not just
+  # `s-name` uses but every loc the DRIVER later copies into a freshly-created `s-name`
+  # (e.g. desugaring `fun f` → an `s-letrec-bind` whose binder name reuses the s-fun's
+  # loc): otherwise the driver-made binder name (real loc) ≠ the canonicalized use name
+  # (dummy loc) and the backend's `tostring`-keyed free-var analysis mis-binds it.
+  # pyret-parser still produces REAL srclocs (its own tests rely on them); this shim
+  # only normalizes the AST handed to the backend, until the backend keys names by
+  # `A.Name.key()` instead of `tostring`.
+  PP.parse-named(src, uri).visit(A.dummy-loc-visitor)
 end
