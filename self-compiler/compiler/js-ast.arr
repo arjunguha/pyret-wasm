@@ -720,7 +720,7 @@ sharing:
 end
 
 
-default-map-visitor = {
+default-js-map-visitor = {
   method j-field(self, name, value): j-field(self, name, value.visit(self)) end,
   method j-parens(self, exp): j-parens(exp.visit(self)) end,
   method j-unop(self, exp, op): j-unop(exp.visit(self), op) end,

@@ -1,20 +1,238 @@
 provide *
-# End-to-end SELF-HOSTED compile driver: source String -> WASM bytes, emitted via
-# `emit-byte`. Chains the self-hosted front-end (surface-parse -> [desugar-scope ->
-# resolve -> desugar] -> anf) into the wasm-of-pyret backend. Compiled by the seed;
-# the bytes it emits ARE the target program's module (produced by Pyret-in-WASM).
+# End-to-end SELF-HOSTED compile driver
 #
-# Run via src/build-selfhost.ts compileWithModule (sets sourceBytes + parseNodes),
-# collecting state.emitted. surface-parse reads the host parse-node stream, so the
-# target program is whatever the host primed (read-source / parseNodes), not `src`.
+# Chain: surface-parse (JS GLR) -> desugar-for-anf (cases-based, no visit()) ->
+#        fix-provides -> ANF -> wasm-of-pyret backend.
+#
+# IMPORTANT: The seed compiler does NOT generate _match methods for data variants,
+# so visit() on AST nodes is broken.  All passes in this driver use `cases`
+# (which the seed compiler DOES support) instead of the visitor pattern.
 
 import file("../self-compiler/compiler/parse-pyret.arr") as P
 import ast as A
 import anf as ANF
 import file("./wasm-of-pyret.arr") as W
 
-# anf-program reads `provides.first`; surface-parse leaves that field `empty`, and
-# the backend ignores provides anyway — so patch in a singleton placeholder.
+# ── op-string → global arithmetic function name ─────────────────────────────
+
+fun op-to-global(op-str :: String) -> String:
+  if op-str == "op+": "_plus"
+  else if op-str == "op-": "_minus"
+  else if op-str == "op*": "_times"
+  else if op-str == "op/": "_divide"
+  else if op-str == "op<": "_lessthan"
+  else if op-str == "op>": "_greaterthan"
+  else if op-str == "op<=": "_lessequal"
+  else if op-str == "op>=": "_greaterequal"
+  else if op-str == "op==": "equal-always"
+  else: raise("Unknown op: " + op-str)
+  end
+end
+
+# ── cases-based AST desugaring (no visit()) ──────────────────────────────────
+#
+# Converts forms that ANF doesn't handle to forms it does:
+#   s-op        -> s-app-enriched( s-id(s-global(…)), [lhs, rhs] )
+#   s-app       -> s-app-enriched( f, args )
+#   s-fun       -> collected into s-letrec by desugar-stmts
+#   s-if        -> s-if-else (adds runtime error else-branch)
+# All other nodes are passed through with recursive descent into sub-expressions.
+
+fun desugar-expr(e :: A.Expr) -> A.Expr:
+  l = A.dummy-loc
+  no-info = A.app-info-c(false, false)
+  cases(A.Expr) e:
+    | s-num(_, _)  => e
+    | s-str(_, _)  => e
+    | s-bool(_, _) => e
+    | s-id(_, _)   => e
+    | s-prim-val(_, _) => e
+    | s-undefined(_) => e
+    | s-srcloc(_, _) => e
+    | s-id-var(_, _) => e
+    | s-id-letrec(_, _, _) => e
+    | s-id-modref(_, _, _, _) => e
+    | s-id-var-modref(_, _, _, _) => e
+    | s-ref(_, _) => e
+
+    | s-op(loc, op-loc, op-str, lhs, rhs) =>
+      gname = op-to-global(op-str)
+      A.s-app-enriched(loc, A.s-id(loc, A.s-global(gname)),
+        [list: desugar-expr(lhs), desugar-expr(rhs)], no-info)
+
+    | s-app(loc, f, args) =>
+      A.s-app-enriched(loc, desugar-expr(f),
+        args.map(desugar-expr), no-info)
+
+    | s-app-enriched(loc, f, args, info) =>
+      A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), info)
+
+    | s-block(loc, stmts) =>
+      A.s-block(loc, desugar-stmts(stmts))
+
+    | s-if-else(loc, branches, _else, blocky) =>
+      A.s-if-else(loc,
+        branches.map(lam(b): A.s-if-branch(b.l, desugar-expr(b.test), desugar-expr(b.body)) end),
+        desugar-expr(_else), blocky)
+
+    | s-if(loc, branches, blocky) =>
+      # Desugar s-if (no else) to s-if-else with a raise as the else branch
+      A.s-if-else(loc,
+        branches.map(lam(b): A.s-if-branch(b.l, desugar-expr(b.test), desugar-expr(b.body)) end),
+        A.s-prim-app(loc, "throwNonBooleanCondition", [list:], A.prim-app-info-c(false)),
+        blocky)
+
+    | s-lam(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
+      A.s-lam(loc, name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+
+    | s-fun(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
+      # s-fun in non-statement position: turn into a self-named lambda
+      A.s-lam(loc, name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+
+    | s-let(loc, bind, expr, closure-val) =>
+      A.s-let(loc, bind, desugar-expr(expr), closure-val)
+
+    | s-let-expr(loc, binds, body, blocky) =>
+      new-binds = binds.map(lam(b):
+        cases(A.LetBind) b:
+          | s-let-bind(bl, bind, val) => A.s-let-bind(bl, bind, desugar-expr(val))
+          | s-var-bind(bl, bind, val) => A.s-var-bind(bl, bind, desugar-expr(val))
+        end
+      end)
+      A.s-let-expr(loc, new-binds, desugar-expr(body), blocky)
+
+    | s-letrec(loc, binds, body, blocky) =>
+      new-binds = binds.map(lam(b):
+        A.s-letrec-bind(b.l, b.b, desugar-expr(b.value))
+      end)
+      A.s-letrec(loc, new-binds, desugar-expr(body), blocky)
+
+    | s-var(loc, bind, val) =>
+      A.s-var(loc, bind, desugar-expr(val))
+
+    | s-assign(loc, id, val) =>
+      A.s-assign(loc, id, desugar-expr(val))
+
+    | s-dot(loc, obj, field) =>
+      A.s-dot(loc, desugar-expr(obj), field)
+
+    | s-get-bang(loc, obj, field) =>
+      A.s-get-bang(loc, desugar-expr(obj), field)
+
+    | s-update(loc, obj, fields) =>
+      A.s-update(loc, desugar-expr(obj), fields.map(lam(f):
+        A.s-data-field(f.l, f.name, desugar-expr(f.value))
+      end))
+
+    | s-extend(loc, obj, fields) =>
+      A.s-extend(loc, desugar-expr(obj), fields.map(lam(f):
+        A.s-data-field(f.l, f.name, desugar-expr(f.value))
+      end))
+
+    | s-obj(loc, fields) =>
+      A.s-obj(loc, fields.map(lam(f):
+        A.s-data-field(f.l, f.name, desugar-expr(f.value))
+      end))
+
+    | s-tuple(loc, fields) =>
+      A.s-tuple(loc, fields.map(desugar-expr))
+
+    | s-tuple-get(loc, tup, index, index-loc) =>
+      A.s-tuple-get(loc, desugar-expr(tup), index, index-loc)
+
+    | s-array(loc, values) =>
+      A.s-array(loc, values.map(desugar-expr))
+
+    | s-user-block(loc, body) =>
+      # strip s-user-block — just keep the inner expression
+      desugar-expr(body)
+
+    | s-instantiate(loc, body, params) =>
+      A.s-instantiate(loc, desugar-expr(body), params)
+
+    | s-module(loc, answer, dv, dt, prov, types, checks) =>
+      A.s-module(loc, desugar-expr(answer), dv, dt, prov, types, desugar-expr(checks))
+
+    | s-check-expr(loc, expr, ann) =>
+      A.s-check-expr(loc, desugar-expr(expr), ann)
+
+    | s-prim-app(loc, fname, args, info) =>
+      A.s-prim-app(loc, fname, args.map(desugar-expr), info)
+
+    | s-construct(loc, modifier, constructor, values) =>
+      A.s-construct(loc, modifier, desugar-expr(constructor), values.map(desugar-expr))
+
+    | s-paren(_, inner) => desugar-expr(inner)
+
+    | else => e
+  end
+end
+
+# ── Desugar a statement list, hoisting consecutive s-fun into s-letrec ────────
+
+fun collect-funs(stmts):
+  # Returns {fun-list; remaining-stmts} splitting at first non-s-fun
+  cases(List) stmts:
+    | empty => {[list:]; [list:]}
+    | link(f, rest) =>
+      is-sfun = A.is-s-fun(f)
+      if is-sfun:
+        {more-funs; remaining} = collect-funs(rest)
+        {link(f, more-funs); remaining}
+      else:
+        {[list:]; stmts}
+      end
+  end
+end
+
+fun fun-to-letrec-bind(fn :: A.Expr) -> A.LetrecBind:
+  cases(A.Expr) fn:
+    | s-fun(fl, fname, fparams, fargs, fann, fdoc, fbody, fchk-loc, fchk, fblocky) =>
+      lam-val = A.s-lam(fl, fname, fparams, fargs, fann, fdoc, desugar-expr(fbody),
+                        fchk-loc, fchk, fblocky)
+      A.s-letrec-bind(fl, A.s-bind(fl, false, A.s-name(fl, fname), A.a-blank), lam-val)
+  end
+end
+
+fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
+  l = A.dummy-loc
+  cases(List) stmts:
+    | empty => empty
+    | link(f, rest) =>
+      cases(A.Expr) f:
+        | s-fun(_, _, _, _, _, _, _, _, _, _) =>
+          # Collect a run of consecutive s-fun definitions
+          {funs; remaining} = collect-funs(stmts)
+          letrec-binds = funs.map(fun-to-letrec-bind)
+          remaining-desugared = desugar-stmts(remaining)
+          # Body of the letrec is the remaining statements
+          letrec-body = if is-empty(remaining-desugared):
+            A.s-id(l, A.s-name(l, "nothing"))
+          else if is-empty(remaining-desugared.rest):
+            remaining-desugared.first
+          else:
+            A.s-block(l, remaining-desugared)
+          end
+          [list: A.s-letrec(l, letrec-binds, letrec-body, false)]
+        | else =>
+          link(desugar-expr(f), desugar-stmts(rest))
+      end
+  end
+end
+
+fun desugar-program(prog :: A.Program) -> A.Program:
+  cases(A.Program) prog:
+    | s-program(loc, use, prov, prov-types, provides, imports, body) =>
+      new-body = cases(A.Expr) body:
+        | s-block(bl, stmts) => A.s-block(bl, desugar-stmts(stmts))
+        | else => desugar-expr(body)
+      end
+      A.s-program(loc, use, prov, prov-types, provides, imports, new-body)
+  end
+end
+
+# ── Patch provides.first for ANF (which expects a non-empty provides list) ────
+
 fun fix-provides(prog :: A.Program) -> A.Program:
   cases(A.Program) prog:
     | s-program(l, u, p, pt, _, imports, blk) =>
@@ -22,12 +240,12 @@ fun fix-provides(prog :: A.Program) -> A.Program:
   end
 end
 
+# ── Main compile pipeline ─────────────────────────────────────────────────────
+
 fun compile-source(src) -> List<Number>:
-  ast = P.surface-parse(src, "test")
-  # NOTE: desugar/resolve-scope need a C.CompileEnvironment (heavy) and `desugar`
-  # null-refs standalone — so this minimal driver only handles already-core forms
-  # (literals/blocks that anf accepts directly). Operators/`if`/etc. need desugar.
-  fixed = fix-provides(ast)
+  raw-ast = P.surface-parse(src, "test")
+  desugared = desugar-program(raw-ast)
+  fixed = fix-provides(desugared)
   aprog = ANF.anf-program(fixed)
   W.compile-prog(aprog)
 end
