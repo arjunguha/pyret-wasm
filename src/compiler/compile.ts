@@ -1294,7 +1294,10 @@ class Compiler {
       const args = argExprNodes.map((a) => this.compileExpr(a, ctx, false));
       const intr = this.compileIntrinsic(dot.name, args, ctx);
       if (intr !== null) return intr;
-      if (this.variants.has(dot.name)) {
+      // A top-level binding (e.g. a `shadow str = lam ...` over a variant `str`)
+      // overrides the variant — match resolveName's topScope-before-variants order.
+      // Only build the variant directly when the name is NOT a top-level global.
+      if (!this.topScope.has(dot.name) && this.variants.has(dot.name)) {
         const v = this.variants.get(dot.name)!;
         return this.makeVariant(dot.name, v, args);
       }
