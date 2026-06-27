@@ -19,8 +19,6 @@
 // (buildSourceSelfHosted throws).
 
 import { buildSourceFile } from "./build.ts";
-import { parsePyret } from "./parser/pyret-parser.ts";
-import { serializeCst } from "./runtime/parse-bridge.ts";
 import { buildHostImports, newHostState, run } from "./runtime/run.ts";
 import type { RunResult } from "./runtime/run.ts";
 import { resolve } from "path";
@@ -37,11 +35,13 @@ export async function compileSelfHostedDriver(): Promise<Uint8Array> {
 
 // Run the self-hosted compiler driver MODULE on a source string, returning the WASM
 // module bytes it emits. The driver reads its input via `read-source()`
-// (state.sourceBytes) and the surface parser via the JS-GLR bridge (state.parseNodes).
+// (state.sourceBytes) and parses with the no-JS pure-Pyret parser — NO JS-GLR bridge.
+// (The old `state.parseNodes = serializeCst(parsePyret(src))` priming was vestigial —
+// surface-parse no longer reads parseNodes — and it CRASHED `toAnn` on `a-app`
+// annotations, which masqueraded as the "×10 JS error a.name" self-compile blocker.)
 export async function compileWithDriver(driverWasm: Uint8Array, src: string): Promise<Uint8Array> {
   const state = newHostState(() => {}); // discard the compiler's own stdout
   state.sourceBytes = new TextEncoder().encode(src);
-  state.parseNodes = serializeCst(await parsePyret(src)); // prime the JS-GLR surface-parse bridge
   const { instance } = await WebAssembly.instantiate(driverWasm as BufferSource, buildHostImports(state));
   state.instance = instance;
   state.memory = instance.exports.memory as WebAssembly.Memory;

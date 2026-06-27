@@ -97,7 +97,11 @@ throw-prims :: List<String> = [list:
 # resolve-scope) so capture knows to grab the BOX. nlams: lambda count, so a-data-expr can
 # compute a ctor's table slot (= nlams + variant.id).
 data Ctx: ctx(locals, next-local :: Number, vars, fenv, lams, dreg, gvars, nlams :: Number) end
-fun name-key(n): tostring(n) end          # TODO(port): use A.Name's .key()
+# loc-independent identity. Only s-name carries a loc (the reason the dummy-loc shim
+# existed); other Names + non-Name values are already loc-free under tostring. Guard with
+# ref.test (null-safe) so a non-Name (e.g. a tuple-bind's absent .id) falls back like the
+# old tostring instead of crashing on a missing .key().
+fun name-key(n): if A.is-s-name(n): "name#" + n.s else: tostring(n) end end
 fun bind-local(c :: Ctx, key, idx :: Number) -> Ctx:
   ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
