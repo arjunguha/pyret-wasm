@@ -130,6 +130,12 @@ class Compiler {
 
     // Pass 3: $main — initialize fun globals (hoisted), then run statements.
     const ctx = new Ctx(true);
+    // Box top-level vars captured+assigned by a nested closure (e.g. a `var` inside
+    // a `block:` expression). Top-level *statement* vars are globals (shared already),
+    // so exclude those — only nested-block locals need a shared cell.
+    for (const n of this.boxedVarsFor(block!)) {
+      if (!this.topScope.has(n)) ctx.boxed.add(n);
+    }
     const resultLocal = ctx.addLocal(binaryen.anyref);
     const lenLocal = ctx.addLocal(binaryen.i32);
     const body: number[] = [];
@@ -287,7 +293,7 @@ class Compiler {
     const m = this.m;
     const names = methods.map((meth) => this.strLiteralRaw(meth.name));
     const values = methods.map((meth) => {
-      const closure = this.buildClosureFromParts(this.headerParams(meth.node), this.childNamed(meth.node, "block")!, ctx, "$vmth_");
+      const closure = this.buildClosureFromParts(this.headerParamBindings(meth.node), this.childNamed(meth.node, "block")!, ctx, "$vmth_");
       return m.struct.new([m.ref.cast(closure, this.t.ClosureRef)], this.t.Method);
     });
     return m.call("$make_object", [m.array.new_fixed(this.t.Names, names), m.array.new_fixed(this.t.Fields, values)], this.t.ObjectRef);
@@ -358,38 +364,58 @@ class Compiler {
     }
   }
 
-  private headerParams(fnLike: CstNode): string[] {
+  // The binding nodes for a function/lambda header — one per arg SLOT (a slot may
+  // be a tuple-binding `{a; b}`, which binds multiple names from one argument).
+  private headerParamBindings(fnLike: CstNode): CstNode[] {
     const header = this.childNamed(fnLike, "fun-header");
     const args = header && this.childNamed(header, "args");
     if (!args) return [];
-    return args.kids.filter((k) => k.name === "binding").map((b) => this.bindingName(b));
+    return args.kids.filter((k) => k.name === "binding");
+  }
+
+  // All names a header binds (flattening tuple-binding params).
+  private headerParams(fnLike: CstNode): string[] {
+    return this.headerParamBindings(fnLike).flatMap((b) => this.bindingNames(b));
   }
 
   // Compile a fun-expr or lambda-expr into a wasm function with the uniform
   // calling convention. `captures` maps captured free-var names -> caps index.
   private compileFunction(wasmName: string, fnLike: CstNode, captures: Map<string, number>) {
-    this.compileFunctionParts(wasmName, this.headerParams(fnLike), this.childNamed(fnLike, "block")!, captures);
+    this.compileFunctionParts(wasmName, this.headerParamBindings(fnLike), this.childNamed(fnLike, "block")!, captures);
   }
 
-  private compileFunctionParts(wasmName: string, paramNames: string[], bodyBlock: CstNode, captures: Map<string, number>, inheritedBoxed?: Set<string>) {
+  private compileFunctionParts(wasmName: string, paramBindings: CstNode[], bodyBlock: CstNode, captures: Map<string, number>, inheritedBoxed?: Set<string>) {
     const m = this.m;
     const ctx = new Ctx(false);
-    paramNames.forEach((p, i) => ctx.params.set(p, i));
+    const allParamNames = paramBindings.flatMap((b) => this.bindingNames(b));
     captures.forEach((idx, name) => ctx.captures.set(name, idx));
     // boxed = vars declared here that nested closures capture, plus boxed vars
     // we inherited as captures (the cell is shared down the closure chain).
     this.boxedVarsFor(bodyBlock).forEach((n) => ctx.boxed.add(n));
     if (inheritedBoxed) inheritedBoxed.forEach((n) => ctx.boxed.add(n));
     // a param can shadow an outer var name; a param is never boxed.
-    paramNames.forEach((p) => ctx.boxed.delete(p));
+    allParamNames.forEach((p) => ctx.boxed.delete(p));
+    // Each binding occupies one arg slot. Simple names map directly to the slot;
+    // a tuple-binding param destructures its slot value into locals at entry.
+    const prelude: number[] = [];
+    paramBindings.forEach((b, i) => {
+      if (this.tupleComponents(b) === null) {
+        ctx.params.set(this.bindingName(b), i);
+      } else {
+        const argVal = m.array.get(m.local.get(1, this.t.FieldsRefNull), m.i32.const(i), binaryen.anyref, false);
+        this.emitBinding(b, argVal, ctx, prelude);
+      }
+    });
     const body = this.compileBlock(bodyBlock, ctx, true);
-    m.addFunction(wasmName, this.sig, binaryen.anyref, ctx.localTypes, body);
+    const full = prelude.length ? m.block(null, [...prelude, body], binaryen.anyref) : body;
+    m.addFunction(wasmName, this.sig, binaryen.anyref, ctx.localTypes, full);
   }
 
-  // Build a $Closure value from explicit param names + a body block, computing
+  // Build a $Closure value from explicit param bindings + a body block, computing
   // captures against the enclosing ctx. Used by lambdas, local funs, methods, for.
-  private buildClosureFromParts(paramNames: string[], bodyBlock: CstNode, ctx: Ctx, prefix: string): number {
-    const free = this.freeVars(bodyBlock, new Set(paramNames));
+  private buildClosureFromParts(paramBindings: CstNode[], bodyBlock: CstNode, ctx: Ctx, prefix: string): number {
+    const allParamNames = paramBindings.flatMap((b) => this.bindingNames(b));
+    const free = this.freeVars(bodyBlock, new Set(allParamNames));
     const caps: string[] = [];
     for (const name of free) {
       if (ctx.locals.has(name) || ctx.params.has(name) || ctx.captures.has(name)) caps.push(name);
@@ -400,7 +426,7 @@ class Compiler {
     const wasmName = prefix + fnIndex;
     this.fnNames.push(wasmName);
     const inheritedBoxed = new Set(caps.filter((n) => ctx.boxed.has(n)));
-    this.compileFunctionParts(wasmName, paramNames, bodyBlock, capMap, inheritedBoxed);
+    this.compileFunctionParts(wasmName, paramBindings, bodyBlock, capMap, inheritedBoxed);
     return this.makeClosure(fnIndex, caps, ctx);
   }
 
@@ -788,7 +814,7 @@ class Compiler {
       const nameStr = key ? this.childNamed(key, "NAME")!.value! : this.childNamed(f, "NAME")!.value!;
       names.push(this.strLiteralRaw(nameStr));
       if (f.kids.some((k) => k.name === "METHOD")) {
-        const closure = this.buildClosureFromParts(this.headerParams(f), this.childNamed(f, "block")!, ctx, "$mth_");
+        const closure = this.buildClosureFromParts(this.headerParamBindings(f), this.childNamed(f, "block")!, ctx, "$mth_");
         values.push(m.struct.new([m.ref.cast(closure, this.t.ClosureRef)], this.t.Method));
       } else {
         const valNode = this.childNamed(f, "binop-expr")!;
@@ -862,15 +888,21 @@ class Compiler {
   // If any of `operands` is a bare `_`, build `lam($cur..): <node with _ -> $cur> end`.
   private curryOver(node: CstNode, operands: (CstNode | undefined)[], ctx: Ctx): number | null {
     const map = new Map<CstNode, CstNode>();
-    const params: string[] = [];
+    const paramBindings: CstNode[] = [];
     for (const o of operands) {
       const u = o && this.isUnderscore(o);
-      if (u) { const p = "$cur" + (this.gcount++); params.push(p); map.set(u, this.idExprNode(p, node.pos)); }
+      if (u) {
+        const p = "$cur" + (this.gcount++);
+        paramBindings.push({ name: "binding", pos: node.pos, kids: [
+          { name: "name-binding", pos: node.pos, kids: [{ name: "NAME", pos: node.pos, kids: [], value: p }] },
+        ] });
+        map.set(u, this.idExprNode(p, node.pos));
+      }
     }
-    if (params.length === 0) return null;
+    if (paramBindings.length === 0) return null;
     const body = this.replaceNodes(node, map);
     const block: CstNode = { name: "block", pos: node.pos, kids: [{ name: "stmt", pos: node.pos, kids: [body] }] };
-    return this.buildClosureFromParts(params, block, ctx, "$cur_");
+    return this.buildClosureFromParts(paramBindings, block, ctx, "$cur_");
   }
 
   // Whether any data variant has a field named `name` (so `.name` should attempt
@@ -936,16 +968,16 @@ class Compiler {
   }
 
   private compileLambda(node: CstNode, ctx: Ctx): number {
-    return this.buildClosureFromParts(this.headerParams(node), this.childNamed(node, "block")!, ctx, "$lam_");
+    return this.buildClosureFromParts(this.headerParamBindings(node), this.childNamed(node, "block")!, ctx, "$lam_");
   }
 
   // for F(x from e1, y from e2): body end  ==>  F(lam(x, y): body end, e1, e2)
   private compileFor(node: CstNode, ctx: Ctx, tail: boolean): number {
     const iterExpr = node.kids.find((k) => k.name === "expr")!;
     const binds = node.kids.filter((k) => k.name === "for-bind");
-    const paramNames = binds.map((b) => this.bindingName(this.childNamed(b, "binding")!));
+    const paramBindings = binds.map((b) => this.childNamed(b, "binding")!);
     const body = this.childNamed(node, "block")!;
-    const lambda = this.buildClosureFromParts(paramNames, body, ctx, "$for_");
+    const lambda = this.buildClosureFromParts(paramBindings, body, ctx, "$for_");
     const fromArgs = binds.map((b) => this.compileExpr(b.kids.find((k) => k.name === "binop-expr")!, ctx, false));
     const iterClosure = this.compileExpr(iterExpr, ctx, false);
     return this.callClosureValue(iterClosure, [lambda, ...fromArgs], ctx, tail);
@@ -1552,6 +1584,7 @@ class Compiler {
   private compileLocalFun(fnExpr: CstNode, ctx: Ctx): number {
     const m = this.m;
     const name = this.childNamed(fnExpr, "NAME")!.value!;
+    const paramBindings = this.headerParamBindings(fnExpr);
     const params = this.headerParams(fnExpr);
     const body = this.childNamed(fnExpr, "block")!;
     const idx = ctx.addLocal(binaryen.anyref);
@@ -1561,13 +1594,13 @@ class Compiler {
     // self-reference resolves through the box.
     if (this.freeVars(body, new Set(params)).has(name)) {
       ctx.boxed.add(name);
-      const closure = this.buildClosureFromParts(params, body, ctx, "$lfn_");
+      const closure = this.buildClosureFromParts(paramBindings, body, ctx, "$lfn_");
       return m.block(null, [
         m.local.set(idx, this.makeBox(m.ref.i31(m.i32.const(2)))),
         this.setBox(m.local.get(idx, binaryen.anyref), closure),
       ]);
     }
-    return m.local.set(idx, this.buildClosureFromParts(params, body, ctx, "$lfn_"));
+    return m.local.set(idx, this.buildClosureFromParts(paramBindings, body, ctx, "$lfn_"));
   }
 
   private compileNumber(text: string): number {
