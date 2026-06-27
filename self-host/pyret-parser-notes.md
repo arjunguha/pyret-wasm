@@ -84,10 +84,52 @@ Parser:
 - **Exact decimals** (`3.14` → `s-num` holding the exact rational `numer / 10^k`) and
   **rough integers** (`~5` → `s-num` holding a roughnum, no longer an exact int).
 
+## Done in round 4 (parsing REAL compiler source)
+
+Driven by feeding real `self-compiler/**.arr` files through `parse` (via `read-source()`;
+see `pyret-parser-realfile-probe.arr` + the `parses real compiler source files` test).
+**50 of 76 real compiler/trove files now parse**; the rest are blocked by SCALE, not
+grammar (see below). Gaps closed:
+
+- **multi-binding `for`** (`for raw-array-fold(a from x, b from y, _ from z): ...`). The
+  iterator is now parsed with `parse-postfix-noapp` (name/dot chain, no trailing app) so the
+  `(` opens the for-binds rather than being eaten as an application.
+- **triple-backtick strings** `` ```...``` `` (raw, multi-line) — pervasive as `doc:` strings.
+- **unary sign on numeric literals** (`-1`, `+2`, `~5` after a sign) in operand position —
+  Pyret's `num-expr` carries the sign; there is no general unary minus (`-x` on a non-literal
+  isn't valid Pyret).
+- **contract statements with ty-params + no-paren arrow anns**:
+  `name :: <A> (A -> B), C -> D` (grammar `contract-stmt: NAME COLONCOLON ty-params (ann |
+  noparen-arrow-ann)`).  Also typed lets `name :: ann = value` route through the same path.
+- **curly-brace lambdas** `{ [ty-params] args [-> ann] : block }` (e.g. `{(k): {k; v}}`);
+  blocks now also terminate at `}`.
+- **`include from MOD: spec, ... end`** selective includes — bare names, `type`/`data`/
+  `module` specs, `* ` and `type *`/`data *`, optional `as`.
+- (ty-params on `fun`/`method`/`data` declarations were already supported.)
+
 ## TODO(grammar) — to reach the full grammar
 
-- tables (`table:`/`select`/`sieve`/`order`/`extract`/`transform`/`extend`/
-  `load-table`), `reactor`.
+- **tables** (`table:`/`select`/`sieve`/`order`/`extract`/`transform`/`extend`/
+  `load-table`), `reactor`.  This is the ONLY remaining grammar gap across the real
+  compiler+trove source (only `tables.arr` still fails to parse: `expected RPAREN but got
+  COLON` on a `table:` literal).  Large feature, used only by table libraries — NOT by the
+  self-hosted compiler itself.
+
+## REMAINING BLOCKER: SCALE, not grammar (per-file findings)
+
+Of the 76 real `self-compiler/**.arr` files, **50 parse**; **1** has a grammar gap
+(`tables.arr`, above); the other **25 fail at RUNTIME on large inputs**, NOT on grammar:
+- `JS-ERROR: Maximum call stack size exceeded` — the recursive-descent parser + its
+  cons-list builders (`tokenize`/`lex`/`parse-stmts`/`string-to-code-points`) recurse to a
+  depth proportional to file size; 80–130KB files (anf/desugar/well-formed/resolve-scope/
+  type-check/ast.arr/lists/sets/contracts/…) overflow the stack.
+- `JS-ERROR: Length out of range of buffer` — the seed runtime's linear-memory string path
+  hits its limit on the largest files (independent of how much the host pre-grows memory).
+These are the SAME big compiler files the no-JS fixpoint ultimately needs.  Fixing them is a
+RUNTIME/architecture task (make the tokenizer + statement/list loops iterative / tail-
+recursive so they run in constant stack — the seed does native tail calls — and/or raise the
+seed's memory/string limits), out of scope for grammar work.  Tracked here as the next step
+for the pure-Pyret parser.
 - Decimal **exponents** (`3.14e5` — currently the integer part only), full string
   escapes (`\u`, `\x`, octal), triple-backtick strings.
 - Generics/instantiation `f<T>(...)` in expression position (`<`/`>` lex as
