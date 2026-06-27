@@ -42,12 +42,45 @@ fun op-to-global(op-str :: String) -> String:
   end
 end
 
+# ── annotation stripping ─────────────────────────────────────────────────────
+# Our backend does NO contract checking, so annotations are ERASED for codegen.
+# Critically, leaving them in place traps the compiler: a bind/return annotation that
+# is an `a-app` (e.g. `List<Number>`, `Option<a>`), `a-arrow`, `a-dot`, etc. null-refs
+# downstream (anf/backend) — the dominant "null-ref at module load" self-compile blocker.
+# So we replace every bind/return Ann with `a-blank` during desugar.
+
+fun strip-bind(b :: A.Bind) -> A.Bind:
+  cases(A.Bind) b:
+    | s-bind(bl, sh, nm, _) => A.s-bind(bl, sh, nm, A.a-blank)
+    | s-tuple-bind(bl, fields, as-name) =>
+      A.s-tuple-bind(bl, fields.map(strip-bind),
+        cases(Option) as-name:
+          | none => none
+          | some(ab) => some(strip-bind(ab))
+        end)
+  end
+end
+
+fun strip-binds(bs :: List<A.Bind>) -> List<A.Bind>: bs.map(strip-bind) end
+
+fun strip-member(m :: A.VariantMember) -> A.VariantMember:
+  cases(A.VariantMember) m:
+    | s-variant-member(ml, mt, bind) => A.s-variant-member(ml, mt, strip-bind(bind))
+  end
+end
+
+fun strip-cases-bind(cb :: A.CasesBind) -> A.CasesBind:
+  cases(A.CasesBind) cb:
+    | s-cases-bind(cl, ft, bind) => A.s-cases-bind(cl, ft, strip-bind(bind))
+  end
+end
+
 # ── helpers for cases / data desugaring ──────────────────────────────────────
 
 fun desugar-cases-branch(b) -> A.CasesBranch:
   cases(A.CasesBranch) b:
     | s-cases-branch(l, pl, name, args, body) =>
-      A.s-cases-branch(l, pl, name, args, desugar-expr(body))
+      A.s-cases-branch(l, pl, name, args.map(strip-cases-bind), desugar-expr(body))
     | s-singleton-cases-branch(l, pl, name, body) =>
       A.s-singleton-cases-branch(l, pl, name, desugar-expr(body))
   end
@@ -62,7 +95,7 @@ fun desugar-member(m) -> A.Member:
       # feeding it to anf raises "$err_no_field". (Mirrors real Pyret's desugar, which
       # lowers method fields to data-field + s-method before anf.)
       A.s-data-field(fresh-loc(), name,
-        A.s-method(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), cl, ck, bl))
+        A.s-method(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), cl, ck, bl))
     | else => m
   end
 end
@@ -70,7 +103,7 @@ end
 fun desugar-variant(v) -> A.Variant:
   cases(A.Variant) v:
     | s-variant(l, cl, vname, members, with-members) =>
-      A.s-variant(l, cl, vname, members, with-members.map(desugar-member))
+      A.s-variant(l, cl, vname, members.map(strip-member), with-members.map(desugar-member))
     | s-singleton-variant(l, vname, with-members) =>
       A.s-singleton-variant(l, vname, with-members.map(desugar-member))
   end
@@ -188,32 +221,35 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         blocky)
 
     | s-lam(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
-      A.s-lam(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+      A.s-lam(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), chk-loc, chk, blocky)
 
     | s-fun(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
       # s-fun in non-statement position: turn into a self-named lambda
-      A.s-lam(fresh-loc(), name, params, args, ann, doc, desugar-expr(body), chk-loc, chk, blocky)
+      A.s-lam(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), chk-loc, chk, blocky)
+
+    | s-method(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
+      A.s-method(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), chk-loc, chk, blocky)
 
     | s-let(loc, bind, expr, closure-val) =>
-      A.s-let(loc, bind, desugar-expr(expr), closure-val)
+      A.s-let(loc, strip-bind(bind), desugar-expr(expr), closure-val)
 
     | s-let-expr(loc, binds, body, blocky) =>
       new-binds = binds.map(lam(b):
         cases(A.LetBind) b:
-          | s-let-bind(bl, bind, val) => A.s-let-bind(bl, bind, desugar-expr(val))
-          | s-var-bind(bl, bind, val) => A.s-var-bind(bl, bind, desugar-expr(val))
+          | s-let-bind(bl, bind, val) => A.s-let-bind(bl, strip-bind(bind), desugar-expr(val))
+          | s-var-bind(bl, bind, val) => A.s-var-bind(bl, strip-bind(bind), desugar-expr(val))
         end
       end)
       A.s-let-expr(loc, new-binds, desugar-expr(body), blocky)
 
     | s-letrec(loc, binds, body, blocky) =>
       new-binds = binds.map(lam(b):
-        A.s-letrec-bind(b.l, b.b, desugar-expr(b.value))
+        A.s-letrec-bind(b.l, strip-bind(b.b), desugar-expr(b.value))
       end)
       A.s-letrec(loc, new-binds, desugar-expr(body), blocky)
 
     | s-var(loc, bind, val) =>
-      A.s-var(loc, bind, desugar-expr(val))
+      A.s-var(loc, strip-bind(bind), desugar-expr(val))
 
     | s-assign(loc, id, val) =>
       A.s-assign(loc, id, desugar-expr(val))
@@ -255,7 +291,7 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-for(loc, iterator, bindings, _, body, _) =>
       # `for ITER(b0 from e0, b1 from e1): body end`
       #   -> ITER(lam(b0, b1): body end, e0, e1)
-      args = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, b, _) => b end end)
+      args = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, b, _) => strip-bind(b) end end)
       srcs = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, _, v) => desugar-expr(v) end end)
       lam-e = A.s-lam(fresh-loc(), "", [list:], args, A.a-blank, "",
         desugar-expr(body), none, none, false)
@@ -345,7 +381,7 @@ end
 fun fun-to-letrec-bind(fn :: A.Expr) -> A.LetrecBind:
   cases(A.Expr) fn:
     | s-fun(fl, fname, fparams, fargs, fann, fdoc, fbody, fchk-loc, fchk, fblocky) =>
-      lam-val = A.s-lam(fresh-loc(), fname, fparams, fargs, fann, fdoc, desugar-expr(fbody),
+      lam-val = A.s-lam(fresh-loc(), fname, fparams, strip-binds(fargs), A.a-blank, fdoc, desugar-expr(fbody),
                         fchk-loc, fchk, fblocky)
       A.s-letrec-bind(fl, A.s-bind(fl, false, A.s-name(fl, fname), A.a-blank), lam-val)
   end
@@ -396,11 +432,11 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
         | s-let(ll, bind, val, _) =>
           # top-level `x = e` → s-let-expr binding x over the remaining statements
           body = stmts-to-body(desugar-stmts(rest))
-          [list: A.s-let-expr(ll, [list: A.s-let-bind(ll, bind, desugar-expr(val))], body, false)]
+          [list: A.s-let-expr(ll, [list: A.s-let-bind(ll, strip-bind(bind), desugar-expr(val))], body, false)]
         | s-var(ll, bind, val) =>
           # top-level `var x = e` → s-let-expr with a var-bind over the rest
           body = stmts-to-body(desugar-stmts(rest))
-          [list: A.s-let-expr(ll, [list: A.s-var-bind(ll, bind, desugar-expr(val))], body, false)]
+          [list: A.s-let-expr(ll, [list: A.s-var-bind(ll, strip-bind(bind), desugar-expr(val))], body, false)]
         | s-type(_, _, _, _) => desugar-stmts(rest)        # type alias: erased
         | s-newtype(_, _, _) => desugar-stmts(rest)        # newtype: erased
         | else =>
