@@ -191,6 +191,21 @@ fun map2(f, a, b):
   end
 end
 
+# indexed-map family (the _n functions) — f receives a running index.
+fun map_n(f, n, lst):
+  cases(List) lst: | empty => empty | link(fst, rst) => link(f(n, fst), map_n(f, n + 1, rst)) end
+end
+fun map2_n(f, n, l1, l2):
+  cases(List) l1: | empty => empty
+    | link(a, ra) => cases(List) l2: | empty => empty | link(b, rb) => link(f(n, a, b), map2_n(f, n + 1, ra, rb)) end end
+end
+fun each_n(f, num, lst):
+  cases(List) lst: | empty => nothing | link(fst, rst) => block: f(num, fst) each_n(f, num + 1, rst) end end
+end
+fun fold_n(f, num, base, lst):
+  cases(List) lst: | empty => base | link(fst, rst) => fold_n(f, num + 1, f(num, base, fst), rst) end
+end
+
 fun find(f, l):
   cases(List) l:
     | empty => false
