@@ -1102,6 +1102,13 @@ class Compiler {
     if (name === "num-quotient" && args.length === 2) {
       return m.call("$num_quotient", [this.asNum(args[0]!), this.asNum(args[1]!)], this.t.NumRef);
     }
+    if (name === "num-expt" && args.length === 2) {
+      return m.call("$num_expt", [this.asNum(args[0]!), this.asNum(args[1]!)], this.t.NumRef);
+    }
+    if (name === "string-equal" && args.length === 2) {
+      return this.mkBool(m.call("$str_equal",
+        [m.ref.cast(args[0]!, this.t.StrRef), m.ref.cast(args[1]!, this.t.StrRef)], binaryen.i32));
+    }
     if (name === "read-source" && args.length === 0) {
       // The self-hosting input path: ask the host to write the program source into
       // scratch memory, then copy it into a Pyret $Str. Returns a String.
@@ -1179,6 +1186,63 @@ class Compiler {
       }
       if (name === "num-to-roughnum") {
         return m.call("$make_rough", [m.call("$to_f64", [this.asNum(args[0]!)], binaryen.f64)], this.t.RoughnumRef);
+      }
+      if (name === "num-sqrt") {
+        return m.call("$make_rough",
+          [m.f64.sqrt(m.call("$to_f64", [this.asNum(args[0]!)], binaryen.f64))], this.t.RoughnumRef);
+      }
+      // number-kind predicates (NUM_TAG: FIX=0, RATIONAL=1, ROUGH=2, BIGNUM=3)
+      {
+        const tagOf = (x: number) => m.struct.get(0, this.asNum(x), binaryen.i32, false);
+        if (name === "num-is-fixnum") return this.mkBool(m.i32.eq(tagOf(args[0]!), m.i32.const(0)));
+        if (name === "num-is-rational") return this.mkBool(m.i32.eq(tagOf(args[0]!), m.i32.const(1)));
+        if (name === "num-is-roughnum") return this.mkBool(m.i32.eq(tagOf(args[0]!), m.i32.const(2)));
+        if (name === "num-is-integer") {
+          const v = ctx.addLocal(this.t.NumRef);
+          const get = () => m.local.get(v, this.t.NumRef);
+          const tag = () => m.struct.get(0, get(), binaryen.i32, false);
+          const f = () => m.call("$to_f64", [get()], binaryen.f64);
+          return m.block(null, [
+            m.local.set(v, this.asNum(args[0]!)),
+            this.mkBool(m.i32.or(
+              m.i32.or(m.i32.eq(tag(), m.i32.const(0)), m.i32.eq(tag(), m.i32.const(3))),
+              m.i32.and(m.i32.eq(tag(), m.i32.const(2)), m.f64.eq(m.f64.floor(f()), f())))),
+          ], binaryen.anyref);
+        }
+      }
+      // num-floor/ceiling/round: exact input -> exact integer; roughnum -> roughnum.
+      // (Goes through f64, so exact rationals/bignums beyond 2^53 are approximated.)
+      {
+        const roundOp = (op: "floor" | "ceil" | "nearest", x: number) => {
+          const v = ctx.addLocal(this.t.NumRef);
+          const get = () => m.local.get(v, this.t.NumRef);
+          const rf = () => (m.f64 as any)[op](m.call("$to_f64", [get()], binaryen.f64));
+          return m.block(null, [
+            m.local.set(v, this.asNum(x)),
+            m.if(m.i32.eq(m.struct.get(0, get(), binaryen.i32, false), m.i32.const(2)),
+              m.call("$make_rough", [rf()], this.t.RoughnumRef),
+              m.call("$make_fix", [m.i64.trunc_s.f64(rf())], this.t.FixnumRef),
+              this.t.NumRef),
+          ], binaryen.anyref);
+        };
+        if (name === "num-floor") return roundOp("floor", args[0]!);
+        if (name === "num-ceiling") return roundOp("ceil", args[0]!);
+        if (name === "num-round") return roundOp("nearest", args[0]!);
+      }
+      // num-exact: exact passthrough; roughnum -> nearest exact integer (best-effort).
+      if (name === "num-exact") {
+        const v = ctx.addLocal(this.t.NumRef);
+        const get = () => m.local.get(v, this.t.NumRef);
+        return m.block(null, [
+          m.local.set(v, this.asNum(args[0]!)),
+          m.if(m.i32.eq(m.struct.get(0, get(), binaryen.i32, false), m.i32.const(2)),
+            m.call("$make_fix", [m.i64.trunc_s.f64(m.f64.nearest(m.call("$to_f64", [get()], binaryen.f64)))], this.t.FixnumRef),
+            get(), this.t.NumRef),
+        ], binaryen.anyref);
+      }
+      // num-to-scientific: stub — a plain numeric string (not yet true scientific form).
+      if (name === "num-to-scientific") {
+        return m.call("$tostring", [this.asNum(args[0]!)], this.t.StrRef);
       }
     }
     if ((name === "print" || name === "display" || name === "print-error") && args.length === 1) {

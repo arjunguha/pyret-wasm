@@ -148,6 +148,31 @@ export class Runtime {
           m.local.set(5, m.i64.add(r(), b()))),
         m.call("$make_fix", [r()], t.FixnumRef),
       ], t.FixnumRef));
+
+    // $num_expt(base, exp) = base^exp for a non-negative integer exp (repeated
+    // multiply over the full number tower via $num_mul). exp is read as i32.
+    {
+      const base = () => m.local.get(0, t.NumRef);
+      const result = () => m.local.get(2, t.NumRef);
+      const e = () => m.local.get(3, binaryen.i32);
+      const i = () => m.local.get(4, binaryen.i32);
+      m.addFunction("$num_expt", binaryen.createType([t.NumRef, t.NumRef]), t.NumRef,
+        [t.NumRef, binaryen.i32, binaryen.i32],
+        m.block(null, [
+          m.local.set(3, m.call("$num_to_i32", [m.local.get(1, t.NumRef)], binaryen.i32)),
+          m.local.set(2, m.call("$make_fix", [m.i64.const(1n)], t.FixnumRef)),
+          m.local.set(4, m.i32.const(0)),
+          m.block("done", [
+            m.loop("lp", m.block(null, [
+              m.if(m.i32.ge_s(i(), e()), m.br("done")),
+              m.local.set(2, m.call("$num_mul", [result(), base()], t.NumRef)),
+              m.local.set(4, m.i32.add(i(), m.i32.const(1))),
+              m.br("lp"),
+            ])),
+          ]),
+          result(),
+        ], t.NumRef));
+    }
   }
 
   // Build a function that writes `message` to scratch, calls host raise, then
