@@ -339,10 +339,35 @@ class Compiler {
     return null;
   }
 
-  // All names introduced by a binding (recursively flattening tuple bindings).
+  // The `as NAME` alias on a tuple-binding `{a; b} as name` (binds the whole tuple),
+  // or null. The AS + name-binding sit inside the tuple-binding node after the `}`.
+  private tupleAsName(binding: CstNode): string | null {
+    let n: CstNode | undefined = binding;
+    while (n && (n.name === "toplevel-binding" || n.name === "binding")) {
+      const tb = this.childNamed(n, "tuple-binding");
+      if (tb) {
+        const asIdx = tb.kids.findIndex((k) => k.name === "AS");
+        if (asIdx >= 0) {
+          const nb = tb.kids.slice(asIdx).find((k) => k.name === "name-binding");
+          if (nb) { const nm = this.childNamed(nb, "NAME"); if (nm) return nm.value!; }
+        }
+        return null;
+      }
+      if (this.childNamed(n, "name-binding")) break;
+      n = n.kids[0];
+    }
+    return null;
+  }
+
+  // All names introduced by a binding (recursively flattening tuple bindings; a
+  // `{a; b} as whole` binds the components AND `whole`).
   private bindingNames(binding: CstNode): string[] {
     const comps = this.tupleComponents(binding);
-    if (comps) return comps.flatMap((c) => this.bindingNames(c));
+    if (comps) {
+      const names = comps.flatMap((c) => this.bindingNames(c));
+      const asN = this.tupleAsName(binding);
+      return asN ? [...names, asN] : names;
+    }
     return [this.bindingName(binding)];
   }
 
@@ -357,7 +382,11 @@ class Compiler {
   }
   private nonShadowBindingNames(binding: CstNode): string[] {
     const comps = this.tupleComponents(binding);
-    if (comps) return comps.flatMap((c) => this.nonShadowBindingNames(c));
+    if (comps) {
+      const names = comps.flatMap((c) => this.nonShadowBindingNames(c));
+      const asN = this.tupleAsName(binding);
+      return asN ? [...names, asN] : names;
+    }
     return this.hasShadowToken(binding) ? [] : [this.bindingName(binding)];
   }
 
@@ -370,6 +399,14 @@ class Compiler {
     if (comps) {
       const tmp = ctx.addLocal(binaryen.anyref);
       parts.push(m.local.set(tmp, value));
+      // `{a; b} as whole` — also bind the whole tuple value to `whole`.
+      const asN = this.tupleAsName(binding);
+      if (asN) {
+        const idx = ctx.addLocal(binaryen.anyref);
+        ctx.locals.set(asN, idx);
+        const v = m.local.get(tmp, binaryen.anyref);
+        parts.push(m.local.set(idx, ctx.boxed.has(asN) ? this.makeBox(v) : v));
+      }
       comps.forEach((c, i) => {
         const field = m.call("$variant_field",
           [m.ref.cast(m.local.get(tmp, binaryen.anyref), this.t.VariantRef), m.i32.const(i)], binaryen.anyref);
