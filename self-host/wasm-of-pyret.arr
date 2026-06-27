@@ -5,13 +5,17 @@ provide *
 # runtime emitted by runtime.arr. Mirrors the STRUCTURE of anf-loop-compiler.arr /
 # js-of-pyret.arr (the real backend) so later diffing is easy.
 #
-# STATUS: faithful structural SKETCH. The value-model leaf forms (num/bool/str/tuple/
-# obj/dot/var-cell/assign) emit real encoder bytes against the runtime's GC type indices
-# (T-* from runtime.arr/types.ts). The deeper forms (closure-calling convention with a
-# temp local, a-lam function-table collection, a-cases vtag dispatch + field binds,
-# a-data-expr runtime registration, and the compile-prog section ASSEMBLER tie-in to
-# runtime.arr's build-runtime) are `# TODO(port)` — they need the lambda-collection pass
-# and the runtime index map. It parses; it does NOT run end-to-end yet.
+# STATUS: faithful structural port. The value-model leaf forms (num/bool/str/tuple/obj/
+# dot/var-cell/assign) emit real encoder bytes against the runtime's GC type indices.
+# Now ALSO ported: closure free-var CAPTURE (lambdas pack their free vars into the
+# $Closure env and read them back from the env inside the body — boxed `var`s capture the
+# box so mutation is shared), a-data-expr CONSTRUCTOR emission (one table function per
+# variant building a $Variant, plus the $variant_names global), the prim-app dispatch
+# table, and inline $truthy (i31 cast + get_s).  `$raise` stays a trapping stand-in: the
+# function index space is import-free (runtime.arr's internal `call`s are hard-indexed
+# from 0), so a host import would shift every index — wiring it needs a coordinated
+# runtime.arr change.  Most runtime kernels are still `todo()` stubs, so a compiled module
+# does not RUN end-to-end yet; this emits faithful bytes for the structure above.
 
 import encoder as E
 import ast-anf as N
@@ -33,12 +37,13 @@ T-NAMES = 10        # (array (ref $Str))
 T-OBJECT = 11       # (struct (ref $Names), (ref $Fields))
 T-METHOD = 12       # (struct (ref $Closure))
 ANYREF-BT = [list: 110]   # blocktype: single anyref result
+I31-HT = 108              # the i31 abstract heaptype byte (== i31ref value-type byte)
 
 # ===== runtime-function indices =====
-# The function index space is [runtime fns ++ user lambdas ++ main] (no imports yet).
-# So a runtime fn's func index == its position in build-runtime(). We resolve by name
-# against the real list runtime.arr emits, so the idx-* below stay correct as the
-# runtime grows/reorders.  NUM-GC-TYPES type-section entries precede the func types.
+# The function index space is [runtime fns ++ user lambdas ++ variant ctors ++ main] (NO
+# imports — runtime.arr's bodies `call` each other by hard-coded index from 0, so adding
+# an import section would shift every index). A runtime fn's func index == its position in
+# build-runtime(); resolve by name so the idx-* below stay correct as the runtime grows.
 NUM-GC-TYPES = 13
 RT-FUNS = R.build-runtime()
 fun rt-index(name :: String) -> Number: rt-index-from(RT-FUNS, name, 0) end
@@ -54,47 +59,142 @@ fun idx-obj-get(): rt-index("$obj_get") end
 fun idx-obj-extend(): rt-index("$obj_extend") end
 fun idx-variant-field-by-name(): rt-index("$variant_field_by_name") end
 fun idx-variant-id(): rt-index("$variant_id") end
-# no $truthy / $raise runtime fn yet: bools are i31 (inline i31.get_u eventually); raise
-# will be a host import. Keep placeholders so callers still type-check. TODO(port).
-fun idx-truthy(): 0 end
-fun idx-raise(): 0 end
+
+# bools/nothing are i31 (true=1,false=0,nothing=2). $truthy is inlined: cast to i31 then
+# i31.get_s, leaving an i32 the `if` consumes (mirrors compile.ts's truthy()).
+fun truthy-instr() -> List<Number>: E.ref-cast(I31-HT).append(E.i31-get-s) end
+# $raise: see header — no runtime fn / import yet, so emit a trap. TODO(port): host import.
+fun raise-instr() -> List<Number>: E.i-unreachable end
+
+# prim-app names the front-end throws for failed control flow (desugar.arr). They abort.
+throw-prims :: List<String> = [list:
+  "throwNoBranchesMatched", "throwNoCasesMatched", "throwNonBooleanCondition",
+  "throwNonBooleanOp", "throwUnfinishedTemplate" ]
 
 # ===== compile context =====
 # locals: List<{k; i}> A.Name-key -> wasm local index. vars: keys that are BOXED (a-var)
-# so a-id-var/a-assign go through the 1-cell. fenv: List<{k; i}> fn-name -> table index.
-# lams: List<{k; i}> lambda-loc-key -> fnIndex(=table slot), from the collect-lambdas pass.
-# dreg: List<{name; id; arity}> the data registry from the collect-data pass (variant-name
-# -> global variant id + field count), used by a-cases vtag dispatch + a-data-expr.
-data Ctx: ctx(locals, next-local :: Number, vars, fenv, lams, dreg) end
+# so a-id-var/a-assign go through the 1-cell. fenv: reserved. lams: List<{k; i; fvs}>
+# lambda-loc-key -> {fnIndex(=table slot); ordered free-var keys}, from collect-lambdas.
+# dreg: List<{name; id; arity; fields}> the data registry (variant-name -> global id, field
+# count, field names) from collect-data, used by a-cases dispatch + a-data-expr + the
+# $variant_names global. gvars: every key bound by an a-var anywhere (names are unique post
+# resolve-scope) so capture knows to grab the BOX. nlams: lambda count, so a-data-expr can
+# compute a ctor's table slot (= nlams + variant.id).
+data Ctx: ctx(locals, next-local :: Number, vars, fenv, lams, dreg, gvars, nlams :: Number) end
 fun name-key(n): tostring(n) end          # TODO(port): use A.Name's .key()
 fun bind-local(c :: Ctx, key, idx :: Number) -> Ctx:
-  ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg)
+  ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
 fun bind-var(c :: Ctx, key, idx :: Number) -> Ctx:
-  ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), link(key, c.vars), c.fenv, c.lams, c.dreg)
+  ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), link(key, c.vars), c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
 fun is-var(c :: Ctx, key) -> Boolean: c.vars.member(key) end
-fun lookup-local(c :: Ctx, key):
-  cases(List) c.locals:
-    | empty => raise("wasm-of-pyret: unbound local " + key)
-    | link(f, r) => if f.k == key: f.i else: lookup-local(ctx(r, c.next-local, c.vars, c.fenv, c.lams, c.dreg), key) end
-  end
+fun lookup-local-opt(c :: Ctx, key):
+  find-pair-opt(c.locals, key)
 end
-# variant-name -> {id; arity} option, from the data registry.
-fun data-lookup(c :: Ctx, name :: String):
-  cases(List) c.dreg:
+fun find-pair-opt(ps, key):
+  cases(List) ps:
     | empty => none
-    | link(f, r) => if f.name == name: some(f) else: data-lookup(ctx(c.locals, c.next-local, c.vars, c.fenv, c.lams, r), name) end
+    | link(f, r) => if f.k == key: some(f.i) else: find-pair-opt(r, key) end
   end
 end
-# lambda-loc-key -> its collected fnIndex (== table slot).
-fun lookup-lam(c :: Ctx, key) -> Number: lookup-pair(c.lams, key) end
-fun lookup-pair(ps, key) -> Number:
+fun lookup-local(c :: Ctx, key) -> Number:
+  cases(Option) lookup-local-opt(c, key):
+    | none => raise("wasm-of-pyret: unbound local " + key)
+    | some(i) => i
+  end
+end
+# variant-name -> {id; arity; fields} option, from the data registry.
+fun data-lookup(c :: Ctx, name :: String): dreg-find(c.dreg, name) end
+fun dreg-find(ds, name :: String):
+  cases(List) ds:
+    | empty => none
+    | link(f, r) => if f.name == name: some(f) else: dreg-find(r, name) end
+  end
+end
+# lambda-loc-key -> its collected {k; i(fnIndex); fvs}.
+fun lookup-lam-pair(ps, key):
   cases(List) ps:
     | empty => raise("wasm-of-pyret: lambda not collected " + key)
-    | link(f, r) => if f.k == key: f.i else: lookup-pair(r, key) end
+    | link(f, r) => if f.k == key: f else: lookup-lam-pair(r, key) end
   end
 end
+
+# ===== free-var analysis (for closure capture) =====
+# fv-* return ordered, de-duplicated lists of A.Name keys referenced but not bound within.
+fun fv-union(a, b):
+  cases(List) b:
+    | empty => a
+    | link(f, r) => fv-union(if a.member(f): a else: a.append([list: f]) end, r)
+  end
+end
+fun fv-subtract(a, ks): a.filter(lam(x): not(ks.member(x)) end) end
+fun fv-val(v):
+  cases(N.AVal) v:
+    | a-id(_, id) => [list: name-key(id)]
+    | a-id-safe-letrec(_, id) => [list: name-key(id)]
+    | else => empty
+  end
+end
+fun fv-vals(vs):
+  cases(List) vs:
+    | empty => empty
+    | link(f, r) => fv-union(fv-val(f), fv-vals(r))
+  end
+end
+fun fv-fields(fields): fv-vals(fields.map(lam(f): f.value end)) end
+fun arg-keys(args): args.map(lam(a): name-key(a.id) end) end
+fun branch-arg-keys(br):
+  cases(N.ACasesBranch) br:
+    | a-cases-branch(_, _, _, args, _) => args.map(lam(cb): name-key(cb.bind.id) end)
+    | a-singleton-cases-branch(_, _, _, _) => empty
+  end
+end
+fun fv-branches(branches):
+  cases(List) branches:
+    | empty => empty
+    | link(br, r) =>
+      fv-union(fv-subtract(fv-expr(branch-body(br)), branch-arg-keys(br)), fv-branches(r))
+  end
+end
+fun fv-lettable(lt):
+  cases(N.ALettable) lt:
+    | a-val(_, v) => fv-val(v)
+    | a-id-var(_, id) => [list: name-key(id)]
+    | a-id-letrec(_, id, _) => [list: name-key(id)]
+    | a-id-var-modref(_, _, _, _) => empty
+    | a-app(_, f, args, _) => fv-union(fv-val(f), fv-vals(args))
+    | a-prim-app(_, _, args, _) => fv-vals(args)
+    | a-if(_, cnd, t, e) => fv-union(fv-val(cnd), fv-union(fv-expr(t), fv-expr(e)))
+    | a-lam(_, _, args, _, body) => fv-subtract(fv-expr(body), arg-keys(args))
+    | a-method(_, _, args, _, body) => fv-subtract(fv-expr(body), arg-keys(args))
+    | a-obj(_, fields) => fv-fields(fields)
+    | a-extend(_, supe, fields) => fv-union(fv-val(supe), fv-fields(fields))
+    | a-update(_, supe, fields) => fv-union(fv-val(supe), fv-fields(fields))
+    | a-dot(_, obj, _) => fv-val(obj)
+    | a-colon(_, obj, _) => fv-val(obj)
+    | a-get-bang(_, obj, _) => fv-val(obj)
+    | a-tuple(_, fields) => fv-vals(fields)
+    | a-tuple-get(_, tup, _) => fv-val(tup)
+    | a-cases(_, _, val, branches, els) => fv-union(fv-val(val), fv-union(fv-expr(els), fv-branches(branches)))
+    | a-assign(_, id, value) => fv-union([list: name-key(id)], fv-val(value))
+    | a-method-app(_, obj, _, args) => fv-union(fv-val(obj), fv-vals(args))
+    | a-data-expr(_, _, _, _, _) => empty   # TODO(port): with-members/shared free vars
+    | a-ref(_, _) => empty
+    | a-module(_, _, _, _, _, _, _) => empty
+  end
+end
+fun fv-expr(e):
+  cases(N.AExpr) e:
+    | a-let(_, b, lt, body) => fv-union(fv-lettable(lt), fv-subtract(fv-expr(body), [list: name-key(b.id)]))
+    | a-var(_, b, lt, body) => fv-union(fv-lettable(lt), fv-subtract(fv-expr(body), [list: name-key(b.id)]))
+    | a-seq(_, e1, e2) => fv-union(fv-lettable(e1), fv-expr(e2))
+    | a-lettable(_, lt) => fv-lettable(lt)
+    | a-type-let(_, _, body) => fv-expr(body)
+    | a-arr-let(_, b, _, lt, body) => fv-union(fv-lettable(lt), fv-subtract(fv-expr(body), [list: name-key(b.id)]))
+  end
+end
+fun fv-of-lam(args, body): fv-subtract(fv-expr(body), arg-keys(args)) end
 
 # ===== a $Str (array i8) from a Pyret string's code points =====
 fun emit-str(s :: String) -> List<Number>:
@@ -104,6 +204,15 @@ end
 # read the boxed-var 1-cell at local `idx` -> its value
 fun box-read(idx :: Number) -> List<Number>:
   E.local-get(idx).append(E.i32-const(0)).append(E.array-get(T-FIELDS))
+end
+# load a free var's CURRENT value at a capture site: just local-get its local. For a `var`
+# that local already holds the 1-cell BOX, so the box (not the value) is captured -> shared
+# mutation. A name not bound as a local (e.g. a top-level def) captures as null. TODO(port).
+fun load-capture(c :: Ctx, key) -> List<Number>:
+  cases(Option) lookup-local-opt(c, key):
+    | none => E.i-ref-null(110)
+    | some(i) => E.local-get(i)
+  end
 end
 
 # ===== AVal -> instructions (leaves one anyref on the stack) =====
@@ -116,10 +225,13 @@ fun compile-aval(v, c :: Ctx) -> List<Number>:
     | a-bool(l, b) => E.i32-const(if b: 1 else: 0 end).append(E.ref-i31)
     | a-id(l, id) =>
       k = name-key(id)
-      if is-var(c, k): box-read(lookup-local(c, k)) else: E.local-get(lookup-local(c, k)) end
-    | a-srcloc(l, loc) => E.i-ref-null(110)                                # TODO(port): srcloc value
+      cases(Option) lookup-local-opt(c, k):
+        | none => E.i-ref-null(110)                                          # TODO(port): top-level/global ref
+        | some(i) => if is-var(c, k): box-read(i) else: E.local-get(i) end
+      end
+    | a-srcloc(l, loc) => E.i-ref-null(110)                                  # TODO(port): srcloc value
     | a-undefined(l) => E.i-ref-null(110)
-    | a-prim-val(l, name) => E.i-ref-null(110)                             # TODO(port): primitive globals
+    | a-prim-val(l, name) => E.i-ref-null(110)                              # TODO(port): primitive globals
   end
 end
 
@@ -130,9 +242,13 @@ end
 fun pack-fields(vs, c :: Ctx) -> List<Number>:
   compile-avals(vs, c).append(E.array-new-fixed(T-FIELDS, length(vs)))
 end
-# a $Names array of $Str from field names
+# a $Names array of $Str from field records (each with .name)
 fun emit-names(flds) -> List<Number>:
   E.concat(flds.map(lam(f): emit-str(f.name) end)).append(E.array-new-fixed(T-NAMES, length(flds)))
+end
+# a $Names array from a plain list of field-name strings
+fun emit-names-of(names) -> List<Number>:
+  E.concat(names.map(lam(nm): emit-str(nm) end)).append(E.array-new-fixed(T-NAMES, length(names)))
 end
 
 # ===== ALettable -> instructions (leaves the value; `tail` => return_call) =====
@@ -141,9 +257,16 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
     | a-val(l, v) => compile-aval(v, c)
     | a-id-var(l, id) =>
       k = name-key(id)
-      if is-var(c, k): box-read(lookup-local(c, k)) else: E.local-get(lookup-local(c, k)) end
-    | a-id-letrec(l, id, safe) => E.local-get(lookup-local(c, name-key(id)))
-    | a-id-var-modref(l, id, uri, name) => E.i-ref-null(110)               # TODO(port): module ref
+      cases(Option) lookup-local-opt(c, k):
+        | none => E.i-ref-null(110)
+        | some(i) => if is-var(c, k): box-read(i) else: E.local-get(i) end
+      end
+    | a-id-letrec(l, id, safe) =>
+      cases(Option) lookup-local-opt(c, name-key(id)):
+        | none => E.i-ref-null(110)
+        | some(i) => E.local-get(i)
+      end
+    | a-id-var-modref(l, id, uri, name) => E.i-ref-null(110)                # TODO(port): module ref
     | a-app(l, f, args, info) =>
       # closure-calling convention: (closure-as-anyref, $Fields)->anyref via table 0.
       # The closure is used twice (passed as arg0 AND its fnIndex is the table selector),
@@ -158,10 +281,17 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(E.local-get(cl)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))  # selector
         .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
     | a-prim-app(l, fname, args, info) =>
-      compile-avals(args, c).append(E.i-call(prim-index(fname)))
+      # prim-app dispatch (mirrors js-of-pyret's prim table + the seed's intrinsic ladder).
+      ask:
+        | fname == "equal-always" then: compile-avals(args, c).append(E.i-call(rt-index("$equal")))
+        | fname == "not" then:
+          compile-aval(args.first, c).append(truthy-instr()).append(E.i32-eqz).append(E.ref-i31)
+        | throw-prims.member(fname) then: raise-instr()
+        | otherwise: raise-instr()   # TODO(port): raw_array_*, makeArrayN, getMaker*, getBracket, makeSome/None, ...
+      end
     | a-if(l, cnd, t, e) =>
       compile-aval(cnd, c)
-        .append(E.i-call(idx-truthy()))
+        .append(truthy-instr())
         .append(E.i-if(ANYREF-BT))
         .append(compile-aexpr(t, c, tail))
         .append(E.i-else)
@@ -169,13 +299,15 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(E.i-end)
     | a-lam(l, name, args, ret, body) =>
       # closure value: struct.new $Closure {fnIndex, caps}.  fnIndex is the table slot the
-      # collect-lambdas pass assigned this lambda (so call_indirect can reach its compiled
-      # body, emitted as a separate function by the assembler).
-      # TODO(port): caps = the captured free vars packed into a $Fields (currently null, so
-      # only closed lambdas run); the function body reads caps from local 0.
-      E.i32-const(lookup-lam(c, tostring(l))).append(E.i-ref-null(T-FIELDS)).append(E.struct-new(T-CLOSURE))
+      # collect-lambdas pass assigned this lambda; caps is its free vars packed into a
+      # $Fields (read back inside the body from local 0). Closed lambdas get an empty caps.
+      p = lookup-lam-pair(c.lams, tostring(l))
+      caps = E.concat(p.fvs.map(lam(k): load-capture(c, k) end)).append(E.array-new-fixed(T-FIELDS, length(p.fvs)))
+      E.i32-const(p.i).append(caps).append(E.struct-new(T-CLOSURE))
     | a-method(l, name, args, ret, body) =>
-      E.i32-const(lookup-lam(c, tostring(l))).append(E.i-ref-null(T-FIELDS)).append(E.struct-new(T-CLOSURE)).append(E.struct-new(T-METHOD))
+      p = lookup-lam-pair(c.lams, tostring(l))
+      caps = E.concat(p.fvs.map(lam(k): load-capture(c, k) end)).append(E.array-new-fixed(T-FIELDS, length(p.fvs)))
+      E.i32-const(p.i).append(caps).append(E.struct-new(T-CLOSURE)).append(E.struct-new(T-METHOD))
     | a-obj(l, fields) =>
       # $make_object(names, values)
       emit-names(fields)
@@ -207,7 +339,7 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # args from the variant's $Fields by index, then runs its body; final else.
       vtmp = c.next-local
       idtmp = c.next-local + 1
-      c2 = ctx(c.locals, c.next-local + 2, c.vars, c.fenv, c.lams, c.dreg)   # reserve 2 temps
+      c2 = ctx(c.locals, c.next-local + 2, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)   # reserve 2 temps
       compile-aval(val, c)
         .append(E.local-set(vtmp))
         .append(E.local-get(vtmp)).append(E.i-call(idx-variant-id())).append(E.local-set(idtmp))
@@ -222,21 +354,41 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(E.i32-const(2)).append(E.ref-i31)
     | a-method-app(l, obj, meth, args) => compile-aval(obj, c)              # TODO(port): method dispatch
     | a-data-expr(l, name, namet, variants, shared) =>
-      # the variant-name -> id/arity mapping is collected up front (collect-data, threaded
-      # in Ctx.dreg) so a-cases can dispatch. TODO(port): emit the runtime side — per-variant
-      # constructor closures (calling $make_variant with the registry id) + the $variant_names
-      # global for $variant_field_by_name — and return the data value (tuple of constructors).
-      E.i32-const(2).append(E.ref-i31)
+      # the variant registry (id/arity/fields) is collected up front (collect-data, in
+      # Ctx.dreg); the per-variant constructor FUNCTIONS are emitted by the assembler into
+      # the table (ctor table slot = nlams + variant.id). Here we return the data value as
+      # an $Object mapping each variant name -> its constructor closure, so later code can
+      # reach the constructors. The $variant_names global (for $variant_field_by_name) is
+      # built by the assembler from the same registry.
+      # TODO(port): is-<variant> predicates, singleton ctor as a value not a closure, and
+      # binding the constructor names that the front-end's ANF references directly.
+      this-names = variants.map(variant-name)
+      emit-names-of(this-names)
+        .append(E.concat(variants.map(lam(vv): ctor-closure(c, vv) end)))
+        .append(E.array-new-fixed(T-FIELDS, length(variants)))
+        .append(E.i-call(idx-make-object()))
     | a-ref(l, ann) => E.i-ref-null(110)                                   # TODO(port): bare ref
     | a-module(l, ans, dv, dt, prov, types, checks) => E.i-ref-null(110)   # TODO(port): module value
   end
 end
 
-# prim-app function name -> runtime index. TODO(port): exhaustive table (mirror
-# js-of-pyret's prim dispatch + the seed's compileApp intrinsic ladder).
-fun prim-index(fname :: String) -> Number:
-  idx-raise()   # TODO(port)
+# the constructor closure for a variant: struct.new $Closure {table-slot, null caps}.
+# table-slot = nlams + the variant's registry id (the assembler lays ctors after lambdas).
+fun ctor-closure(c :: Ctx, v) -> List<Number>:
+  vn = variant-name(v)
+  cases(Option) data-lookup(c, vn):
+    | none => E.i-ref-null(T-CLOSURE)
+    | some(d) => E.i32-const(c.nlams + d.id).append(E.i-ref-null(T-FIELDS)).append(E.struct-new(T-CLOSURE))
+  end
 end
+fun variant-name(v) -> String:
+  cases(N.AVariant) v:
+    | a-variant(_, _, nm, _, _) => nm
+    | a-singleton-variant(_, nm, _) => nm
+  end
+end
+
+# prim-app -> runtime index. (kept for reference; the dispatch lives inline in a-prim-app.)
 
 # ===== a-cases branch chain =====
 # Build a nested if/else over the variant id (in local `idtmp`), val in local `vtmp`.
@@ -320,7 +472,7 @@ end
 
 # ===== pre-pass: collect lambdas (so each gets a stable fnIndex/table slot) =====
 # Walk the whole program collecting every a-lam/a-method in source order. Each record:
-# { key: loc-string, args, body }. fnIndex == position in this list.
+# { key: loc-string, args, body, fvs: ordered free-var keys }. fnIndex == position.
 fun collect-lams-expr(e, acc):
   cases(N.AExpr) e:
     | a-let(_, _, lt, body) => collect-lams-expr(body, collect-lams-lettable(lt, acc))
@@ -333,8 +485,8 @@ fun collect-lams-expr(e, acc):
 end
 fun collect-lams-lettable(lt, acc):
   cases(N.ALettable) lt:
-    | a-lam(l, _, args, _, body) => collect-lams-expr(body, link({key: tostring(l), args: args, body: body}, acc))
-    | a-method(l, _, args, _, body) => collect-lams-expr(body, link({key: tostring(l), args: args, body: body}, acc))
+    | a-lam(l, _, args, _, body) => collect-lams-expr(body, link({key: tostring(l), args: args, body: body, fvs: fv-of-lam(args, body)}, acc))
+    | a-method(l, _, args, _, body) => collect-lams-expr(body, link({key: tostring(l), args: args, body: body, fvs: fv-of-lam(args, body)}, acc))
     | a-if(_, _, t, e) => collect-lams-expr(e, collect-lams-expr(t, acc))
     | a-cases(_, _, _, branches, els) =>
       for fold(a from collect-lams-expr(els, acc), br from branches):
@@ -350,9 +502,38 @@ fun branch-body(br):
   end
 end
 
-# ===== pre-pass: collect the data registry (variant-name -> {id; arity}) =====
-# Global, unique variant ids assigned in encounter order, used both by a-cases dispatch
-# and (TODO) a-data-expr constructors.
+# ===== pre-pass: every key bound by an a-var (so captures grab the box) =====
+fun collect-gvars-expr(e, acc):
+  cases(N.AExpr) e:
+    | a-let(_, _, lt, body) => collect-gvars-expr(body, collect-gvars-lettable(lt, acc))
+    | a-var(_, b, lt, body) => collect-gvars-expr(body, collect-gvars-lettable(lt, link(name-key(b.id), acc)))
+    | a-seq(_, e1, e2) => collect-gvars-expr(e2, collect-gvars-lettable(e1, acc))
+    | a-lettable(_, lt) => collect-gvars-lettable(lt, acc)
+    | a-type-let(_, _, body) => collect-gvars-expr(body, acc)
+    | a-arr-let(_, _, _, lt, body) => collect-gvars-expr(body, collect-gvars-lettable(lt, acc))
+  end
+end
+fun collect-gvars-lettable(lt, acc):
+  cases(N.ALettable) lt:
+    | a-lam(_, _, _, _, body) => collect-gvars-expr(body, acc)
+    | a-method(_, _, _, _, body) => collect-gvars-expr(body, acc)
+    | a-if(_, _, t, e) => collect-gvars-expr(e, collect-gvars-expr(t, acc))
+    | a-cases(_, _, _, branches, els) =>
+      for fold(a from collect-gvars-expr(els, acc), br from branches):
+        collect-gvars-expr(branch-body(br), a)
+      end
+    | else => acc
+  end
+end
+
+# ===== pre-pass: collect the data registry (variant-name -> {id; arity; fields}) =====
+# Global, unique variant ids assigned in encounter order, used by a-cases dispatch,
+# a-data-expr constructors, and the $variant_names global.
+fun variant-member-name(m) -> String:
+  cases(N.AVariantMember) m:
+    | a-variant-member(_, _, bind) => name-key(bind.id)
+  end
+end
 fun collect-data-expr(e, acc):
   cases(N.AExpr) e:
     | a-let(_, _, lt, body) => collect-data-expr(body, collect-data-lettable(lt, acc))
@@ -368,8 +549,10 @@ fun collect-data-lettable(lt, acc):
     | a-data-expr(_, _, _, variants, _) =>
       for fold(a from acc, v from variants):
         cases(N.AVariant) v:
-          | a-variant(_, _, vname, members, _) => link({name: vname, id: length(a), arity: length(members)}, a)
-          | a-singleton-variant(_, vname, _) => link({name: vname, id: length(a), arity: 0}, a)
+          | a-variant(_, _, vname, members, _) =>
+            link({name: vname, id: length(a), arity: length(members), fields: members.map(variant-member-name)}, a)
+          | a-singleton-variant(_, vname, _) =>
+            link({name: vname, id: length(a), arity: 0, fields: empty}, a)
         end
       end
     | a-if(_, _, t, e) => collect-data-expr(e, collect-data-expr(t, acc))
@@ -380,6 +563,17 @@ fun collect-data-lettable(lt, acc):
         collect-data-expr(branch-body(br), a)
       end
     | else => acc
+  end
+end
+# the registry in id order (ids are dense 0..n-1).
+fun ctors-by-id(dreg, i :: Number, n :: Number):
+  if i == n: empty
+  else: link(find-by-id(dreg, i), ctors-by-id(dreg, i + 1, n)) end
+end
+fun find-by-id(ds, target :: Number):
+  cases(List) ds:
+    | empty => raise("wasm-of-pyret: no variant with id " + tostring(target))
+    | link(f, r) => if f.id == target: f else: find-by-id(r, target) end
   end
 end
 
@@ -409,30 +603,61 @@ fun main-type-idx(): NUM-GC-TYPES + length(RT-FUNS) + 1 end
 
 LOCAL-BUDGET = 512   # anyref locals declared per function (over-declared; unused are legal)
 
-# assign each collected lambda its fnIndex (== source position) -> List<{k; i}>
+# assign each collected lambda its fnIndex (== source position) -> List<{k; i; fvs}>
 fun index-pairs(items, i :: Number, acc):
   cases(List) items:
     | empty => acc.reverse()
-    | link(f, r) => index-pairs(r, i + 1, link({k: f.key, i: i}, acc))
+    | link(f, r) => index-pairs(r, i + 1, link({k: f.key, i: i, fvs: f.fvs}, acc))
   end
 end
 
-# compile one lambda to a code entry: copy args out of the $Fields param (local 1) into
-# fresh locals, then the body in tail position.  caps (free vars from local 0) are TODO.
-fun compile-lam(lr, lam-map, dreg) -> List<Number>:
-  bound = setup-args(lr.args, ctx(empty, 2, empty, empty, lam-map, dreg), empty)
-  body-code = compile-aexpr(lr.body, bound.cx, true)
-  E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], bound.code.append(body-code))
+# compile one lambda to a code entry: caps (free vars from the closure env, local 0) and
+# args (from the $Fields param, local 1) are loaded into fresh locals, then the body in
+# tail position.  A captured `var` is re-bound as a var so reads/writes go through the box.
+fun compile-lam(lr, lam-map, dreg, gvars, nlams :: Number) -> List<Number>:
+  c0 = ctx(empty, 2, empty, empty, lam-map, dreg, gvars, nlams)
+  capres = bind-caps(lr.fvs, 0, c0, empty)
+  argres = setup-args(lr.args, capres.cx, capres.code, 0)
+  body-code = compile-aexpr(lr.body, argres.cx, true)
+  E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], argres.code.append(body-code))
 end
-fun setup-args(args, c :: Ctx, code):
+# load each captured free var out of the closure env (local 0 -> $Closure.caps[j]).
+fun bind-caps(fvs, j :: Number, c :: Ctx, code):
+  cases(List) fvs:
+    | empty => { code: code, cx: c }
+    | link(k, rest) =>
+      slot = c.next-local
+      c2 = if c.gvars.member(k): bind-var(c, k, slot) else: bind-local(c, k, slot) end
+      step = E.local-get(0)
+        .append(E.ref-cast(T-CLOSURE))
+        .append(E.struct-get(T-CLOSURE, 1))   # caps $Fields
+        .append(E.i32-const(j))
+        .append(E.array-get(T-FIELDS))
+        .append(E.local-set(slot))
+      bind-caps(rest, j + 1, c2, code.append(step))
+  end
+end
+# copy args out of the $Fields param (local 1) by position into fresh locals.
+fun setup-args(args, c :: Ctx, code, argi :: Number):
   cases(List) args:
     | empty => { code: code, cx: c }
     | link(ab, rest) =>
       slot = c.next-local
       c2 = bind-local(c, name-key(ab.id), slot)
-      step = E.local-get(1).append(E.i32-const(slot - 2)).append(E.array-get(T-FIELDS)).append(E.local-set(slot))
-      setup-args(rest, c2, code.append(step))
+      step = E.local-get(1).append(E.i32-const(argi)).append(E.array-get(T-FIELDS)).append(E.local-set(slot))
+      setup-args(rest, c2, code.append(step), argi + 1)
   end
+end
+# compile one variant constructor: receives args as $Fields (local 1); builds the
+# $Variant {id, name, fields=local1} and returns it.
+fun compile-ctor(d) -> List<Number>:
+  body = E.i32-const(d.id).append(emit-str(d.name)).append(E.local-get(1)).append(E.struct-new(T-VARIANT))
+  E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], body)
+end
+# $variant_names global = (ref $Fields) of $Names, indexed by variant id, so
+# $variant_field_by_name can scan a variant's field names. Built from the registry.
+fun variant-names-init(ordered) -> List<Number>:
+  E.concat(ordered.map(lam(d): emit-names-of(d.fields) end)).append(E.array-new-fixed(T-FIELDS, length(ordered)))
 end
 
 # ===== program assembler =====
@@ -441,15 +666,19 @@ fun compile-prog(prog) -> List<Number>:
     | a-program(l, provides, imports, body) =>
       lams = collect-lams-expr(body, empty).reverse()       # source order
       dreg = collect-data-expr(body, empty)                 # registry (ids by encounter)
+      gvars = collect-gvars-expr(body, empty)               # a-var-bound keys
       lam-map = index-pairs(lams, 0, empty)
       num-rt = length(RT-FUNS)
       num-lams = length(lams)
-      main-funcidx = num-rt + num-lams
+      num-ctors = length(dreg)
+      ordered = ctors-by-id(dreg, 0, num-ctors)             # ctors in id order
+      main-funcidx = (num-rt + num-lams) + num-ctors
 
-      # ----- main (() -> anyref) and the lambda bodies -----
-      main-ctx = ctx(empty, 0, empty, empty, lam-map, dreg)
+      # ----- main (() -> anyref), the lambda bodies, and the ctor bodies -----
+      main-ctx = ctx(empty, 0, empty, empty, lam-map, dreg, gvars, num-lams)
       main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], compile-aexpr(body, main-ctx, true))
-      lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg) end)
+      lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams) end)
+      ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry
       # would append a second `end`).
       rt-code = RT-FUNS.map(lam(rf): E.byte-vec(E.vec(rf.locals).append(rf.body)) end)
@@ -460,23 +689,32 @@ fun compile-prog(prog) -> List<Number>:
       main-type = E.func-type-vt(empty, [list: E.anyref])
       type-c = E.vec(link(gc-rec-group(), rt-types.append([list: closure-type, main-type])))
 
-      # ----- func section: a type index per function (runtime ++ lambdas ++ main) -----
+      # ----- func section: a type index per function (runtime ++ lambdas ++ ctors ++ main) -----
       rt-func-decls = range(0, num-rt).map(lam(i): E.leb-u(NUM-GC-TYPES + i) end)
       lam-func-decls = range(0, num-lams).map(lam(_): E.leb-u(closure-call-type-idx()) end)
-      func-c = E.vec(rt-func-decls.append(lam-func-decls).append([list: E.leb-u(main-type-idx())]))
+      ctor-func-decls = range(0, num-ctors).map(lam(_): E.leb-u(closure-call-type-idx()) end)
+      func-c = E.vec(rt-func-decls.append(lam-func-decls).append(ctor-func-decls).append([list: E.leb-u(main-type-idx())]))
 
-      # ----- table + element segment: lambda funcidxs at slots 0..num-lams-1 -----
-      table-c = E.vec([list: E.table-entry([list: 112], num-lams)])   # 112 = funcref
+      # ----- table + element segment: lambda funcidxs then ctor funcidxs -----
+      num-slots = num-lams + num-ctors
+      table-c = if num-slots == 0: empty
+                else: E.vec([list: E.table-entry([list: 112], num-slots)]) end   # 112 = funcref
       lam-funcidxs = range(0, num-lams).map(lam(i): num-rt + i end)
-      elem-c = if num-lams == 0: empty
-               else: E.vec([list: E.elem-active-funcs(E.i32-const(0), lam-funcidxs)]) end
+      ctor-funcidxs = range(0, num-ctors).map(lam(j): (num-rt + num-lams) + j end)
+      all-slots = lam-funcidxs.append(ctor-funcidxs)
+      elem-c = if num-slots == 0: empty
+               else: E.vec([list: E.elem-active-funcs(E.i32-const(0), all-slots)]) end
+
+      # ----- global: $variant_names (only when there are variants) -----
+      global-c = if num-ctors == 0: empty
+                 else: E.vec([list: E.global-entry(E.reft(T-FIELDS), 0, variant-names-init(ordered))]) end
 
       # ----- export main -----
       export-c = E.vec([list: E.export-entry("main", 0, main-funcidx)])
 
       # ----- code section -----
-      code-c = E.vec(rt-code.append(lam-code).append([list: main-code]))
+      code-c = E.vec(rt-code.append(lam-code).append(ctor-code).append([list: main-code]))
 
-      E.wasm-module-of(type-c, empty, func-c, table-c, empty, empty, export-c, elem-c, code-c)
+      E.wasm-module-of(type-c, empty, func-c, table-c, empty, global-c, export-c, elem-c, code-c)
   end
 end
