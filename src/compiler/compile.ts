@@ -1463,6 +1463,31 @@ class Compiler {
         m.ref.i31(m.i32.const(2)), // nothing
       ], binaryen.anyref);
     }
+    // Self-hosted parser bridge (paired with the host imports + parse-bridge.ts).
+    // `parse-num-nodes()` parses the runtime source (precomputed host-side) and
+    // returns the flat node count; `parse-node-tag`/`-nkids`/`-str` read node i.
+    if (name === "parse-num-nodes" && args.length === 0) {
+      return m.call("$make_fix",
+        [m.i64.extend_s(m.call("$parse_source", [], binaryen.i32))], this.t.FixnumRef);
+    }
+    if (name === "parse-node-tag" && args.length === 1) {
+      return m.call("$make_fix",
+        [m.i64.extend_s(m.call("$parse_node_tag", [m.call("$num_to_i32", [args[0]!], binaryen.i32)], binaryen.i32))],
+        this.t.FixnumRef);
+    }
+    if (name === "parse-node-nkids" && args.length === 1) {
+      return m.call("$make_fix",
+        [m.i64.extend_s(m.call("$parse_node_nkids", [m.call("$num_to_i32", [args[0]!], binaryen.i32)], binaryen.i32))],
+        this.t.FixnumRef);
+    }
+    if (name === "parse-node-str" && args.length === 1) {
+      const len = ctx.addLocal(binaryen.i32);
+      return m.block(null, [
+        m.local.set(len, m.call("$parse_node_str_into",
+          [m.call("$num_to_i32", [args[0]!], binaryen.i32), m.i32.const(SCRATCH_OFFSET)], binaryen.i32)),
+        m.call("$str_from_mem", [m.i32.const(SCRATCH_OFFSET), m.local.get(len, binaryen.i32)], this.t.StrRef),
+      ], this.t.StrRef);
+    }
     if (name === "identical" && args.length === 2) {
       return this.mkBool(m.ref.eq(m.ref.cast(args[0]!, binaryen.eqref), m.ref.cast(args[1]!, binaryen.eqref)));
     }

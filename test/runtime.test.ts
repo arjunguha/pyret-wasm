@@ -43,6 +43,8 @@ async function instantiate() {
       emit_byte: () => {},
       do_pause: () => { throw new Error("pause"); },
       read_source_into: () => 0,
+      parse_source: () => 0, parse_node_tag: () => 0,
+      parse_node_nkids: () => 0, parse_node_str_into: () => 0,
     },
   });
   return instance.exports as any;

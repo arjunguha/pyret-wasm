@@ -69,9 +69,38 @@ dispatch keeps both in sync.
 3. Later, Option A (pure Pyret port) if we want zero JS in the parse step — but the JS
    GLR parser stays regardless (a Pyret GLR parser is a separate, much larger effort).
 
-## First step taken
-`self-host/parse-from-tree.arr` — a skeleton `surface-parse`/`from-tree` deserializer
-for the core forms (program/block/num/str/id/op/app/let/if), showing the tag-dispatch +
-recursive child-building shape. It parses cleanly (it's a sketch; the host import and the
-full ctor table are TODO). `self-compiler/compiler/parse-pyret.arr` (the stub) should
-later `include` this and call `from-tree(read-parse-tree())`.
+## DONE (Option B, core forms wired end-to-end)
+The bridge is implemented and exercised end-to-end (see `test/surface-parse.test.ts`):
+
+- **Host side** `src/runtime/parse-bridge.ts` — `serializeCst(program)` lowers the seed's
+  JS GLR `CstNode` into a FLAT pre-order `SerNode[]` (`{tag, nkids, str}`), `tag` per the
+  shared `TAGS` table. This is the retargeted-builder of step (1)/(2), done as a small
+  CST→simplified-AST walk (no `parse-pyret.js` copy needed for the core forms).
+- **Cursor protocol** instead of a u32 byte-stream: four host imports in `run.ts`
+  (`parse_source`, `parse_node_tag`, `parse_node_nkids`, `parse_node_str_into`) let the
+  Pyret side walk the precomputed `state.parseNodes` node-by-node — NO in-WASM stream
+  parsing. Declared in `src/compiler/runtime.ts`; paired intrinsics
+  (`parse-num-nodes`/`parse-node-tag`/`-nkids`/`-str`) in `compile.ts`.
+- **Pyret side** `self-host/parse-from-tree.arr` — `from-tree()` drives a shared cursor,
+  building real `ast.arr` nodes via a `tag → constructor` dispatch.
+- **Entry** `self-compiler/compiler/parse-pyret.arr` — `surface-parse(src, uri)` now calls
+  `from-tree()` (no longer a `raise` stub).
+
+Verified: a seed-compiled program calling `surface-parse("5","x")` yields
+`s-program { block: s-block { stmts: [s-num(5)] } }`; `serializeCst` lowers
+num/str/bool/id/binop. Whole suite green (191 pass / 0 fail).
+
+### Current scope & next
+- Covered tags: `program, block, num, str, bool, id, op` (binop chains folded left).
+- **Limitation**: the host parses the RUNTIME source buffer (`read-source`'s bytes), so
+  `surface-parse`'s `src` arg must equal that program — it does not yet parse an arbitrary
+  string independent of `read-source`. To lift this, pass `src` through a host import that
+  parses *that* string (parse-bridge already separates parse from serialize).
+- **Grow coverage** by extending two files in lockstep: add a `TAGS` entry + lowering case
+  in `parse-bridge.ts` and a matching `build-node` case in `parse-from-tree.arr`
+  (next: `app`, `if`, `let`, `fun`, `data`, `cases`). The eventual 225-ctor table can be
+  generated from `ast.arr` as described above; today's hand-written set is the core subset.
+
+## Original first step (superseded by the above)
+`self-host/parse-from-tree.arr` began as a skeleton `from-tree` for the core forms; it is
+now the working cursor-based deserializer described under DONE.

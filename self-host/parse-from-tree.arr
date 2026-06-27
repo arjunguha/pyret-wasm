@@ -1,52 +1,67 @@
 provide *
-# Skeleton deserializer: a serialized (host-produced) parse tree -> ast.arr AST.
-# This is the Pyret side of Option B in parser-plan.md. SKETCH: the host import that
-# produces the serial stream and the full 225-constructor table are TODO(port); this
-# shows the tag-dispatch + recursive child-building shape for the core forms.
+# Pyret side of the self-hosted parser (Option B in parser-plan.md). The seed's
+# JS GLR parser produces a CST; the host (src/runtime/parse-bridge.ts) lowers it
+# to a FLAT pre-order array of tagged nodes and exposes it via four intrinsics:
+#   parse-num-nodes()    -> node count (also triggers the host-side parse)
+#   parse-node-tag(i)    -> tag code (must match parse-bridge.ts TAGS)
+#   parse-node-nkids(i)  -> child count (children follow immediately, pre-order)
+#   parse-node-str(i)    -> the node's string payload
+# We walk the array with a shared cursor and build real ast.arr AST values. The
+# core forms are handled here; growing the table (app/if/let/fun/data/cases/…) is
+# matched by growing the lowering in parse-bridge.ts.
 import ast as A
 
-# One node of the serialized tree the host hands us: a tag, child nodes, and leaf
-# payloads (string + number). A real stream would be flat u32s + a string table
-# (see parser-plan.md); this nested form is the in-Pyret shape after reading it.
-data SNode:
-  | snode(tag :: String, kids, str :: String, num :: Number)
-end
+# Tag codes — keep in sync with src/runtime/parse-bridge.ts TAGS.
+PROGRAM = 0
+BLOCK = 1
+NUM = 2
+STR = 3
+BOOL = 4
+ID = 5
+OP = 6
 
-fun mk-loc(n :: SNode):
-  # TODO(port): decode the real srcloc carried in the stream; dummy for the skeleton.
-  A.dummy-loc
-end
+# Shared read cursor into the flat pre-order stream.
+var cursor = 0
 
-# tag -> ast.arr constructor dispatch (core forms; grow to the full table).
-fun from-tree(n :: SNode):
-  l = mk-loc(n)
-  k = n.kids
-  if n.tag == "s-num": A.s-num(l, n.num)
-  else if n.tag == "s-str": A.s-str(l, n.str)
-  else if n.tag == "s-bool": A.s-bool(l, n.str == "true")
-  else if n.tag == "s-id": A.s-id(l, A.s-name(l, n.str))
-  else if n.tag == "s-op":
-    A.s-op(l, l, n.str, from-tree(k.get(0)), from-tree(k.get(1)))
-  else if n.tag == "s-app":
-    A.s-app(l, from-tree(k.get(0)), map(from-tree, k.drop(1)))
-  else if n.tag == "s-block":
-    A.s-block(l, map(from-tree, k))
-  else if n.tag == "s-let":
-    A.s-let(l, A.s-bind(l, false, A.s-name(l, n.str), A.a-blank), from-tree(k.get(0)), false)
-  else if n.tag == "s-if-else":
-    A.s-if-else(l, map(from-tree, k.drop(1)), from-tree(k.get(0)))
-  else if n.tag == "s-program":
-    # minimal program shell; real provides/imports decode TODO(port)
-    A.s-program(l, none, A.s-provide-none(l), A.s-provide-types-none(l), empty, empty,
-      from-tree(k.get(k.length() - 1)))
-  else:
-    raise("from-tree: unhandled tag " + n.tag)
+fun build-node(tag, s, kids):
+  l = A.dummy-loc
+  if tag == NUM: A.s-num(l, string-to-number(s).value)
+  else if tag == STR: A.s-str(l, s)
+  else if tag == BOOL: A.s-bool(l, s == "true")
+  else if tag == ID: A.s-id(l, A.s-name(l, s))
+  else if tag == OP: A.s-op(l, l, s, kids.get(0), kids.get(1))
+  else if tag == BLOCK: A.s-block(l, kids)
+  else if tag == PROGRAM:
+    # Minimal program shell: provides/imports decoding is TODO(port).
+    A.s-program(l, none, A.s-provide-none(l), A.s-provide-types-none(l),
+      empty, empty, kids.get(0))
+  else: raise("from-tree: unhandled tag " + tostring(tag))
   end
 end
 
-# Entry the parse-pyret stub should call: surface-parse(src, uri) =
-#   from-tree(read-parse-tree(src, uri))  where read-parse-tree is the host import
-#   (TODO) that runs the JS tokenizer+GLR parser + retargeted parse-pyret builder.
-fun from-serialized(root :: SNode):
-  from-tree(root)
+# Read `n` sibling nodes left-to-right (each call advances the shared cursor).
+fun read-kids(n):
+  if n == 0: empty
+  else:
+    first = read-node()        # must be forced before reading the rest
+    link(first, read-kids(n - 1))
+  end
+end
+
+# Read one node (and its subtree) at the current cursor.
+fun read-node():
+  i = cursor
+  cursor := cursor + 1
+  tag = parse-node-tag(i)
+  nk = parse-node-nkids(i)
+  s = parse-node-str(i)
+  kids = read-kids(nk)
+  build-node(tag, s, kids)
+end
+
+# Entry point: parse the runtime source (delivered host-side) into an ast.arr AST.
+fun from-tree():
+  cursor := 0
+  _ = parse-num-nodes()        # triggers the host-side parse; root drives the walk
+  read-node()
 end

@@ -64,6 +64,21 @@ export class Runtime {
     // can receive runtime source. Empty for normal runs.
     m.addFunctionImport("$read_source_into", "host", "read_source_into",
       binaryen.createType([binaryen.i32]), binaryen.i32);
+    // Self-hosted parser bridge: the host precomputes a flat pre-order parse tree
+    // (CST lowered by parse-bridge.ts) and exposes it node-by-node. The Pyret side
+    // (self-host/parse-from-tree.arr) walks it with a cursor to build ast.arr AST.
+    //   parse_source()           -> node count
+    //   parse_node_tag(i)        -> tag code (see parse-bridge TAGS)
+    //   parse_node_nkids(i)      -> number of children (which follow in pre-order)
+    //   parse_node_str_into(i,a) -> writes node i's string payload at addr a; ret len
+    m.addFunctionImport("$parse_source", "host", "parse_source",
+      binaryen.createType([]), binaryen.i32);
+    m.addFunctionImport("$parse_node_tag", "host", "parse_node_tag",
+      binaryen.createType([binaryen.i32]), binaryen.i32);
+    m.addFunctionImport("$parse_node_nkids", "host", "parse_node_nkids",
+      binaryen.createType([binaryen.i32]), binaryen.i32);
+    m.addFunctionImport("$parse_node_str_into", "host", "parse_node_str_into",
+      binaryen.createType([binaryen.i32, binaryen.i32]), binaryen.i32);
   }
 
   // $num_to_i32(anyref) -> i32 : low 32 bits of a fixnum (used by emit-byte etc.)
