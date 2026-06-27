@@ -371,4 +371,68 @@ fun dict-keys-list(d): if is-m-dict(d): d.keys-list-now() else: d.keys-list() en
 fun fold-keys(f, init, d): foldl(f, init, dict-keys-list(d)) end
 fun each-key(f, d): each(f, dict-keys-list(d)) end
 fun each-key-now(f, d): each(f, dict-keys-list(d)) end
+
+# === raw-array builders / list / string helpers (used by the real front-end) ===
+fun raw-array-build(f, n):
+  arr = raw-array-of(0, n)
+  fun rb-loop(i): if i >= n: arr else: block: raw-array-set(arr, i, f(i)) rb-loop(i + 1) end end end
+  rb-loop(0)
+end
+fun raw-array-duplicate(arr):
+  n = raw-array-length(arr)
+  res = raw-array-of(0, n)
+  fun rd-loop(i): if i >= n: res else: block: raw-array-set(res, i, raw-array-get(arr, i)) rd-loop(i + 1) end end end
+  rd-loop(0)
+end
+fun take(l, n): list-take(l, n) end
+fun drop(l, n): list-drop(l, n) end
+fun filter-map(f, l):
+  cases(List) l:
+    | empty => empty
+    | link(x, r) => cases(Option) f(x): | some(v) => link(v, filter-map(f, r)) | none => filter-map(f, r) end
+  end
+end
+fun distinct(l):
+  cases(List) l:
+    | empty => empty
+    | link(x, r) => if member(r, x): distinct(r) else: link(x, distinct(r)) end
+  end
+end
+data PartitionR: | partition-r(is-true, is-false) end
+fun partition(pred, l):
+  cases(List) l:
+    | empty => partition-r(empty, empty)
+    | link(x, r) =>
+      sub = partition(pred, r)
+      if pred(x): partition-r(link(x, sub.is-true), sub.is-false)
+      else: partition-r(sub.is-true, link(x, sub.is-false)) end
+  end
+end
+fun list-to-set(l): set-from-list(l) end
+fun list-to-tree-set(l): set-from-list(l) end
+fun string-join(l, sep):
+  cases(List) l:
+    | empty => ""
+    | link(f, r) => cases(List) r: | empty => f | link(a, b) => f + sep + string-join(r, sep) end
+  end
+end
+fun string-split-all(s, sep):
+  if string-length(sep) == 0: [list: s]
+  else:
+    idx = string-index-of(s, sep)
+    if idx < 0: [list: s]
+    else:
+      before = string-substring(s, 0, idx)
+      after = string-substring(s, idx + string-length(sep), string-length(s))
+      link(before, string-split-all(after, sep))
+    end
+  end
+end
+fun string-split(s, sep):
+  idx = string-index-of(s, sep)
+  if idx < 0: [list: s]
+  else: [list: string-substring(s, 0, idx), string-substring(s, idx + string-length(sep), string-length(s))]
+  end
+end
+fun string-replace(s, find, repl): string-join(string-split-all(s, find), repl) end
 `;
