@@ -504,6 +504,17 @@ class Compiler {
       for (const k of node.kids) add(this.freeVars(k, b2));
       return out;
     }
+    if (node.name === "multi-let-expr" || node.name === "letrec-expr") {
+      const b2 = new Set(bound);
+      for (const b of this.multiLetBinds(node)) b2.add(this.bindingName(this.letBinding(b)));
+      for (const k of node.kids) add(this.freeVars(k, b2));
+      return out;
+    }
+    if (node.name === "type-let-expr") {
+      const body = this.childNamed(node, "block");
+      if (body) add(this.freeVars(body, bound)); // type binds erased
+      return out;
+    }
     for (const k of node.kids) add(this.freeVars(k, bound));
     return out;
   }
@@ -623,6 +634,16 @@ class Compiler {
         else if (this.topScope.has(nm)) setter = m.global.set(this.topScope.get(nm)!, value);
         else throw new CompileError(`cannot assign to unbound or non-var identifier: ${nm}`, node);
         return m.block(null, [setter, m.ref.i31(m.i32.const(2))], binaryen.anyref);
+      }
+      case "multi-let-expr":
+      case "letrec-expr":
+        // `let a = e1, b = e2 (block|:) body end` (and letrec). Desugar to a block:
+        // the bindings become block-local let/var statements scoping the body.
+        return this.compileMultiLet(node, ctx, tail);
+      case "type-let-expr": {
+        // `type-let T = ... : body end` — type binds erased (no type-checker).
+        const body = this.childNamed(node, "block")!;
+        return this.compileBlock(body, ctx, tail);
       }
       default:
         throw new CompileError(`unsupported expression: ${node.name}`, node);
@@ -1365,6 +1386,50 @@ class Compiler {
     // a captured `var` is stored in a shared box cell (see resolveName/unbox).
     const stored = ctx.boxed.has(name) ? this.makeBox(value) : value;
     return this.m.local.set(idx, stored);
+  }
+
+  // `let a = e1, b = e2 (block|:) body end` / `letrec ...`. Desugar to a block whose
+  // statements are the bindings followed by the body's statements (reusing emitStmt's
+  // let/var/rec handling + block scoping). letrec's mutual recursion is handled by the
+  // same forward-capable local scoping the seed uses for local `fun`s.
+  // multi-let wraps each binding in a `let-binding` node (-> let-expr|var-expr); letrec
+  // lists `let-expr` directly. Collect the actual binding nodes either way.
+  private multiLetBinds(node: CstNode): CstNode[] {
+    const binds: CstNode[] = [];
+    for (const k of node.kids) {
+      if (k.name === "let-binding") binds.push(this.only(k));
+      else if (k.name === "let-expr" || k.name === "var-expr" || k.name === "rec-expr") binds.push(k);
+    }
+    return binds;
+  }
+
+  private compileMultiLet(node: CstNode, ctx: Ctx, tail: boolean): number {
+    const m = this.m;
+    const binds = this.multiLetBinds(node);
+    const body = this.childNamed(node, "block")!;
+    if (node.name === "letrec-expr") {
+      // letrec: all names are in scope for every bind value (mutual recursion). Pre-declare
+      // each as a boxed cell so closures capture the cell by reference, then fill the cells.
+      const parts: number[] = [];
+      const names = binds.map((b) => this.bindingName(this.letBinding(b)));
+      names.forEach((name) => {
+        const idx = ctx.addLocal(binaryen.anyref);
+        ctx.locals.set(name, idx);
+        ctx.boxed.add(name);
+        parts.push(m.local.set(idx, this.makeBox(m.ref.i31(m.i32.const(2))))); // placeholder
+      });
+      binds.forEach((b, i) => {
+        const value = this.compileExpr(b.kids[b.kids.length - 1]!, ctx, false);
+        parts.push(this.setBox(this.resolveName(names[i]!, ctx, /*raw*/ true)!, value));
+      });
+      parts.push(this.compileBlock(body, ctx, tail));
+      return m.block(null, parts, binaryen.anyref);
+    }
+    // multi-let: sequential bindings desugar to a block (bindings then body statements).
+    const bindStmts: CstNode[] = binds.map((b) => ({ name: "stmt", pos: b.pos, kids: [b] }));
+    const bodyStmts = body.kids.filter((k) => k.name === "stmt");
+    const merged: CstNode = { name: "block", pos: node.pos, kids: [...bindStmts, ...bodyStmts] };
+    return this.compileBlock(merged, ctx, tail);
   }
 
   private compileBlock(block: CstNode, ctx: Ctx, tail: boolean): number {

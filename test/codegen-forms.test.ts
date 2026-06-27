@@ -26,3 +26,27 @@ end
 f(bar(10)) + f(baz(20))`;
   expect(await result(src)).toBe("33"); // 11 + 22
 });
+
+// multi-let-expr: `let a = e1, b = e2 (block|:) body end` (binds wrapped in let-binding).
+test("multi-let-expr: single, multiple, and sequential bindings", async () => {
+  expect(await result("let x = 5: x + 1 end")).toBe("6");
+  expect(await result("let a = 1, b = 2: a + b end")).toBe("3");
+  expect(await result("let a = 10, b = a + 5: b end")).toBe("15"); // later bind sees earlier
+});
+
+// type-let erases its type bindings; var inside a let works.
+test("type-let-expr (erased) and var binding in a let", async () => {
+  expect(await result("type-let N = Number: 40 + 2 end")).toBe("42");
+  expect(await result("let var c = 0: block: c := c + 7\n c end end")).toBe("7");
+});
+
+// letrec: names in scope for all bind values -> (mutual) recursion via boxed cells.
+test("letrec-expr supports self- and mutual recursion", async () => {
+  expect(await result("letrec a = 3, b = 4: a * b end")).toBe("12");
+  expect(await result(
+    "letrec f = lam(n): if n < 1: 0 else: n + f(n - 1) end end: f(5) end")).toBe("15");
+  expect(await result(
+    "letrec even = lam(n): if n == 0: true else: odd(n - 1) end end,\n" +
+    "       odd = lam(n): if n == 0: false else: even(n - 1) end end:\n" +
+    "  even(10) end")).toBe("true");
+});
