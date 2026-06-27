@@ -5,8 +5,11 @@ sharing:
   method _plus(self, other): append(self, other) end,
   method map(self, f): map(f, self) end,
   method filter(self, p): filter(p, self) end,
-  method foldl(self, f, init): foldl(f, init, self) end,
-  method foldr(self, f, init): foldr(f, init, self) end,
+  # Pyret's LIST METHODS are element-first: lst.foldl(f, init) / lst.foldr(f, init)
+  # call f(elt, acc).  (The FREE functions foldl/foldr below are acc-first: f(acc, elt) —
+  # that's a real Pyret quirk.)  Wrap to swap into the free functions' order.
+  method foldl(self, f, init): foldl(lam(acc, elt): f(elt, acc) end, init, self) end,
+  method foldr(self, f, init): foldr(lam(acc, elt): f(elt, acc) end, init, self) end,
   method each(self, f): each(f, self) end,
   method length(self): length(self) end,
   method reverse(self): reverse(self) end,
