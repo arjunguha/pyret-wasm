@@ -93,10 +93,7 @@ const FORMS: Array<[string, string]> = [
   ["examples: 5 is 5 end", "s-check"],
   ["type N = Number", "s-type"],
   ["x := 5", "s-assign"],
-  // TODO(pure-parser): BARE instantiation `f<Number>` (no call) — the pure-Pyret parser
-  // only recognizes `f<T>(...)` (instantiate-then-call); bare instantiation parses as a
-  // `<` comparison. Re-enable once pyret-parser.arr handles it. (JS-GLR bridge handles it.)
-  // ["f<Number>", "s-instantiate"],
+  ["f<Number>", "s-instantiate"], // bare instantiation (no call)
   ["o!{a: 1}", "s-update"],
   ["table: a, b\n  row: 1, 2\nend", "s-table"],
   // round 6 (corpus blockers cont.)
@@ -112,10 +109,7 @@ const FORMS: Array<[string, string]> = [
   // NB: s-let-expr.label() is "s-let" in ast.arr; the dedicated test below asserts
   // the s-let-expr identity + bind kinds to distinguish it from a single s-let.
   ["let a = 1, b = 2: a + b end", "s-let"],
-  // TODO(pure-parser): `reactor:` at statement position isn't parsed by the pure-Pyret
-  // parser (peripheral; not used in the compiler closure). surface-parse now routes through
-  // the no-JS parser, so this form is dropped here. The JS-GLR bridge still lowers it.
-  // ["reactor: init: 1, on-tick: f end", "s-reactor"],
+  ["reactor: init: 1, on-tick: f end", "s-reactor"],
 ];
 
 test("surface-parse: rebuilds the right ast.arr ctor for each core form", async () => {
@@ -271,10 +265,9 @@ test("surface-parse: include file(...) rebuilds s-include", async () => {
 });
 
 // round 4: `provide: a, b end` (provide-block spec form) rebuilds s-provide-block.
-// TODO(pure-parser): surface-parse now routes through the pure-Pyret parser, which currently
-// yields s-provide-all for `provide: ... end` (should be s-provide-block). A follow-up lane
-// fixes pyret-parser.arr's provide handling, then un-skips this. (JS-GLR bridge handles it.)
-test.skip("surface-parse: provide-block (provide: ... end) rebuilds s-provide-block", async () => {
+// round 4: `provide: a, b end` (provide-block spec form) — the pure-Pyret parser now builds
+// s-provide-block (placed in s-program's _provide slot, matching the JS-GLR bridge).
+test("surface-parse: provide-block (provide: ... end) rebuilds s-provide-block", async () => {
   const wasm = await buildSourceFile(INFO);
   const out = await runWithSource(wasm, "provide: x, y end\n5");
   expect(out).toContain("provide=s-provide-block");

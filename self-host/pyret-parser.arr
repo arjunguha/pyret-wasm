@@ -934,8 +934,13 @@ fun inst-scan(toks :: List<Token>, depth :: Number) -> Boolean:
       else if (t.kind == "OP") and (t.value == ">"):
         if depth == 1:
           cases(List) r:
-            | empty => false
-            | link(n, _) => n.kind == "LPAREN"
+            | empty => true   # bare instantiation `f<T>` at end of input (no RHS => not a comparison)
+            | link(n, _) =>
+              # `(` => instantiate-then-call; EOF / a closing delimiter / comma / colon after
+              # the matching `>` => BARE instantiation (a comparison would need a RHS operand).
+              (n.kind == "LPAREN") or (n.kind == "EOF") or (n.kind == "RPAREN")
+                or (n.kind == "RBRACK") or (n.kind == "RBRACE") or (n.kind == "COMMA")
+                or (n.kind == "COLON")
           end
         else: inst-scan(r, depth - 1)
         end
@@ -1157,6 +1162,12 @@ fun parse-name-atom(st :: PState, v :: String) -> A.Expr:
     A.s-user-block(node-loc(nm-tok), body)
   else if (v == "table") and peek2-kind(st, "COLON"):
     parse-table(st)
+  else if (v == "reactor") and peek2-kind(st, "COLON"):
+    p-advance(st)   # reactor
+    p-advance(st)   # :
+    fields = parse-fields(st)
+    expect-name(st, "end")
+    A.s-reactor(node-loc(nm-tok), fields)
   else:
     p-advance(st)
     A.s-id(tok-loc(nm-tok), A.s-name(tok-loc(nm-tok), v))
@@ -2121,8 +2132,15 @@ fun parse-prelude-loop(st :: PState, prov :: A.Provide, imps :: List<A.Import>):
       p-advance(st) A.s-provide-all(dl)
     else if at-name(st, "star"):
       p-advance(st) A.s-provide-all(dl)
+    else if at-kind(st, "COLON"):
+      # `provide: spec, ... end` -> s-provide-block.  Stuffed into the Provide slot (the
+      # program builder puts preludes.{0} in s-program's _provide), matching the JS-GLR bridge.
+      p-advance(st)
+      specs = parse-provide-specs(st)
+      expect-name(st, "end")
+      A.s-provide-block(dl, empty, specs)
     else:
-      # `provide ... end` / `provide: ... end` — TODO(grammar): parse the block.
+      # `provide <expr> end` (legacy block form) — TODO(grammar): parse the expr.
       skip-to-end(st)
       A.s-provide-all(dl)
     end
@@ -2139,6 +2157,81 @@ fun parse-prelude-loop(st :: PState, prov :: A.Provide, imps :: List<A.Import>):
     parse-prelude-loop(st, prov, imps)
   else:
     {prov; imps}
+  end
+end
+
+### provide-spec list:  spec (, spec)* [,]   up to `end`.
+fun parse-provide-specs(st :: PState) -> List<A.ProvideSpec>:
+  if at-name(st, "end"): empty
+  else:
+    spec = parse-provide-spec(st)
+    if at-kind(st, "COMMA"):
+      p-advance(st)
+      if at-name(st, "end"): link(spec, empty)  # trailing comma
+      else: link(spec, parse-provide-specs(st))
+      end
+    else:
+      link(spec, empty)
+    end
+  end
+end
+
+### parse `NAME (, NAME)* )` (cursor just past the `(`) -> List<Name>, consuming the `)`.
+fun parse-name-list(st :: PState) -> List<A.Name>:
+  if at-kind(st, "RPAREN"): p-advance(st) empty
+  else:
+    nm = expect(st, "NAME").value
+    if at-kind(st, "COMMA"):
+      p-advance(st)
+      link(A.s-name(dl, nm), parse-name-list(st))
+    else:
+      expect(st, "RPAREN")
+      link(A.s-name(dl, nm), empty)
+    end
+  end
+end
+
+### optional `hiding (NAME, ...)` clause after a `*` / `data` spec.
+fun parse-opt-hiding(st :: PState) -> List<A.Name>:
+  if at-name(st, "hiding"):
+    p-advance(st)
+    expect(st, "LPAREN")
+    parse-name-list(st)
+  else: empty end
+end
+
+### provide-spec:  [type|data|module] NAME [as NAME] [hiding (...)]  |  [type] * [hiding (...)]
+fun parse-provide-spec(st :: PState) -> A.ProvideSpec:
+  start = p-peek(st)
+  if at-name(st, "type"):
+    p-advance(st)
+    if at-op(st, "*"):
+      p-advance(st)
+      A.s-provide-type(node-loc(start), A.s-star(dl, parse-opt-hiding(st)))
+    else:
+      nm = expect(st, "NAME").value
+      A.s-provide-type(node-loc(start), A.s-local-ref(dl, A.s-name(dl, nm), A.s-name(dl, nm)))
+    end
+  else if at-name(st, "data"):
+    p-advance(st)
+    if at-op(st, "*"):
+      p-advance(st)
+      A.s-provide-data(node-loc(start), A.s-star(dl, parse-opt-hiding(st)), empty)
+    else:
+      nm = expect(st, "NAME").value
+      A.s-provide-data(node-loc(start), A.s-local-ref(dl, A.s-name(dl, nm), A.s-name(dl, nm)), parse-opt-hiding(st))
+    end
+  else if at-name(st, "module"):
+    p-advance(st)
+    nm = expect(st, "NAME").value
+    A.s-provide-module(node-loc(start), A.s-local-ref(dl, A.s-name(dl, nm), A.s-name(dl, nm)))
+  else if at-op(st, "*"):
+    p-advance(st)
+    A.s-provide-name(node-loc(start), A.s-star(dl, parse-opt-hiding(st)))
+  else:
+    nm = expect(st, "NAME").value
+    as-nm = if at-name(st, "as"): p-advance(st) expect(st, "NAME").value else: nm end
+    A.s-provide-name(node-loc(start), A.s-local-ref(dl, A.s-name(dl, nm), A.s-name(dl, as-nm)))
   end
 end
 

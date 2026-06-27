@@ -218,3 +218,9 @@ follow-up: raise/auto-grow the linear-memory + source-buffer sizing (and/or stre
 `string-to-code-points`) so 100KB+ files fit. Until then, deeply NESTED expressions
 still recurse by nesting depth (bounded, fine) — only file-length recursion was the
 stack issue, and that is resolved.
+
+## Surface gaps closed after the no-JS parser swap (provide-block, bare instantiation, stmt-reactor)
+- `provide: spec, ... end` -> s-provide-block (specs incl `*`/`type *`/`data X hiding (...)`/`as`); placed in s-program._provide to match the JS-GLR bridge.
+- bare instantiation `f<Number>` (no call) -> s-instantiate (matching `>` followed by EOF/`)`/`]`/`}`/`,`/`:` => instantiation, else comparison).
+- `reactor: ... end` at statement position -> s-reactor.
+Whole closure still parses; surface-parse.test.ts reactor/f<Number>/provide-block restored.
