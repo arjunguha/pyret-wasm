@@ -100,6 +100,17 @@ export const TAGS = {
   HEADERS: 80, // helper: a List<FieldName>
   TABLEROW: 81, // s-table-row: kids = [EXPRS(elems)]
   ROWS: 82, // helper: a List<TableRow>
+  // --- round 6 (corpus blockers cont.) ---
+  EXTEND: 83, // s-extend: kids = [obj, MEMBERS]
+  GETBANG: 84, // s-get-bang: str = field, kids = [obj]
+  TUPLEGET: 85, // s-tuple-get: str = index, kids = [obj]
+  REC: 86, // s-rec: str = name, kids = [value]
+  METHOD: 87, // s-method: kids = [BINDS(args), body-block, where?]
+  LETREC: 88, // s-letrec: kids = [LRBINDS, body-block]
+  LRBIND: 89, // s-letrec-bind: str = name, kids = [value]
+  LRBINDS: 90, // helper: a List<LetrecBind>
+  RFRAC: 91, // s-rfrac: str = "~num/den" (rough rational literal)
+  CHECKREFINE: 92, // s-check-test w/ refinement: str = op kind, kids = [left, refinement, right]
 } as const;
 
 // One node of the flat pre-order stream. `nkids` children follow immediately
@@ -332,6 +343,39 @@ function toExpr(orig: CstNode): AstNode {
     }
     case "table-expr":
       return tableExpr(n);
+    case "rfrac-expr":
+      return node(TAGS.RFRAC, n.kids[0]!.value ?? "~0/1"); // ROUGHRATIONAL "~num/den"
+    case "extend-expr": {
+      // obj . { fields }  ->  s-extend (fields are data/method members).
+      const obj = toExpr(n.kids[0]!);
+      const members = lowerFields(n);
+      return node(TAGS.EXTEND, "", [obj, node(TAGS.MEMBERS, "", members)]);
+    }
+    case "get-bang-expr": {
+      // obj ! field  ->  s-get-bang (the direct NAME child is the field).
+      const obj = toExpr(n.kids[0]!);
+      const field = n.kids.find((k) => k.name === "NAME")?.value ?? "";
+      return node(TAGS.GETBANG, field, [obj]);
+    }
+    case "tuple-get": {
+      // obj . { N }  ->  s-tuple-get (the direct NUMBER child is the index).
+      const obj = toExpr(n.kids[0]!);
+      const idx = n.kids.find((k) => k.name === "NUMBER")?.value ?? "0";
+      return node(TAGS.TUPLEGET, idx, [obj]);
+    }
+    case "rec-expr": {
+      // REC toplevel-binding = value  ->  s-rec.
+      const name = bindName(n.kids.find((k) => k.name === "toplevel-binding")!);
+      const value = toExpr(n.kids[n.kids.length - 1]!);
+      return node(TAGS.REC, name, [value]);
+    }
+    case "method-expr": {
+      // method(args): body [where:] end  ->  s-method (anonymous).
+      const { binds, body } = funParts(n);
+      return node(TAGS.METHOD, "", withWhere([binds, body], n));
+    }
+    case "letrec-expr":
+      return letrecExpr(n);
     default:
       if (n.kids.length === 1) return toExpr(n.kids[0]!);
       throw new Error(`parse-bridge: unhandled CST node '${n.name}'`);
@@ -350,14 +394,40 @@ function binop(n: CstNode): AstNode {
   return acc;
 }
 
-// check-test: either a plain expression, or `lhs check-op rhs`.
+// check-test: either a plain expression, or `lhs check-op rhs`, or the refined
+// `lhs check-op%(pred) rhs` form (e.g. `x is%(within(0.1)) y`).
 function checkTest(n: CstNode): AstNode {
   if (n.kids.length === 1) return toExpr(n.kids[0]!);
   const opNode = n.kids.find((k) => k.name === "check-op");
-  if (opNode && n.kids.length >= 3) {
-    return node(TAGS.CHECKTEST, checkOpKind(opNode), [toExpr(n.kids[0]!), toExpr(n.kids[2]!)]);
+  if (opNode) {
+    // `%(pred)` refinement: a PERCENT terminal sits between the op and rhs, and
+    // there are THREE binop-expr children [left, refinement-pred, right].
+    if (n.kids.some((k) => k.name === "PERCENT")) {
+      const binops = n.kids.filter((k) => k.name === "binop-expr");
+      if (binops.length >= 3) {
+        return node(TAGS.CHECKREFINE, checkOpKind(opNode), [
+          toExpr(binops[0]!), toExpr(binops[1]!), toExpr(binops[2]!),
+        ]);
+      }
+    }
+    if (n.kids.length >= 3) {
+      return node(TAGS.CHECKTEST, checkOpKind(opNode), [toExpr(n.kids[0]!), toExpr(n.kids[2]!)]);
+    }
   }
   return toExpr(n.kids[0]!); // TODO(grammar): postfix check-op-postfix, `because`
+}
+
+// letrec-expr: LETREC let-expr (, let-expr)* : block END  ->  s-letrec.
+function letrecExpr(n: CstNode): AstNode {
+  const binds = n.kids
+    .filter((k) => k.name === "let-expr")
+    .map((le) => {
+      const name = bindName(le.kids.find((k) => k.name === "toplevel-binding")!);
+      const value = toExpr(le.kids[le.kids.length - 1]!);
+      return node(TAGS.LRBIND, name, [value]);
+    });
+  const body = toBlock(n.kids.find((k) => k.name === "block")!);
+  return node(TAGS.LETREC, "", [node(TAGS.LRBINDS, "", binds), body]);
 }
 
 // app-expr: fn app-args  (fn may itself be a dot-expr => method call).

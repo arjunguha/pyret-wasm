@@ -98,6 +98,16 @@ FIELDNAME = 79
 HEADERS = 80
 TABLEROW = 81
 ROWS = 82
+EXTEND = 83
+GETBANG = 84
+TUPLEGET = 85
+REC = 86
+METHOD = 87
+LETREC = 88
+LRBIND = 89
+LRBINDS = 90
+RFRAC = 91
+CHECKREFINE = 92
 
 # Shared read cursor into the flat pre-order stream.
 var cursor = 0
@@ -266,6 +276,24 @@ fun build-node(tag, s, kids):
   else if tag == HEADERS: kids   # a List<FieldName>
   else if tag == TABLEROW: A.s-table-row(l, kids.get(0))
   else if tag == ROWS: kids   # a List<TableRow>
+  else if tag == EXTEND: A.s-extend(l, kids.get(0), kids.get(1))
+  else if tag == GETBANG: A.s-get-bang(l, kids.get(0), s)
+  else if tag == TUPLEGET:
+    A.s-tuple-get(l, kids.get(0), string-to-number(s).value, l)
+  else if tag == REC: A.s-rec(l, mk-bind(l, s), kids.get(0))
+  else if tag == METHOD:
+    A.s-method(l, "", empty, kids.get(0), A.a-blank, "", kids.get(1),
+      check-loc(l, kids, 2), opt-at(kids, 2), false)
+  else if tag == LETREC: A.s-letrec(l, kids.get(0), kids.get(1), false)
+  else if tag == LRBIND: A.s-letrec-bind(l, mk-bind(l, s), kids.get(0))
+  else if tag == LRBINDS: kids   # a List<LetrecBind>
+  else if tag == RFRAC:
+    # str is "~num/den"; drop the leading "~" then split on "/".
+    fp = frac-parts(string-substring(s, 1, string-length(s)))
+    A.s-rfrac(l, fp.num, fp.den)
+  else if tag == CHECKREFINE:
+    A.s-check-test(l, check-op(l, s), some(kids.get(1)), kids.get(0),
+      some(kids.get(2)), none)
   else if tag == BIND: mk-bind(l, s)
   else if tag == PROGRAM:
     # `provide { ... }` (flag "block") prepends the provide expr as a leading kid,
