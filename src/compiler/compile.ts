@@ -64,6 +64,8 @@ class Compiler {
   fnNames: string[] = [];               // table entries (index = position)
   ctorFns = new Map<string, number>();  // variant name -> table index of its constructor wrapper
   predFns = new Map<string, number>();  // variant name -> table index of its is-<v> predicate wrapper
+  typePredFns = new Map<string, number>(); // data TYPE name -> table index of its is-<Type> predicate
+  dataTypeRanges = new Map<string, { min: number; max: number }>(); // data type name -> [min,max] variant id range
   tostringFns = new Map<string, number>(); // tostring/torepr reified as first-class fns
   sig: binaryen.Type;
   gcount = 0;                            // for unique global names
@@ -224,6 +226,10 @@ class Compiler {
   private registerData(dataExpr: CstNode) {
     // `sharing:` methods apply to every variant of this data type; per-variant
     // `with:` methods override them by name.
+    // The variants of one `data` decl get consecutive ids, so the type is a
+    // contiguous id range — record it for the data-TYPE predicate `is-<TypeName>`.
+    const typeName = this.childNamed(dataExpr, "NAME")?.value;
+    const minId = this.nextVariantId;
     const sharing = this.childNamed(dataExpr, "data-sharing");
     const shared = sharing ? this.collectMethods(sharing) : [];
     for (const kid of dataExpr.kids) {
@@ -246,6 +252,9 @@ class Compiler {
         const nm = this.childNamed(kid, "NAME");
         if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods });
       }
+    }
+    if (typeName && this.nextVariantId > minId) {
+      this.dataTypeRanges.set(typeName, { min: minId, max: this.nextVariantId - 1 });
     }
   }
 
@@ -548,6 +557,25 @@ class Compiler {
     return fnIndex;
   }
 
+  // Reify the data-TYPE predicate `is-<TypeName>` (true for any variant of that
+  // data type) as a first-class function: value is a $Variant whose id is in range.
+  private typePredicateFnIndex(typeName: string): number {
+    if (this.typePredFns.has(typeName)) return this.typePredFns.get(typeName)!;
+    const m = this.m;
+    const r = this.dataTypeRanges.get(typeName)!;
+    const fnIndex = this.fnNames.length;
+    const wasmName = "$isty_" + fnIndex + "_" + typeName;
+    this.fnNames.push(wasmName);
+    const arg = () => m.array.get(m.local.get(1, this.t.FieldsRefNull), m.i32.const(0), binaryen.anyref, false);
+    const idv = () => m.call("$variant_id", [m.ref.cast(arg(), this.t.VariantRef)], binaryen.i32);
+    const body = this.mkBool(m.if(m.ref.test(arg(), this.t.VariantRefNull),
+      m.i32.and(m.i32.ge_s(idv(), m.i32.const(r.min)), m.i32.le_s(idv(), m.i32.const(r.max))),
+      m.i32.const(0), binaryen.i32));
+    m.addFunction(wasmName, this.sig, binaryen.anyref, [], body);
+    this.typePredFns.set(typeName, fnIndex);
+    return fnIndex;
+  }
+
   // Resolve an identifier to a binaryen expression, or null if unbound.
   // raw=true returns a boxed var's CELL (for capture/assign) instead of its value.
   private resolveName(name: string, ctx: Ctx, raw = false): number | null {
@@ -575,6 +603,10 @@ class Compiler {
     // bare `is-<variant>` -> a first-class predicate function.
     if (name.startsWith("is-") && this.variants.has(name.slice(3))) {
       return this.makeClosure(this.predicateFnIndex(name.slice(3)), [], ctx);
+    }
+    // bare `is-<TypeName>` -> the data-type predicate (any variant of that type).
+    if (name.startsWith("is-") && this.dataTypeRanges.has(name.slice(3))) {
+      return this.makeClosure(this.typePredicateFnIndex(name.slice(3)), [], ctx);
     }
     // bare reference to a unary string-rendering builtin -> a first-class function.
     if (name === "tostring" || name === "to-string" || name === "torepr" || name === "to-repr") {
@@ -1266,6 +1298,19 @@ class Compiler {
       return this.mkBool(m.if(m.ref.test(arg, this.t.VariantRefNull),
         m.i32.eq(m.call("$variant_id", [m.ref.cast(arg, this.t.VariantRef)], binaryen.i32), m.i32.const(v.id)),
         m.i32.const(0), binaryen.i32));
+    }
+    // is-<TypeName>(x): data-type predicate (variant id in the type's range).
+    if (name && name.startsWith("is-") && this.dataTypeRanges.has(name.slice(3)) && args.length === 1 && !this.isBound(name, ctx)) {
+      const r = this.dataTypeRanges.get(name.slice(3))!;
+      const tmp = ctx.addLocal(binaryen.anyref);
+      const g = () => m.local.get(tmp, binaryen.anyref);
+      const idv = () => m.call("$variant_id", [m.ref.cast(g(), this.t.VariantRef)], binaryen.i32);
+      return m.block(null, [
+        m.local.set(tmp, args[0]!),
+        this.mkBool(m.if(m.ref.test(g(), this.t.VariantRefNull),
+          m.i32.and(m.i32.ge_s(idv(), m.i32.const(r.min)), m.i32.le_s(idv(), m.i32.const(r.max))),
+          m.i32.const(0), binaryen.i32)),
+      ], binaryen.anyref);
     }
 
     // general closure call
