@@ -1449,19 +1449,17 @@ export class Runtime {
   // $num_to_string(ref $Num) -> i32 (byte length written at SCRATCH_OFFSET)
   // Handles fixnum (decimal) and rational ("n/d"). Roughnum deferred.
   private buildNumToString() {
-    const m = this.m, t = this.t, I = binaryen.i32;
+    const m = this.m, t = this.t, I = binaryen.i32, L = binaryen.i64;
     // $render_num(v, addr) -> end addr. Writes the number's decimal repr at addr.
     {
       const v = () => m.local.get(0, t.NumRef);
       const addr = () => m.local.get(1, I);
       const len = () => m.local.get(2, I);
       const tg = () => m.struct.get(0, v(), I, false);
-      const rough = "roughnum";
-      const roughStores = Array.from(rough, (ch, i) =>
-        m.i32.store8(0, 0, m.i32.add(addr(), m.i32.const(i)), m.i32.const(ch.charCodeAt(0))));
       const body = m.block("ret", [
         m.if(m.i32.eq(tg(), m.i32.const(NUM_TAG.ROUGH)),
-          m.block(null, [...roughStores, m.br("ret", undefined, m.i32.add(addr(), m.i32.const(rough.length)))])),
+          m.br("ret", undefined, m.call("$render_rough", [
+            m.struct.get(1, m.ref.cast(v(), t.RoughnumRef), binaryen.f64, false), addr()], I))),
         m.if(m.i32.eq(tg(), m.i32.const(NUM_TAG.BIGNUM)),
           m.br("ret", undefined, m.call("$bn_render", [
             m.struct.get(2, m.ref.cast(v(), t.BignumRef), t.LimbsRef, false),
@@ -1479,6 +1477,93 @@ export class Runtime {
           m.call("$write_i64", [m.struct.get(1, m.ref.cast(v(), t.FixnumRef), binaryen.i64, false), addr()], I))),
       ], I);
       m.addFunction("$render_num", binaryen.createType([t.NumRef, I]), I, [I], body);
+    }
+    // $render_rough(f64 x, i32 addr) -> i32 end addr. Writes Pyret's `~`-prefixed
+    // decimal repr of a roughnum (e.g. ~3.14, ~5, ~-0.5).  Approximates JS Number
+    // toString with fixed-precision: integer part + up to 15 fractional digits,
+    // rounded, with trailing zeros trimmed (so ~3.14 prints as "~3.14", integral
+    // roughnums as "~5").  NaN/inf print "~nan"/"~inf".
+    {
+      const F = binaryen.f64;
+      const x = () => m.local.get(0, F);
+      const a = () => m.local.get(2, I);     // cursor
+      const ax = () => m.local.get(3, F);    // |x|
+      const ip = () => m.local.get(4, L);    // integer part
+      const fr = () => m.local.get(5, L);    // scaled fractional part
+      const width = () => m.local.get(6, I); // remaining fractional field width
+      const divisor = () => m.local.get(7, L);
+      const d = () => m.local.get(8, L);     // current digit
+      const E15 = m.i64.const(1000000000000000n);
+      const setA = (e: number) => m.local.set(2, e);
+      const incA = () => setA(m.i32.add(a(), m.i32.const(1)));
+      const lit = (s: string) => m.block(null, [
+        ...Array.from(s, (ch, i) =>
+          m.i32.store8(0, 0, m.i32.add(a(), m.i32.const(i)), m.i32.const(ch.charCodeAt(0)))),
+        m.br("ret", undefined, m.i32.add(a(), m.i32.const(s.length))),
+      ]);
+      const store = (ch: string) => m.i32.store8(0, 0, a(), m.i32.const(ch.charCodeAt(0)));
+      const DBL_MAX = m.f64.const(1.7976931348623157e308);
+      const body = m.block("ret", [
+        setA(m.local.get(1, I)),
+        store("~"), incA(),
+        // NaN: x != x
+        m.if(m.f64.ne(x(), x()), lit("nan")),
+        // sign
+        m.if(m.f64.lt(x(), m.f64.const(0)), m.block(null, [store("-"), incA()])),
+        m.local.set(3, m.f64.abs(x())),
+        // +inf
+        m.if(m.f64.gt(ax(), DBL_MAX), lit("inf")),
+        // integer part + rounded scaled fractional part
+        m.local.set(4, m.i64.trunc_s_sat.f64(ax())),
+        m.local.set(5, m.i64.trunc_s_sat.f64(m.f64.add(
+          m.f64.mul(m.f64.sub(ax(), m.f64.convert_s.i64(ip())), m.f64.const(1e15)),
+          m.f64.const(0.5)))),
+        // carry if rounding bumped the fraction to a whole unit
+        m.if(m.i64.ge_u(fr(), E15), m.block(null, [
+          m.local.set(4, m.i64.add(ip(), m.i64.const(1n))),
+          m.local.set(5, m.i64.const(0n)),
+        ])),
+        // integer digits
+        setA(m.i32.add(a(), m.call("$write_i64", [ip(), a()], I))),
+        // fractional digits (only when nonzero)
+        m.if(m.i64.ne(fr(), m.i64.const(0n)), m.block(null, [
+          // trim trailing zeros, shrinking the field width to keep leading zeros
+          m.local.set(6, m.i32.const(15)),
+          m.loop("trim", m.block(null, [
+            m.if(m.i64.eqz(m.i64.rem_u(fr(), m.i64.const(10n))), m.block(null, [
+              m.local.set(5, m.i64.div_u(fr(), m.i64.const(10n))),
+              m.local.set(6, m.i32.sub(width(), m.i32.const(1))),
+              m.br("trim"),
+            ])),
+          ])),
+          store("."), incA(),
+          // divisor = 10^(width-1)
+          m.local.set(7, m.i64.const(1n)),
+          m.local.set(8, m.i64.extend_u(m.i32.sub(width(), m.i32.const(1)))),
+          m.loop("pw", m.block(null, [
+            m.if(m.i64.gt_s(d(), m.i64.const(0n)), m.block(null, [
+              m.local.set(7, m.i64.mul(divisor(), m.i64.const(10n))),
+              m.local.set(8, m.i64.sub(d(), m.i64.const(1n))),
+              m.br("pw"),
+            ])),
+          ])),
+          // emit `width` digits most-significant first
+          m.loop("dig", m.block(null, [
+            m.if(m.i32.gt_s(width(), m.i32.const(0)), m.block(null, [
+              m.local.set(8, m.i64.div_u(fr(), divisor())),
+              m.i32.store8(0, 0, a(), m.i32.add(m.i32.const(48), m.i32.wrap(d()))),
+              setA(m.i32.add(a(), m.i32.const(1))),
+              m.local.set(5, m.i64.sub(fr(), m.i64.mul(d(), divisor()))),
+              m.local.set(7, m.i64.div_u(divisor(), m.i64.const(10n))),
+              m.local.set(6, m.i32.sub(width(), m.i32.const(1))),
+              m.br("dig"),
+            ])),
+          ])),
+        ])),
+        m.br("ret", undefined, a()),
+      ], I);
+      m.addFunction("$render_rough", binaryen.createType([F, I]), I,
+        [I, F, L, L, I, L, L], body);
     }
     // $num_to_string(v) -> length, writing at SCRATCH_OFFSET (used by tests).
     m.addFunction("$num_to_string", binaryen.createType([t.NumRef]), I, [],
