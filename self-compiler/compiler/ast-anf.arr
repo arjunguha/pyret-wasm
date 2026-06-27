@@ -553,7 +553,7 @@ fun strip-loc-val(val :: AVal):
   end
 end
 
-default-map-visitor = {
+default-anf-map-visitor = {
   method a-module(self, l :: Loc, answer :: AVal, dm, dv, dt, checks):
     a-module(l, answer.visit(self), dm, dv, dt, checks.visit(self))
   end,
@@ -703,7 +703,6 @@ default-map-visitor = {
     a-id-safe-letrec(l, id)
   end
 }
-
 fun freevars-list-acc(anns :: List<A.Ann>, seen-so-far):
   for fold(acc from seen-so-far, a from anns):
     freevars-ann-acc(a, acc)

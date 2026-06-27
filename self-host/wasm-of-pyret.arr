@@ -247,7 +247,8 @@ fun emit-str(s :: String) -> List<Number>:
 end
 # read the boxed-var 1-cell at local `idx` -> its value
 fun box-read(idx :: Number) -> List<Number>:
-  E.local-get(idx).append(E.i32-const(0)).append(E.array-get(T-FIELDS))
+  # cast anyref local to (ref $Fields) before array.get (WASM requires the concrete type)
+  E.local-get(idx).append(E.ref-cast(T-FIELDS)).append(E.i32-const(0)).append(E.array-get(T-FIELDS))
 end
 # load a free var's CURRENT value at a capture site: just local-get its local. For a `var`
 # that local already holds the 1-cell BOX, so the box (not the value) is captured -> shared
@@ -273,6 +274,13 @@ fun compile-aval(v, c :: Ctx) -> List<Number>:
         | none => resolve-nonlocal(c, k)                                     # top-level global, else null
         | some(i) => if is-var(c, k): box-read(i) else: E.local-get(i) end
       end
+    | a-id-safe-letrec(l, id) =>                                             # letrec-safe read: same as a-id
+      k = name-key(id)
+      cases(Option) lookup-local-opt(c, k):
+        | none => resolve-nonlocal(c, k)
+        | some(i) => E.local-get(i)
+      end
+    | a-id-modref(l, id, uri, name) => E.i-ref-null(110)                    # TODO(port): module ref
     | a-srcloc(l, loc) => E.i-ref-null(110)                                  # TODO(port): srcloc value
     | a-undefined(l) => E.i-ref-null(110)
     | a-prim-val(l, name) => E.i-ref-null(110)                              # TODO(port): primitive globals
@@ -352,6 +360,24 @@ fun compile-prim-app(fname :: String, args, c :: Ctx) -> List<Number>:
   end
 end
 
+# ===== arithmetic global fast-path helpers =====
+# Get the .key() of an AVal id (for global detection). Uses A.Name.key() which returns
+# "global#<name>" for s-global, "atom#<base>#<serial>" for s-atom, etc. Returns "" for
+# non-id AVal nodes so find-arith never matches them.
+fun name-key-of-aval(v) -> String:
+  cases(N.AVal) v:
+    | a-id(_, id) => id.key()
+    | else => ""
+  end
+end
+# Find a runtime-function name for a known arithmetic global key, else none.
+fun find-arith(tbl, key :: String):
+  cases(List) tbl:
+    | empty => none
+    | link(f, r) => if f.k == key: some(f.fn) else: find-arith(r, key) end
+  end
+end
+
 # ===== ALettable -> instructions (leaves the value; `tail` => return_call) =====
 fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
   cases(N.ALettable) lt:
@@ -370,18 +396,48 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       end
     | a-id-var-modref(l, id, uri, name) => E.i-ref-null(110)                # TODO(port): module ref
     | a-app(l, f, args, info) =>
-      # closure-calling convention: (closure-as-anyref, $Fields)->anyref via table 0.
-      # The closure is used twice (passed as arg0 AND its fnIndex is the table selector),
-      # so stash it in a temp local. Stack order for call_indirect: [arg0=closure,
-      # arg1=fields, selector=closure.fnIndex].  tyidx = the closure-call func type.
-      cl = c.next-local
-      tyidx = closure-call-type-idx()
-      compile-aval(f, c)
-        .append(E.local-set(cl))
-        .append(E.local-get(cl))                                  # arg0: the closure
-        .append(pack-fields(args, c))                             # arg1: args as $Fields
-        .append(E.local-get(cl)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))  # selector
-        .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+      # Fast path: well-known Pyret global arithmetic/comparison operators that desugar
+      # emits as s-app(s-id(s-global("_plus")), [a, b]) etc. These map directly to
+      # runtime functions that take (anyref, anyref) -> anyref and need no closure wrap.
+      # "_plus"    -> $plus      (fixnum add or string concat)
+      # "_minus"   -> $minus     (fixnum sub)
+      # "_times"   -> $times     (fixnum mul)
+      # "_divide"  -> $divide    (fixnum div)
+      # "_lessthan" / "_greaterthan" / "_lessequal" / "_greaterequal" -> comparisons
+      # "equal-always" / "equal-now" -> $equal (also handled in prim-app but may reach here)
+      # Keys use A.Name.key() format: "global#<name>" for s-global names.
+      # These are the global function names that desugar.arr emits for operators.
+      arith-map = [list:
+        {k: "global#_plus",          fn: "$plus"},
+        {k: "global#_minus",         fn: "$minus"},
+        {k: "global#_times",         fn: "$times"},
+        {k: "global#_divide",        fn: "$divide"},
+        {k: "global#_lessthan",      fn: "$lessthan"},
+        {k: "global#_greaterthan",   fn: "$greaterthan"},
+        {k: "global#_lessequal",     fn: "$lessequal"},
+        {k: "global#_greaterequal",  fn: "$greaterequal"},
+        {k: "global#equal-always",   fn: "$equal_wrap"},
+        {k: "global#equal-now",      fn: "$equal_wrap"}
+      ]
+      f-key = name-key-of-aval(f)
+      cases(Option) find-arith(arith-map, f-key):
+        | some(rt-name) =>
+          # Direct runtime call: push args (anyref), call runtime fn.
+          compile-avals(args, c).append(E.i-call(rt-funcidx(rt-name)))
+        | none =>
+          # closure-calling convention: (closure-as-anyref, $Fields)->anyref via table 0.
+          # The closure is used twice (passed as arg0 AND its fnIndex is the table selector),
+          # so stash it in a temp local. Stack order for call_indirect: [arg0=closure,
+          # arg1=fields, selector=closure.fnIndex].  tyidx = the closure-call func type.
+          cl = c.next-local
+          tyidx = closure-call-type-idx()
+          compile-aval(f, c)
+            .append(E.local-set(cl))
+            .append(E.local-get(cl))                                  # arg0: the closure
+            .append(pack-fields(args, c))                             # arg1: args as $Fields
+            .append(E.local-get(cl)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))  # selector
+            .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+      end
     | a-prim-app(l, fname, args, info) => compile-prim-app(fname, args, c)
     | a-if(l, cnd, t, e) =>
       compile-aval(cnd, c)
@@ -442,6 +498,7 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # write the var's 1-cell: cell[0] := value ; assignment returns nothing.
       k = name-key(id)
       E.local-get(lookup-local(c, k))
+        .append(E.ref-cast(T-FIELDS))  # cast anyref local to (ref $Fields) for array.set
         .append(E.i32-const(0))
         .append(compile-aval(value, c))
         .append(E.array-set(T-FIELDS))
@@ -464,7 +521,13 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(E.array-new-fixed(T-FIELDS, length(variants)))
         .append(E.i-call(idx-make-object()))
     | a-ref(l, ann) => E.i-ref-null(110)                                   # TODO(port): bare ref
-    | a-module(l, ans, dv, dt, prov, types, checks) => E.i-ref-null(110)   # TODO(port): module value
+    | a-module(l, ans, dv, dt, prov, types, checks) =>
+      # Return the answer (the last evaluated expression in the body). The module value
+      # itself is not representable; we just expose `ans` so the host can render the result.
+      # `checks` is the checker results expression; we skip it here because a-prim-val
+      # ("builtins") is not yet wired up and would trap. The check: harness is handled
+      # separately via a-prim-app dispatch when the full builtins object is available.
+      compile-aval(ans, c)
   end
 end
 

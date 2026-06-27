@@ -572,7 +572,7 @@ fun compile-fun-body(l :: Loc, step :: A.Name, fun-name :: A.Name, compiler, arg
   var arg-used-in-lambda = false
   arg-names = args.map(_.id)
   dummy-anf-lettable = N.a-obj(A.dummy-loc, empty)
-  body.visit(N.default-map-visitor.{
+  body.visit(N.default-anf-map-visitor.{
     method a-lam(self, _, _, _, _, shadow body) block:
       saved-in-lam = in-lam
       in-lam := true
@@ -1004,7 +1004,7 @@ fun is-id-occurs(target :: A.Name, e :: J.JExpr) block:
   doc: "Returns true iff `target` occurs in `e`"
   dummy-js-expr = j-num(0)
   var found = false
-  e.visit(J.default-map-visitor.{
+  e.visit(J.default-js-map-visitor.{
     method j-id(self, name) block:
       when name == target:
         found := true
@@ -1984,7 +1984,7 @@ compiler-visitor = {
 }
 
 #|
-remove-useless-if-visitor = N.default-map-visitor.{
+remove-useless-if-visitor = N.default-anf-map-visitor.{
   method a-if(self, l, c, t, e):
     cases(N.AVal) c:
       | a-bool(_, test) =>
