@@ -130,4 +130,10 @@ test("pure-Pyret parser: parses real compiler source files", async () => {
   // matrix-util.arr: `include from G: ... end` (incl. `type *`), unary minus.
   const mu = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/trove/matrix-util.arr"));
   expect(mu).toContain("ok stmts=34");
+
+  // tables.arr: the `table:` literal grammar (table-expr: headers + `row:` rows).
+  // This was the LAST grammar-blocked real file; now every real compiler/trove
+  // file parses for grammar (the remaining failures are scale, not grammar).
+  const tbl = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/trove/tables.arr"));
+  expect(tbl).toContain("ok stmts=21");
 });

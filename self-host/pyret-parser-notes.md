@@ -107,18 +107,38 @@ grammar (see below). Gaps closed:
   `module` specs, `* ` and `type *`/`data *`, optional `as`.
 - (ty-params on `fun`/`method`/`data` declarations were already supported.)
 
-## TODO(grammar) — to reach the full grammar
+## Done in round 5 (grammar is now complete for the real compiler source)
 
-- **tables** (`table:`/`select`/`sieve`/`order`/`extract`/`transform`/`extend`/
-  `load-table`), `reactor`.  This is the ONLY remaining grammar gap across the real
-  compiler+trove source (only `tables.arr` still fails to parse: `expected RPAREN but got
-  COLON` on a `table:` literal).  Large feature, used only by table libraries — NOT by the
-  self-hosted compiler itself.
+- **`table:` literal** (`table-expr`): `table: hdr [:: ann] (, hdr)* (row: e (, e)*)* end`
+  → `s-table(l, headers :: List<FieldName>, rows :: List<TableRow>)` via `parse-table` /
+  `parse-table-headers` / `parse-table-header` / `parse-table-rows` / `parse-table-row`
+  (dispatched from `parse-name-atom` when `table` is followed by `:`, mirroring `block:`).
+  `tables.arr` was the LAST grammar-blocked file; it now parses (21 stmts).
+
+**Status: GRAMMAR = 0 across all 84 real `self-compiler/**.arr` + `self-host/*.arr` files.**
+55 parse; the other 29 fail ONLY on SCALE (call stack / linear-memory buffer on 80–130KB
+files), which is a runtime/architecture task, not grammar (see below).
+
+## TODO(grammar) — remaining, but NOT exercised by any real compiler/trove file
+
+- The other **table operations** (`select`/`sieve`/`order`/`extract`/`transform`/`extend`/
+  `update`/`load-table`) and `reactor` — the compiler source uses only the `table:` literal,
+  so these are unimplemented but currently block no file. Add when a consumer needs them.
+- **Decimal exponents** (`3.14e5`) and full string escapes (`\u`, `\x`, octal) — deferred:
+  unexercised by the compiler source, and Pyret's exact-vs-rough semantics for exponents
+  should be pinned against the reference parser before implementing (no failing file to
+  validate against yet).
+- **Generics/instantiation** `f<T>(...)` in expression position — genuinely ambiguous for
+  plain recursive descent (`<`/`>` lex as comparison ops; needs the real tokenizer's
+  LANGLE-vs-LT whitespace distinction). Unexercised by the compiler source.
+- Reject mixed operators without parens (defer to well-formedness, as real Pyret).
+- The last couple of secondary `dummy-loc`s (pat-loc on cases binds, where-loc).
 
 ## REMAINING BLOCKER: SCALE, not grammar (per-file findings)
 
-Of the 76 real `self-compiler/**.arr` files, **50 parse**; **1** has a grammar gap
-(`tables.arr`, above); the other **25 fail at RUNTIME on large inputs**, NOT on grammar:
+Of all 84 real `self-compiler/**.arr` + `self-host/*.arr` files, **55 parse**; **0** have a
+grammar gap (the `table:` literal closed the last one); the other **29 fail at RUNTIME on
+large inputs**, NOT on grammar:
 - `JS-ERROR: Maximum call stack size exceeded` — the recursive-descent parser + its
   cons-list builders (`tokenize`/`lex`/`parse-stmts`/`string-to-code-points`) recurse to a
   depth proportional to file size; 80–130KB files (anf/desugar/well-formed/resolve-scope/

@@ -1040,6 +1040,8 @@ fun parse-name-atom(st :: PState, v :: String) -> A.Expr:
     body = parse-block(st)
     expect-name(st, "end")
     A.s-user-block(node-loc(nm-tok), body)
+  else if (v == "table") and peek2-kind(st, "COLON"):
+    parse-table(st)
   else:
     p-advance(st)
     A.s-id(tok-loc(nm-tok), A.s-name(tok-loc(nm-tok), v))
@@ -1610,6 +1612,54 @@ fun parse-type-let-bind(st :: PState) -> A.TypeLetBind:
     ann = parse-ann(st)
     A.s-type-bind(node-loc(start), A.s-name(tok-loc(nm-tok), nm-tok.value), params, ann)
   end
+end
+
+### table:  table: hdr [:: ann] (, hdr)*  (row: e (, e)*)*  end
+fun parse-table(st :: PState) -> A.Expr:
+  start = p-peek(st)
+  expect-name(st, "table")
+  expect(st, "COLON")
+  headers = parse-table-headers(st)
+  rows = parse-table-rows(st)
+  expect-name(st, "end")
+  A.s-table(node-loc(start), headers, rows)
+end
+
+fun parse-table-headers(st :: PState) -> List<A.FieldName>:
+  # headers run until `end` or the first `row:`; may be empty
+  if at-name(st, "end") or (at-name(st, "row") and peek2-kind(st, "COLON")):
+    empty
+  else:
+    h = parse-table-header(st)
+    if at-kind(st, "COMMA"):
+      p-advance(st)
+      link(h, parse-table-headers(st))
+    else:
+      link(h, empty)
+    end
+  end
+end
+
+fun parse-table-header(st :: PState) -> A.FieldName:
+  nm = expect(st, "NAME")
+  ann = if at-kind(st, "COLONCOLON"): p-advance(st) parse-ann(st) else: A.a-blank end
+  A.s-field-name(tok-loc(nm), nm.value, ann)
+end
+
+fun parse-table-rows(st :: PState) -> List<A.TableRow>:
+  if at-name(st, "row") and peek2-kind(st, "COLON"):
+    r = parse-table-row(st)
+    link(r, parse-table-rows(st))
+  else:
+    empty
+  end
+end
+
+fun parse-table-row(st :: PState) -> A.TableRow:
+  start = expect-name(st, "row")
+  expect(st, "COLON")
+  elems = if at-name(st, "row") or at-name(st, "end"): empty else: parse-comma-binops(st) end
+  A.s-table-row(node-loc(start), elems)
 end
 
 ### spy:  spy [message] : [spy-field (, spy-field)*] end
