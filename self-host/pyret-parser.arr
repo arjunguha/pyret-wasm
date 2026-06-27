@@ -434,35 +434,204 @@ fun parse-block-or-colon(st :: PState) -> Boolean:
   end
 end
 
-### ---- annotations (minimal) ------------------------------------------------
-### TODO(grammar): arrow / record / app / pred / tuple annotations.
+### ---- annotations ----------------------------------------------------------
+### Full annotation grammar: name / dot / app (`List<T>`) / arrow (`(A -> B)`) /
+### record (`{x :: A}`) / tuple (`{A; B}`) / pred (`Ann%(expr)`) / `Any`.
 fun parse-ann(st :: PState) -> A.Ann:
+  base = parse-ann-base(st)
+  parse-ann-pred(st, base)
+end
+
+### trailing refinement(s):  Ann %(expr)
+fun parse-ann-pred(st :: PState, base :: A.Ann) -> A.Ann:
+  if at-kind(st, "PERCENT"):
+    p-advance(st)
+    expect(st, "LPAREN")
+    e = parse-binop(st)
+    expect(st, "RPAREN")
+    parse-ann-pred(st, A.a-pred(dl, base, e))
+  else:
+    base
+  end
+end
+
+fun parse-ann-base(st :: PState) -> A.Ann:
   if at-kind(st, "NAME"):
-    n1 = p-advance(st).value
-    if at-kind(st, "DOT"):
+    nm = p-advance(st).value
+    base = if at-kind(st, "DOT"):
       p-advance(st)
       n2 = expect(st, "NAME").value
-      A.a-dot(dl, A.s-name(dl, n1), n2)
+      A.a-dot(dl, A.s-name(dl, nm), n2)
+    else if nm == "Any":
+      A.a-any(dl)
     else:
-      A.a-name(dl, A.s-name(dl, n1))
+      A.a-name(dl, A.s-name(dl, nm))
     end
+    # application:  Name<Ann, ...>   (`<`/`>` are OP tokens)
+    if at-op(st, "<"):
+      p-advance(st)
+      args = parse-ann-app-args(st)
+      expect-gt(st)
+      A.a-app(dl, base, args)
+    else:
+      base
+    end
+  else if at-kind(st, "LPAREN"):
+    # arrow:  ( [Ann (, Ann)*] -> Ann )   or a parenthesized ann
+    p-advance(st)
+    parse-arrow-ann(st)
+  else if at-kind(st, "LBRACE"):
+    # record  { name :: Ann, ... }   or tuple  { Ann ; Ann ... }
+    p-advance(st)
+    parse-brace-ann(st)
   else:
     A.a-blank
   end
 end
 
-### ---- bindings -------------------------------------------------------------
-### name-binding: [SHADOW] NAME [:: ann].  TODO(grammar): tuple-binding.
-fun parse-binding(st :: PState) -> A.Bind:
-  shadows = if at-name(st, "shadow"): p-advance(st) true else: false end
-  nm = expect(st, "NAME").value
-  ann = if at-kind(st, "COLONCOLON"):
-    p-advance(st)
-    parse-ann(st)
-  else:
-    A.a-blank
+### consume a `>` operator (closes an `<...>` application).
+fun expect-gt(st :: PState) -> Nothing:
+  if at-op(st, ">"): p-advance(st) nothing
+  else: raise("parse error: expected '>' to close type application but got '" + p-peek(st).value + "'")
   end
-  A.s-bind(dl, shadows, A.s-name(dl, nm), ann)
+end
+
+fun parse-ann-app-args(st :: PState) -> List<A.Ann>:
+  if at-op(st, ">"): empty
+  else:
+    a = parse-ann(st)
+    if at-kind(st, "COMMA"):
+      p-advance(st)
+      link(a, parse-ann-app-args(st))
+    else:
+      link(a, empty)
+    end
+  end
+end
+
+### already consumed `(`.
+fun parse-arrow-ann(st :: PState) -> A.Ann:
+  if at-kind(st, "THINARROW"):
+    p-advance(st)
+    ret = parse-ann(st)
+    expect(st, "RPAREN")
+    A.a-arrow(dl, empty, ret, true)
+  else:
+    args = parse-arrow-arg-anns(st)
+    if at-kind(st, "THINARROW"):
+      p-advance(st)
+      ret = parse-ann(st)
+      expect(st, "RPAREN")
+      A.a-arrow(dl, args, ret, true)
+    else:
+      expect(st, "RPAREN")
+      cases(List) args:
+        | empty => A.a-blank
+        | link(a, _) => a  # a parenthesized single annotation
+      end
+    end
+  end
+end
+
+fun parse-arrow-arg-anns(st :: PState) -> List<A.Ann>:
+  if at-kind(st, "THINARROW") or at-kind(st, "RPAREN"): empty
+  else:
+    a = parse-ann(st)
+    if at-kind(st, "COMMA"):
+      p-advance(st)
+      link(a, parse-arrow-arg-anns(st))
+    else:
+      link(a, empty)
+    end
+  end
+end
+
+### already consumed `{`.
+fun parse-brace-ann(st :: PState) -> A.Ann:
+  if at-kind(st, "RBRACE"):
+    p-advance(st)
+    A.a-record(dl, empty)
+  else if (p-peek(st).kind == "NAME") and peek2-kind(st, "COLONCOLON"):
+    fields = parse-afield-list(st)
+    expect(st, "RBRACE")
+    A.a-record(dl, fields)
+  else:
+    anns = parse-tuple-ann-list(st)
+    expect(st, "RBRACE")
+    A.a-tuple(dl, anns)
+  end
+end
+
+fun parse-afield-list(st :: PState) -> List<A.AField>:
+  nm = expect(st, "NAME").value
+  expect(st, "COLONCOLON")
+  a = parse-ann(st)
+  f = A.a-field(dl, nm, a)
+  if at-kind(st, "COMMA"):
+    p-advance(st)
+    if at-kind(st, "RBRACE"): link(f, empty)
+    else: link(f, parse-afield-list(st))
+    end
+  else:
+    link(f, empty)
+  end
+end
+
+fun parse-tuple-ann-list(st :: PState) -> List<A.Ann>:
+  a = parse-ann(st)
+  if at-kind(st, "SEMI"):
+    p-advance(st)
+    if at-kind(st, "RBRACE"): link(a, empty)
+    else: link(a, parse-tuple-ann-list(st))
+    end
+  else:
+    link(a, empty)
+  end
+end
+
+### ---- bindings -------------------------------------------------------------
+### binding: name-binding  [SHADOW] NAME [:: ann]   OR
+###          tuple-binding { binding ; binding ... } [as binding]
+fun parse-binding(st :: PState) -> A.Bind:
+  if at-kind(st, "LBRACE"):
+    parse-tuple-binding(st)
+  else:
+    shadows = if at-name(st, "shadow"): p-advance(st) true else: false end
+    nm = expect(st, "NAME").value
+    ann = if at-kind(st, "COLONCOLON"):
+      p-advance(st)
+      parse-ann(st)
+    else:
+      A.a-blank
+    end
+    A.s-bind(dl, shadows, A.s-name(dl, nm), ann)
+  end
+end
+
+### tuple-binding:  { binding ; binding ... } [as binding]
+fun parse-tuple-binding(st :: PState) -> A.Bind:
+  expect(st, "LBRACE")
+  fields = parse-tuple-bind-fields(st)
+  expect(st, "RBRACE")
+  as-name = if at-name(st, "as"):
+    p-advance(st)
+    some(parse-binding(st))
+  else:
+    none
+  end
+  A.s-tuple-bind(dl, fields, as-name)
+end
+
+fun parse-tuple-bind-fields(st :: PState) -> List<A.Bind>:
+  b = parse-binding(st)
+  if at-kind(st, "SEMI"):
+    p-advance(st)
+    if at-kind(st, "RBRACE"): link(b, empty)
+    else: link(b, parse-tuple-bind-fields(st))
+    end
+  else:
+    link(b, empty)
+  end
 end
 
 ### ty-params: [< NAME (, NAME)* >]
@@ -1013,6 +1182,8 @@ fun parse-stmt(st :: PState) -> A.Expr:
   else if at-name(st, "data"): parse-data(st)
   else if at-name(st, "var"): parse-var(st)
   else if at-name(st, "rec"): parse-rec(st)
+  else if at-name(st, "type") and peek2-kind(st, "NAME"): parse-type(st)
+  else if at-name(st, "newtype") and peek2-kind(st, "NAME"): parse-newtype(st)
   else if at-name(st, "when"): parse-when(st)
   else if at-name(st, "check") or at-name(st, "examples"): parse-check(st)
   else if at-kind(st, "NAME") and peek2-kind(st, "COLONEQUALS"):
@@ -1042,9 +1213,33 @@ end
 
 fun parse-let(st :: PState) -> A.Expr:
   b = parse-binding(st)
+  if at-kind(st, "EQUALS"):
+    p-advance(st)
+    v = parse-binop(st)
+    A.s-let(dl, b, v, false)
+  else:
+    # `NAME :: Ann` with no `=`  ->  contract statement
+    A.s-contract(dl, b.id, empty, b.ann)
+  end
+end
+
+### type-alias statement:  type NAME [<params>] = Ann
+fun parse-type(st :: PState) -> A.Expr:
+  expect-name(st, "type")
+  nm = expect(st, "NAME").value
+  params = parse-ty-params(st)
   expect(st, "EQUALS")
-  v = parse-binop(st)
-  A.s-let(dl, b, v, false)
+  ann = parse-ann(st)
+  A.s-type(dl, A.s-name(dl, nm), params, ann)
+end
+
+### newtype statement:  newtype NAME as NAMET
+fun parse-newtype(st :: PState) -> A.Expr:
+  expect-name(st, "newtype")
+  nm = expect(st, "NAME").value
+  expect-name(st, "as")
+  namet = expect(st, "NAME").value
+  A.s-newtype(dl, A.s-name(dl, nm), A.s-name(dl, namet))
 end
 
 fun parse-var(st :: PState) -> A.Expr:
