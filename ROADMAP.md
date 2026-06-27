@@ -3,6 +3,42 @@
 A from-scratch WebAssembly compiler and runtime for the **full** Pyret language,
 running both on `bun` and in the browser, with a `code.pyret.org`-style IDE.
 
+## CURRENT STATUS (2026-06-27)
+
+The microcosm "selfhost/" demos below proved every mechanism in miniature; the project
+has since moved to the **real** ambitious target: the seed compiles Pyret's actual
+~23K-line front-end, and the self-hosted compiler is being built for real. Three compilers
+(per user directive): (1) the TS **seed** (kept as bootstrap), (2) the **self-hosted**
+Pyret→WASM compiler (the deliverable), (3) a Pyret→Pyret **CPS** transform (stoppability).
+
+Done this push (suite: **219 tests, 0 fail**):
+- **Front-end:** the seed compiles Pyret's real passes (ast/well-formed/desugar/resolve-
+  scope/anf/...). `ast.arr` runs (constructs + `.tosource().pretty()`). `anf-program`
+  normalizes hand-built ASTs end-to-end.
+- **Parsers (two):** the temporary **JS-GLR `surface-parse`** path (`parse-bridge.ts` +
+  `self-host/parse-from-tree.arr`, ~38 forms) feeding the front-end now; AND the permanent
+  **pure-Pyret parser** (`self-host/pyret-parser.arr`, no JS) — full annotations/type/
+  newtype/check-ops/decimals + **real srclocs** — already turns real source into the real
+  `ast.arr` AST (`fun f(x): x + 1 end\nf(2)` → `s-fun s-app`). Seed keeps JS-GLR
+  permanently; the self-hosted compiler must parse in pure Pyret (see parser-strategy memory).
+- **Backend (`self-host/wasm-of-pyret.arr` + `encoder.arr` + `runtime.arr`):** whole-module
+  assembler (closures w/ free-var capture, variant ctors, `call_indirect`, linear memory,
+  globals, **15 host imports w/ offset scheme** incl `$raise`); runtime kernels real
+  (fixnum tower, strings, objects/variants, `$equal`, renderer `$render`/`$val_to_string`,
+  **check harness** `$check_is`/`$check_pred`, `$cons`/`$obj_extend`). `build-runtime()`
+  emits ~49 fns / ~3K bytes.
+- **CPS (`self-host/cps.arr`):** transforms fun/app/cases(+else)/if/ask/when/for/blocks into
+  yield-checked continuation-passing form; `is-prim` synced with the seed.
+
+**THE singular remaining blocker → see `seed-module-system-blocker` memory.** The seed's
+whole-program *flattening* (`mergeMany` in `src/build.ts`) corrupts a global index when two
+large real modules are merged (minimal repro: `ast + encoder` → `Out of bounds array.get`;
+ruled out name-collision / func-scale / variant-scale). This blocks BOTH end-to-end backend
+verification AND assembling the full self-hosted compiler (which imports the whole front-end
++ the whole backend). Next step: give the seed a real module system (per-module compilation /
+module-relative indices) instead of flattening. Everything else (CPS build-path integration,
+the fixpoint, the corpus run) is gated behind it.
+
 ## Hard requirements (from the goal)
 
 1. **Compiler AND runtime in WebAssembly** — including the lexer and parser

@@ -153,6 +153,17 @@ f64-add = [list: 160]  f64-sub = [list: 161]  f64-mul = [list: 162]  f64-div = [
 i32-wrap-i64 = [list: 167]
 i64-extend-i32-s = [list: 172]  i64-extend-i32-u = [list: 173]
 f64-convert-i64-s = [list: 185]  i64-trunc-f64-s = [list: 176]
+i64-rem-u = [list: 130]  i64-div-u = [list: 128]
+i64-extend-u-i32 = i64-extend-i32-u
+
+# ===== linear-memory load/store (memarg = align ++ offset, both leb-u; we use offset 0).
+# Mirrors runtime.ts's i32.store8/i32.load8_u (1-byte, align 0) and i32 word ops (align 2).
+i32-load    = append([list: 40], [list: 2, 0])   # 0x28 align=2 offset=0
+i32-store   = append([list: 54], [list: 2, 0])   # 0x36
+i32-load8-u = append([list: 45], [list: 0, 0])   # 0x2D align=0
+i32-store8  = append([list: 58], [list: 0, 0])   # 0x3A
+# memory type (limits): flags 1 = min+max present, then min ++ max (pages).
+fun mem-type(min, max): append([list: 1], append(leb-u(min), leb-u(max))) end
 
 # ===== f64 IEEE-754 -> 8 little-endian bytes (for f64.const) =====
 fun pow2(e): if e <= 0: 1 else: 2 * pow2(e - 1) end end
