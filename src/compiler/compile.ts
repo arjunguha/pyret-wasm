@@ -763,6 +763,10 @@ class Compiler {
       case "inst-expr":
         // generic instantiation `expr<T, ...>` — type args erased
         return this.compileExpr(node.kids[0]!, ctx, tail);
+      case "template-expr":
+        // `...` placeholder — Pyret compiles it; running it raises "unfinished".
+        return this.compileIntrinsic("raise",
+          [this.compileString("template-not-finished: this expression is unfinished (...)")], ctx)!;
       case "tuple-expr": {
         // {e1; e2; ...} — a positional tuple (reserved variant id 0)
         const fields = this.childNamed(node, "tuple-fields")!;
