@@ -507,13 +507,9 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # read the ref-cell field by name, then unbox the cell. TODO(port): unbox.
       compile-aval(obj, c).append(emit-str(field)).append(E.i-call(idx-variant-field-by-name()))
     | a-tuple(l, fields) =>
-      # tuple = $Variant id 0, name "tuple", fields.
-      # TODO(render): id 0 collides with the FIRST data variant (collect-data assigns
-      # id=length, 0-based) — render_variant + $equal mis-treat that variant as a tuple.
-      # Moving this sentinel to -1 is the right fix, BUT lists/variants still render ""
-      # (a deeper render_variant/$render dispatch bug) and the cli-selfhost fallback test
-      # assumes lists trap — fix those together in a follow-up.
-      E.i32-const(0).append(emit-str("tuple")).append(pack-fields(fields, c)).append(E.struct-new(T-VARIANT))
+      # tuple = $Variant SENTINEL id -1 (distinct from real variant ids 0,1,2,… so the
+      # first data variant no longer renders/compares as a tuple), name "tuple", fields.
+      E.i32-const(-1).append(emit-str("tuple")).append(pack-fields(fields, c)).append(E.struct-new(T-VARIANT))
     | a-tuple-get(l, tup, index) =>
       compile-aval(tup, c)
         .append(E.ref-cast(T-VARIANT))

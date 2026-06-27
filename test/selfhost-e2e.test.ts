@@ -315,6 +315,22 @@ test("self-hosted: print(42) writes 42 to stdout", async () => {
   expect(result.output).toContain("42");
 });
 
+// Regression: the first data variant got id 0, which collided with the tuple sentinel
+// (also id 0), so `a(5)` rendered (and compared) as a tuple `{5}`. Tuple sentinel moved
+// to -1 so real variant ids 0,1,2,… are distinct.
+test("self-hosted: data variant renders as name(fields), not a tuple", async () => {
+  const { result } = await selfHostRun("data D: | a(x) end\nprint(a(5))");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("a(5)");
+  expect(result.output).not.toContain("{5}");
+});
+
+test("self-hosted: tuple renders as {a; b; c}", async () => {
+  const { result } = await selfHostRun("print({1; 2; 3})");
+  expect(result.error).toBeUndefined();
+  expect(result.output).toContain("{1; 2; 3}");
+});
+
 // `for ITER(b from e): body end` desugars to ITER(lam(b): body end, e).
 test("self-hosted: for-loop desugars to a higher-order call and runs", async () => {
   const { result } = await selfHostRun(
