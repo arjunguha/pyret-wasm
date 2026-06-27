@@ -8,7 +8,9 @@ provide *
 #   parse-node-str(i)    -> the node's string payload
 # We walk the array with a shared cursor and build real ast.arr AST values. Core
 # forms plus app/dot/if/let/var/fun/lam/construct/check-test/data/cases/when/
-# for/tuple and provide/import/include are handled here; growing the table is
+# for/tuple/obj, `ask:` (if-pipe), fraction literals, arrow/app/dot/tuple
+# annotations, data with:/sharing: methods + ref members, import file("…"), and
+# provide */provide {…}/import/include are handled here; growing the table is
 # matched by growing the lowering in parse-bridge.ts.
 import ast as A
 
@@ -55,6 +57,22 @@ IMPORT = 38
 INCLUDE = 39
 IMPORTS = 40
 NAMESTR = 41
+FRAC = 42
+IFPIPE = 43
+IFPIPEELSE = 44
+PIPEBRANCH = 45
+PIPEBRANCHES = 46
+AARROW = 47
+AAPP = 48
+ADOT = 49
+ATUPLE = 50
+ANNS = 51
+IMPORTFILE = 52
+VMEMBER = 53
+METHODFIELD = 54
+MEMBERS = 55
+DATAFIELD = 56
+OBJ = 57
 
 # Shared read cursor into the flat pre-order stream.
 var cursor = 0
@@ -62,6 +80,13 @@ var cursor = 0
 # A bare s-name binding with no annotation.
 fun mk-bind(l, s):
   A.s-bind(l, false, A.s-name(l, s), A.a-blank)
+end
+
+# Parse a "num/den" rational literal into its two integer parts.
+fun frac-parts(s):
+  parts = string-split(s, "/")
+  { num: string-to-number(parts.get(0)).value,
+    den: string-to-number(parts.get(1)).value }
 end
 
 # The check-op kind string (from parse-bridge) -> an ast.arr CheckOp value.
@@ -111,13 +136,19 @@ fun build-node(tag, s, kids):
   else if tag == BINDS: kids   # a List<Bind>
   else if tag == EXPRS: kids   # a List<Expr>
   else if tag == DATA:
-    A.s-data(l, s, empty, empty, kids.get(0), empty, none, none)
+    shared = if kids.length() >= 2: kids.get(1) else: empty end
+    A.s-data(l, s, empty, empty, kids.get(0), shared, none, none)
   else if tag == VARIANTS: kids   # a List<Variant>
   else if tag == VARIANT:
-    members = kids.get(0).map(lam(b): A.s-variant-member(l, A.s-normal, b) end)
-    A.s-variant(l, l, s, members, empty)
-  else if tag == SINGLEVARIANT: A.s-singleton-variant(l, s, empty)
-  else if tag == VMEMBERS: kids   # a List<Bind>
+    with-members = if kids.length() >= 2: kids.get(1) else: empty end
+    A.s-variant(l, l, s, kids.get(0), with-members)
+  else if tag == SINGLEVARIANT:
+    with-members = if is-empty(kids): empty else: kids.get(0) end
+    A.s-singleton-variant(l, s, with-members)
+  else if tag == VMEMBER:
+    mt = if s == "ref": A.s-mutable else: A.s-normal end
+    A.s-variant-member(l, mt, kids.get(0))
+  else if tag == VMEMBERS: kids   # a List<VariantMember>
   else if tag == CASES:
     A.s-cases(l, kids.get(0), kids.get(1), kids.get(2), false)
   else if tag == CASESELSE:
@@ -137,12 +168,45 @@ fun build-node(tag, s, kids):
     A.s-import(l, A.s-const-import(l, s), A.s-name(l, kids.get(0)))
   else if tag == INCLUDE: A.s-include(l, A.s-const-import(l, s))
   else if tag == IMPORTS: kids   # a List<Import>
-  else if tag == NAMESTR: s      # a raw String (e.g. an import alias)
+  else if tag == NAMESTR: s      # a raw String (e.g. an import alias / a-dot field)
+  else if tag == FRAC:
+    fp = frac-parts(s)
+    A.s-frac(l, fp.num, fp.den)
+  else if tag == IFPIPE: A.s-if-pipe(l, kids.get(0), false)
+  else if tag == IFPIPEELSE:
+    A.s-if-pipe-else(l, kids.get(0), kids.get(1), false)
+  else if tag == PIPEBRANCH:
+    A.s-if-pipe-branch(l, kids.get(0), kids.get(1))
+  else if tag == PIPEBRANCHES: kids   # a List<IfPipeBranch>
+  else if tag == AARROW:
+    A.a-arrow(l, kids.get(0), kids.get(1), true)
+  else if tag == AAPP:
+    A.a-app(l, kids.get(0), kids.get(1))
+  else if tag == ADOT:
+    A.a-dot(l, A.s-name(l, s), kids.get(0))
+  else if tag == ATUPLE: A.a-tuple(l, kids.get(0))
+  else if tag == ANNS: kids   # a List<Ann>
+  else if tag == IMPORTFILE:
+    A.s-import(l, A.s-special-import(l, "file", [list: s]), A.s-name(l, kids.get(0)))
+  else if tag == METHODFIELD:
+    A.s-method-field(l, s, empty, kids.get(0), A.a-blank, "", kids.get(1), none, none, false)
+  else if tag == MEMBERS: kids   # a List<Member>
+  else if tag == DATAFIELD: A.s-data-field(l, s, kids.get(0))
+  else if tag == OBJ: A.s-obj(l, kids.get(0))
   else if tag == BIND: mk-bind(l, s)
   else if tag == PROGRAM:
-    prov = if s == "all": A.s-provide-all(l) else: A.s-provide-none(l) end
+    # `provide { ... }` (flag "block") prepends the provide expr as a leading kid,
+    # so imports/block shift by one; provide-all/none keep the 2-kid layout.
+    has-prov-expr = kids.length() >= 3
+    prov =
+      if s == "all": A.s-provide-all(l)
+      else if s == "block": A.s-provide(l, kids.get(0))
+      else: A.s-provide-none(l)
+      end
+    imports = if has-prov-expr: kids.get(1) else: kids.get(0) end
+    blk = if has-prov-expr: kids.get(2) else: kids.get(1) end
     A.s-program(l, none, prov, A.s-provide-types-none(l),
-      empty, kids.get(0), kids.get(1))
+      empty, imports, blk)
   else: raise("from-tree: unhandled tag " + tostring(tag))
   end
 end

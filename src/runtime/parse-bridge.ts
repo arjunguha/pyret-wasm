@@ -56,6 +56,23 @@ export const TAGS = {
   INCLUDE: 39, // s-include: str = module name
   IMPORTS: 40, // helper: a List<Import>
   NAMESTR: 41, // helper: carries a raw string (rebuilt as the String itself)
+  // --- round 3 ---
+  FRAC: 42, // s-frac: str = "num/den"
+  IFPIPE: 43, // s-if-pipe: kids = [PIPEBRANCHES]
+  IFPIPEELSE: 44, // s-if-pipe-else: kids = [PIPEBRANCHES, else-block]
+  PIPEBRANCH: 45, // s-if-pipe-branch: kids = [test, body-block]
+  PIPEBRANCHES: 46, // helper: a List<IfPipeBranch>
+  AARROW: 47, // a-arrow: kids = [ANNS(args), ret-ann]
+  AAPP: 48, // a-app: kids = [base-ann, ANNS(args)]
+  ADOT: 49, // a-dot: str = obj name, kids = [NAMESTR(field)]
+  ATUPLE: 50, // a-tuple: kids = [ANNS(fields)]
+  ANNS: 51, // helper: a List<Ann>
+  IMPORTFILE: 52, // s-import of s-special-import: str = path, kids = [NAMESTR(alias)]
+  VMEMBER: 53, // s-variant-member: str = "ref"|"normal", kids = [BIND]
+  METHODFIELD: 54, // s-method-field: str = name, kids = [BINDS(args), body-block]
+  MEMBERS: 55, // helper: a List<Member> (with: / sharing:)
+  DATAFIELD: 56, // s-data-field: str = name, kids = [value]
+  OBJ: 57, // s-obj: kids = [MEMBERS]
 } as const;
 
 // One node of the flat pre-order stream. `nkids` children follow immediately
@@ -102,6 +119,17 @@ function checkOpKind(opNode: CstNode): string {
   }
 }
 
+// All `ann` CST nodes found under `n` (one level of comma-anns / arg lists).
+function annList(n: CstNode): AstNode[] {
+  const out: AstNode[] = [];
+  function walk(x: CstNode) {
+    if (x.name === "ann") { out.push(toAnn(x)); return; }
+    for (const k of x.kids) walk(k);
+  }
+  walk(n);
+  return out;
+}
+
 // Lower an `ann` CST node to our annotation AstNode.
 function toAnn(annNode: CstNode): AstNode {
   let a = annNode;
@@ -109,8 +137,32 @@ function toAnn(annNode: CstNode): AstNode {
   switch (a.name) {
     case "name-ann":
       return node(TAGS.ANAME, a.kids[0]!.value ?? "");
+    case "arrow-ann": {
+      // ( arrow-ann-args -> ret ) : args are the comma-anns; ret is the last ann.
+      const argsNode = a.kids.find((k) => k.name === "arrow-ann-args");
+      const args = argsNode ? annList(argsNode) : [];
+      const anns = a.kids.filter((k) => k.name === "ann");
+      const ret = toAnn(anns[anns.length - 1]!);
+      return node(TAGS.AARROW, "", [node(TAGS.ANNS, "", args), ret]);
+    }
+    case "app-ann": {
+      // base-name-ann < comma-anns > : base is the leading name-ann.
+      const base = toAnn(a.kids.find((k) => k.name === "name-ann")!);
+      const argsNode = a.kids.find((k) => k.name === "comma-anns");
+      const args = argsNode ? annList(argsNode) : [];
+      return node(TAGS.AAPP, "", [base, node(TAGS.ANNS, "", args)]);
+    }
+    case "dot-ann": {
+      // NAME . NAME : obj then field.
+      const names = a.kids.filter((k) => k.name === "NAME");
+      return node(TAGS.ADOT, names[0]?.value ?? "", [
+        node(TAGS.NAMESTR, names[1]?.value ?? ""),
+      ]);
+    }
+    case "tuple-ann":
+      return node(TAGS.ATUPLE, "", [node(TAGS.ANNS, "", annList(a))]);
     default:
-      return node(TAGS.ABLANK, ""); // TODO(grammar): arrow/app/dot/tuple/record anns
+      return node(TAGS.ABLANK, ""); // TODO(grammar): record/pred anns
   }
 }
 
@@ -129,7 +181,7 @@ function toExpr(orig: CstNode): AstNode {
     case "num-expr":
       return node(TAGS.NUM, n.kids[0]!.value ?? "0");
     case "frac-expr":
-      return node(TAGS.NUM, n.kids[0]!.value ?? "0"); // TODO(grammar): keep as fraction
+      return node(TAGS.FRAC, n.kids[0]!.value ?? "0/1"); // RATIONAL "num/den"
     case "string-expr":
       return node(TAGS.STR, stripStr(n.kids[0]!.value ?? ""));
     case "bool-expr":
@@ -189,6 +241,12 @@ function toExpr(orig: CstNode): AstNode {
     }
     case "for-expr":
       return forExpr(n);
+    case "if-pipe-expr":
+      return ifPipe(n);
+    case "obj-expr":
+      return node(TAGS.OBJ, "", [
+        node(TAGS.MEMBERS, "", lowerFields(n, "obj-fields", "obj-field")),
+      ]);
     default:
       if (n.kids.length === 1) return toExpr(n.kids[0]!);
       throw new Error(`parse-bridge: unhandled CST node '${n.name}'`);
@@ -235,35 +293,75 @@ function construct(n: CstNode): AstNode {
   return node(TAGS.CONSTRUCT, "", [ctor, node(TAGS.EXPRS, "", values)]);
 }
 
-// data-expr: DATA NAME ty-params : data-variant* data-sharing where? END
+// data-expr: DATA NAME ty-params : data-variant* data-with? data-sharing where? END
 function dataExpr(n: CstNode): AstNode {
   const name = n.kids.find((k) => k.name === "NAME")?.value ?? "";
   const variants = n.kids.filter((k) => k.name === "data-variant").map(lowerVariant);
-  return node(TAGS.DATA, name, [node(TAGS.VARIANTS, "", variants)]);
-  // TODO(grammar): mixins (`deriving`), shared `with:` members, sharing:, where:
+  // sharing: members live under data-sharing's `fields`.
+  const sharingNode = n.kids.find((k) => k.name === "data-sharing");
+  const shared = sharingNode ? lowerFields(sharingNode) : [];
+  return node(TAGS.DATA, name, [
+    node(TAGS.VARIANTS, "", variants),
+    node(TAGS.MEMBERS, "", shared),
+  ]);
+  // TODO(grammar): mixins (`deriving`), where:
 }
 
-// data-variant: `| ctor(members) with...` or singleton `| NAME with...`
+// data-variant: `| ctor(members) with:...` or singleton `| NAME with:...`
 function lowerVariant(dv: CstNode): AstNode {
   const ctor = dv.kids.find((k) => k.name === "variant-constructor");
+  // with: members (on either the constructor or singleton variant)
+  const withNode = dv.kids.find((k) => k.name === "data-with");
+  const withMembers = withNode ? lowerFields(withNode) : [];
   if (ctor) {
     const name = ctor.kids.find((k) => k.name === "NAME")?.value ?? "";
     const membersNode = ctor.kids.find((k) => k.name === "variant-members");
-    const binds: AstNode[] = [];
+    const members: AstNode[] = [];
     if (membersNode) {
       for (const vm of membersNode.kids) {
         if (vm.name === "variant-member") {
           const b = findFirst(vm, "binding");
-          if (b) binds.push(lowerBinding(b));
+          if (!b) continue;
+          const isRef = vm.kids.some((k) => k.name === "REF");
+          members.push(node(TAGS.VMEMBER, isRef ? "ref" : "normal", [lowerBinding(b)]));
         }
       }
     }
-    return node(TAGS.VARIANT, name, [node(TAGS.VMEMBERS, "", binds)]);
-    // TODO(grammar): mutable members (ref), with-members
+    return node(TAGS.VARIANT, name, [
+      node(TAGS.VMEMBERS, "", members),
+      node(TAGS.MEMBERS, "", withMembers),
+    ]);
   }
-  // singleton: the direct NAME child
+  // singleton: the direct NAME child (may still carry with: members)
   const name = dv.kids.find((k) => k.name === "NAME")?.value ?? "";
-  return node(TAGS.SINGLEVARIANT, name);
+  return node(TAGS.SINGLEVARIANT, name, [node(TAGS.MEMBERS, "", withMembers)]);
+}
+
+// One `field` / `obj-field` CST node -> a Member node (s-method-field or
+// s-data-field). Method fields carry the METHOD keyword + a fun-header.
+function lowerField(f: CstNode): AstNode | null {
+  const keyName = findFirst(f, "key")?.kids[0]?.value
+    ?? f.kids.find((k) => k.name === "NAME")?.value ?? "";
+  if (f.kids.some((k) => k.name === "METHOD")) {
+    const { binds, body } = funParts(f);
+    return node(TAGS.METHODFIELD, keyName, [binds, body]);
+  }
+  // data field `k: value` -> s-data-field.
+  const valNode = f.kids.find((k) => k.name === "binop-expr");
+  return valNode ? node(TAGS.DATAFIELD, keyName, [toExpr(valNode)]) : null;
+}
+
+// A `data-with` / `data-sharing` (or `obj-expr`) node's fields -> Member nodes.
+function lowerFields(container: CstNode, listName = "fields", fieldName = "field"): AstNode[] {
+  const fieldsNode = findFirst(container, listName);
+  if (!fieldsNode) return [];
+  const out: AstNode[] = [];
+  for (const f of fieldsNode.kids) {
+    if (f.name !== fieldName) continue;
+    const m = lowerField(f);
+    if (m) out.push(m);
+  }
+  return out;
 }
 
 // cases-expr: CASES ( ann ) val : branch* (| else => block)? END
@@ -346,6 +444,26 @@ function ifExpr(n: CstNode): AstNode {
   return node(TAGS.IF, "", [branchesNode]);
 }
 
+// if-pipe-expr (`ask:`): ASK : if-pipe-branch* (| otherwise: block)? END
+// if-pipe-branch: | cond then: block
+function ifPipe(n: CstNode): AstNode {
+  const branches = n.kids
+    .filter((k) => k.name === "if-pipe-branch")
+    .map((b) => {
+      const cond = toExpr(b.kids.find((k) => k.name === "binop-expr")!);
+      const body = toBlock(b.kids.find((k) => k.name === "block")!);
+      return node(TAGS.PIPEBRANCH, "", [cond, body]);
+    });
+  const branchesNode = node(TAGS.PIPEBRANCHES, "", branches);
+  // `| otherwise: block` => the trailing block that isn't inside a branch.
+  if (n.kids.some((k) => k.name === "OTHERWISECOLON")) {
+    const blocks = n.kids.filter((k) => k.name === "block");
+    const elseB = toBlock(blocks[blocks.length - 1]!);
+    return node(TAGS.IFPIPEELSE, "", [branchesNode, elseB]);
+  }
+  return node(TAGS.IFPIPE, "", [branchesNode]);
+}
+
 // A `block` CST -> our BLOCK node of lowered statements.
 function toBlock(n: CstNode): AstNode {
   return node(TAGS.BLOCK, "", n.kids.map(toExpr));
@@ -381,20 +499,36 @@ function findFirst(n: CstNode, name: string): CstNode | undefined {
 }
 
 // Lower the program `prelude` (provide / import / include statements).
-function lowerPrelude(prelude: CstNode): { provideFlag: string; imports: AstNode[] } {
+function lowerPrelude(prelude: CstNode): {
+  provideFlag: string;
+  provideExpr: AstNode | null;
+  imports: AstNode[];
+} {
   let provideFlag = "";
+  let provideExpr: AstNode | null = null;
   const imports: AstNode[] = [];
   for (const stmt of prelude.kids) {
     if (stmt.name === "provide-stmt") {
-      // `provide *` -> provide-all. Other provide forms are TODO(grammar).
-      if (findFirst(stmt, "TIMES")) provideFlag = "all";
-      continue;
+      // `provide *` -> provide-all; `provide { ... } end` -> s-provide of the obj.
+      if (findFirst(stmt, "TIMES")) { provideFlag = "all"; continue; }
+      const objNode = findFirst(stmt, "obj-expr");
+      if (objNode) { provideFlag = "block"; provideExpr = toExpr(objNode); }
+      continue; // TODO(grammar): provide-block spec form, provide-types
     }
     if (stmt.name === "import-stmt") {
       const isInclude = stmt.kids[0]?.name === "INCLUDE";
+      // import file("path") as NAME  ->  s-special-import.
+      const special = findFirst(stmt, "import-special");
+      if (special && !isInclude) {
+        const strNode = special.kids.find((k) => k.name === "STRING");
+        const path = strNode ? stripStr(strNode.value ?? "") : "";
+        const alias = stmt.kids.find((k) => k.name === "NAME")?.value ?? "";
+        imports.push(node(TAGS.IMPORTFILE, path, [node(TAGS.NAMESTR, alias)]));
+        continue;
+      }
       const srcName = findFirst(stmt, "import-name");
       const modName = srcName ? (findFirst(srcName, "NAME")?.value ?? "") : "";
-      if (!modName) continue; // TODO(grammar): import file("...") / import-special
+      if (!modName) continue; // TODO(grammar): include file("..."), import-special include
       if (isInclude) {
         imports.push(node(TAGS.INCLUDE, modName));
       } else {
@@ -404,7 +538,7 @@ function lowerPrelude(prelude: CstNode): { provideFlag: string; imports: AstNode
       }
     }
   }
-  return { provideFlag, imports };
+  return { provideFlag, provideExpr, imports };
 }
 
 function flatten(n: AstNode, out: SerNode[]): void {
@@ -415,13 +549,19 @@ function flatten(n: AstNode, out: SerNode[]): void {
 // Lower a full `program` CST into the flat pre-order SerNode stream.
 export function serializeCst(program: CstNode): SerNode[] {
   const prelude = program.kids.find((k) => k.name === "prelude");
-  const { provideFlag, imports } = prelude ? lowerPrelude(prelude) : { provideFlag: "", imports: [] };
+  const { provideFlag, provideExpr, imports } = prelude
+    ? lowerPrelude(prelude)
+    : { provideFlag: "", provideExpr: null, imports: [] };
   const block = program.kids.find((k) => k.name === "block");
   const stmts = block ? block.kids.map(toExpr) : [];
-  const root = node(TAGS.PROGRAM, provideFlag, [
+  // PROGRAM normally carries [IMPORTS, BLOCK]; for `provide { ... }` (flag
+  // "block") the provide expr is prepended as a leading kid (3 kids total).
+  const kids = [
     node(TAGS.IMPORTS, "", imports),
     node(TAGS.BLOCK, "", stmts),
-  ]);
+  ];
+  if (provideExpr) kids.unshift(provideExpr);
+  const root = node(TAGS.PROGRAM, provideFlag, kids);
   const out: SerNode[] = [];
   flatten(root, out);
   return out;

@@ -16,6 +16,9 @@ const FIXTURE = resolve(import.meta.dir, "fixtures/surface-parse.arr");
 const DETAIL = resolve(import.meta.dir, "fixtures/surface-parse-detail.arr");
 const INFO = resolve(import.meta.dir, "fixtures/surface-parse-info.arr");
 const ANN = resolve(import.meta.dir, "fixtures/surface-parse-ann.arr");
+const ANNLABEL = resolve(import.meta.dir, "fixtures/surface-parse-annlabel.arr");
+const IMPFILE = resolve(import.meta.dir, "fixtures/surface-parse-impfile.arr");
+const DATA = resolve(import.meta.dir, "fixtures/surface-parse-data.arr");
 
 // Run a seed-compiled fixture with the host bridge primed to parse `src`.
 async function runWithSource(wasm: Uint8Array, src: string): Promise<string> {
@@ -69,6 +72,13 @@ const FORMS: Array<[string, string]> = [
   ["for each(x from l): x end", "s-for"],
   ["if x: 1 else if y: 2 else: 3 end", "s-if-else"],
   ["fun f(x :: Number): x end", "s-fun"],
+  // round 3
+  ["1/2", "s-frac"],
+  ["ask: | x then: 1 | otherwise: 2 end", "s-if-pipe-else"],
+  ["ask: | x then: 1 end", "s-if-pipe"],
+  ["data D: | a(ref x) end", "s-data"],
+  ["data D: | a(x) with: method m(self): 1 end end", "s-data"],
+  ["data D: | a(x) sharing: method s(self): 1 end end", "s-data"],
 ];
 
 test("surface-parse: rebuilds the right ast.arr ctor for each core form", async () => {
@@ -151,4 +161,51 @@ test("surface-parse: typed fun param carries an a-name annotation", async () => 
   expect(out).toContain("argname=x");
   expect(out).toContain("annlabel=a-name");
   expect(out).toContain("anntype=Number");
+});
+
+// Richer annotation forms rebuild the matching ast.arr Ann ctor.
+const ANN_FORMS: Array<[string, string]> = [
+  ["fun f(g :: (Number -> String)): g end", "a-arrow"],
+  ["fun f(l :: List<Number>): l end", "a-app"],
+  ["fun f(x :: a.B): x end", "a-dot"],
+  ["fun f(p :: {Number; String}): p end", "a-tuple"],
+];
+
+test("surface-parse: arrow/app/dot/tuple annotations rebuild the right Ann ctor", async () => {
+  const wasm = await buildSourceFile(ANNLABEL);
+  for (const [src, label] of ANN_FORMS) {
+    const out = await runWithSource(wasm, src);
+    expect(out, `source ${JSON.stringify(src)}`).toContain(`annlabel=${label}`);
+  }
+});
+
+// `import file("...") as F` rebuilds an s-special-import with kind + args.
+test("surface-parse: import file(...) rebuilds s-special-import", async () => {
+  const wasm = await buildSourceFile(IMPFILE);
+  const out = await runWithSource(wasm, 'import file("foo.arr") as F\n5');
+  expect(out).toContain("implabel=s-import");
+  expect(out).toContain("filelabel=s-special-import");
+  expect(out).toContain("kind=file");
+  expect(out).toContain("arg0=foo.arr");
+  expect(out).toContain("alias=F");
+});
+
+// `provide { ... }` rebuilds an s-provide (record form) on the program header.
+test("surface-parse: provide { ... } rebuilds s-provide", async () => {
+  const wasm = await buildSourceFile(INFO);
+  const out = await runWithSource(wasm, "provide { x: 1 } end\n5");
+  expect(out).toContain("provide=s-provide");
+  expect(out).toContain("label=s-num");
+});
+
+// data: a `ref` member is s-mutable; `with:`/`sharing:` methods are s-method-field.
+test("surface-parse: data ref member + with/sharing methods", async () => {
+  const wasm = await buildSourceFile(DATA);
+  const src = "data D: | a(ref x) with: method m(self): 1 end sharing: method s(self): 2 end end";
+  const out = await runWithSource(wasm, src);
+  expect(out).toContain("mtype=s-mutable");
+  expect(out).toContain("nwith=1");
+  expect(out).toContain("wmlabel=s-method-field");
+  expect(out).toContain("nshared=1");
+  expect(out).toContain("shlabel=s-method-field");
 });
