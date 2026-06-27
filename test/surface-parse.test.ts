@@ -95,6 +95,15 @@ const FORMS: Array<[string, string]> = [
   ["f<Number>", "s-instantiate"],
   ["o!{a: 1}", "s-update"],
   ["table: a, b\n  row: 1, 2\nend", "s-table"],
+  // round 6 (corpus blockers cont.)
+  ["o.{a: 1}", "s-extend"],
+  ["o!f", "s-get-bang"],
+  ["t.{0}", "s-tuple-get"],
+  ["rec x = 1", "s-rec"],
+  ["method(self): self end", "s-method"],
+  ["letrec x = 1: x end", "s-letrec"],
+  ["~1/2", "s-rfrac"],
+  ["5 is%(within(2)) 6", "s-check-test"], // is%(pred) refinement clause
 ];
 
 test("surface-parse: rebuilds the right ast.arr ctor for each core form", async () => {
