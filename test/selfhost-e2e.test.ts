@@ -416,3 +416,18 @@ test("self-hosted: variant field access via a-dot (a(5).x)", async () => {
     "data D: | a(x) end\nif a(5).x == 5: 0 else: 1 / 0 end");
   expect(result.error).toBeUndefined();
 });
+
+// Regression: `a-app` type-application annotations (List<Number>, Option<a>) — pervasive
+// in real modules — used to null-ref during compilation (the dummy-loc `.visit()` shim
+// trapped on them). surface-parse now returns the parser AST directly (name-key uses
+// A.Name.key(), loc-independent) and the driver blanks bind/return annotations, so they
+// compile + run. (This was the dominant "module-init null-ref ×35" self-compile blocker.)
+test("self-hosted: a-app annotations (List<Number>) compile and run", async () => {
+  const { result } = await selfHostRun("fun f(x :: List<Number>): x end\nif f(5) == 5: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: annotated let + annotated variant member compile", async () => {
+  const { result } = await selfHostRun(
+    "data D: | a(n :: Number) end\nx :: Option<Number> = a(7)\nif x.n == 7: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});

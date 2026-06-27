@@ -20,7 +20,7 @@ import { run } from "../src/runtime/run.ts";
 
 const CLI = resolve(import.meta.dir, "../src/cli.ts");
 const LIT = resolve(import.meta.dir, "fixtures/cli-selfhost-lit.arr");          // "5"
-const FALLBACK = resolve(import.meta.dir, "fixtures/cli-selfhost-fallback.arr"); // "print([list: 5])"
+const FALLBACK = resolve(import.meta.dir, "fixtures/cli-selfhost-fallback.arr"); // "ask: ... print(5) ... end" (s-if-pipe not self-hosted yet; seed runs it)
 
 test("self-hosted compiler compiles + runs a program in its subset (a literal)", async () => {
   const wasm = await buildSelfHosted("5");
