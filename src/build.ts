@@ -29,7 +29,7 @@ const PYRET_SRC_ARR = resolve(import.meta.dir, "../pyret/lang/src/arr");
 // `self-compiler/{compiler,trove}/` (our modifiable copies) or `pyret/lang/src/arr/`
 // (the originals). Redirect a `.../src/arr/<rest>` file import that doesn't exist to the
 // self-compiler copy, else the original — so multi-file compiler tests resolve.
-function redirectFileImport(absPath: string): string {
+export function redirectFileImport(absPath: string): string {
   if (existsSync(absPath)) return absPath;
   const m = absPath.match(/[\\/]src[\\/]arr[\\/](.+\.arr)$/);
   if (m) {
@@ -37,14 +37,14 @@ function redirectFileImport(absPath: string): string {
     const inSelf = resolve(SELF_COMPILER, rest);
     if (existsSync(inSelf)) return inSelf;
     const inOrig = resolve(PYRET_SRC_ARR, rest);
-    if (existsSync(inOrig)) return inOrig;
+    if (existsSync(inOrig)) { if (process.env?.PYRET_DEBUG_RESOLVE) console.error(`[resolve-fallback] ${rest} -> pyret/lang`); return inOrig; }
   }
   // A self-compiler source importing a sibling we don't keep a copy of (e.g.
   // `locators/*`) — fall back to the original tree so the closure resolves.
   const s = absPath.match(/[\\/]self-compiler[\\/](.+\.arr)$/);
   if (s) {
     const inOrig = resolve(PYRET_SRC_ARR, s[1]!);
-    if (existsSync(inOrig)) return inOrig;
+    if (existsSync(inOrig)) { if (process.env?.PYRET_DEBUG_RESOLVE) console.error(`[resolve-fallback] ${s[1]} -> pyret/lang`); return inOrig; }
   }
   return absPath; // unchanged → surfaces the real ENOENT if it's a genuine miss
 }
