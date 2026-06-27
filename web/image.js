@@ -188,11 +188,13 @@
     var urls = new Set(); collectUrls(node, urls);
     urls.forEach(function (u) {
       if (!imgCache[u]) {
-        // No crossOrigin: hosts without CORS headers (e.g. cse.ucsd.edu) would
-        // otherwise fail to load. We only DISPLAY the image (drawImage works on a
-        // tainted canvas; naturalWidth/Height are still readable), never read pixels.
+        // Load through the same-origin CORS proxy (/proxy?url=...) WITH
+        // crossOrigin="anonymous" so the canvas is NOT tainted (pixel ops work),
+        // even for hosts that don't send CORS headers (e.g. cse.ucsd.edu).
         var im = new Image(); imgCache[u] = im;
-        im.onload = render; im.onerror = render; im.src = u;
+        im.crossOrigin = "anonymous";
+        im.onload = render; im.onerror = render;
+        im.src = "/proxy?url=" + encodeURIComponent(u);
       } else if (!imgCache[u].complete) {
         imgCache[u].addEventListener("load", render);
       }

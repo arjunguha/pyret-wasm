@@ -63,6 +63,20 @@ try {
   }, { timeout: 20000 });
   console.log("✓ overlay composites to canvas (100×80)");
 
+  // Cross-origin image-url via the CORS proxy must NOT taint the canvas (toDataURL ok).
+  await page.evaluate(() => (window).cm.setValue('image-url("https://cse.ucsd.edu/sites/default/files/faculty/politz17-115x150.jpg")'));
+  await page.click("#run");
+  try {
+    await page.waitForFunction(() => {
+      const c = document.querySelector("#interactions canvas") as any;
+      if (!(c && c.width === 115 && c.height === 150)) return false;
+      try { c.toDataURL(); return true; } catch (_e) { return false; } // untainted?
+    }, { timeout: 30000 });
+    console.log("✓ cross-origin image-url via proxy renders untainted (toDataURL ok, 115×150)");
+  } catch (_e) {
+    console.log("✗ cross-origin image-url tainted or failed to load (network?)"); failed = true;
+  }
+
   // Stop test: infinite loop
   await page.evaluate(() => (window).cm.setValue("fun loop(n): loop(n + 1) end\nloop(0)"));
   await page.click("#run");
