@@ -20,13 +20,31 @@
 
 import { test, expect } from "bun:test";
 import { buildSourceFile } from "../src/build.ts";
-import { run } from "../src/runtime/run.ts";
+import { run, newHostState, buildHostImports, PyretError } from "../src/runtime/run.ts";
 import { resolve } from "path";
 
 const PROBE = resolve(import.meta.dir, "../self-host/pyret-parser-probe.arr");
 const PROBE2 = resolve(import.meta.dir, "../self-host/pyret-parser-probe2.arr");
 const PROBE3 = resolve(import.meta.dir, "../self-host/pyret-parser-probe3.arr");
 const PROBE4 = resolve(import.meta.dir, "../self-host/pyret-parser-probe4.arr");
+// Reads a REAL source file via `read-source()` and parses it with the pure-Pyret
+// parser, printing `ok stmts=N` / `first=<label>` (asserted below).
+const REALFILE_PROBE = resolve(import.meta.dir, "../self-host/pyret-parser-realfile-probe.arr");
+
+// Compile the realfile probe once, then run it against several real source files by
+// feeding each file's bytes as `state.sourceBytes` (what `read-source()` returns).
+async function parseRealFile(probeWasm: Uint8Array, srcPath: string): Promise<string> {
+  const src = await Bun.file(srcPath).text();
+  const state = newHostState();
+  state.sourceBytes = new TextEncoder().encode(src);
+  const { instance } = await WebAssembly.instantiate(probeWasm as BufferSource, buildHostImports(state));
+  state.instance = instance;
+  state.memory = instance.exports.memory as WebAssembly.Memory;
+  try { state.memory.grow(400); } catch { /* already large enough */ }
+  try { (instance.exports.main as () => void)(); }
+  catch (e) { if (!(e instanceof PyretError)) throw e; state.stdout((e as Error).message + "\n"); }
+  return state.captured;
+}
 
 test("pure-Pyret parser compiles clean under the seed (-> valid wasm)", async () => {
   const wasm = await buildSourceFile(PROBE);
@@ -84,4 +102,30 @@ test("pure-Pyret parser: let/letrec/type-let, check-ops, spy, decimals", async (
   expect(o).toContain("postfix-none: true");          // does-not-raise has no RHS
   expect(o).toContain("refine-some: true");           // is%(within(1)) carries a refinement
   expect(o).toContain("spy: s-spy-block msg=true implicit=true");
+});
+
+// REAL compiler/library source files parse end-to-end into the real ast.arr AST,
+// no JS — exercising for-loops (multi-bind), triple-backtick doc strings, unary
+// minus, contract statements (ty-params + no-paren arrow anns), curly-brace
+// lambdas, and `include from M: ... end`.  These are actual files from the
+// self-hosted compiler / its trove, fed via `read-source()`.
+test("pure-Pyret parser: parses real compiler source files", async () => {
+  const wasm = await buildSourceFile(REALFILE_PROBE);
+  // encoder.arr: the in-Pyret WASM binary encoder (uses triple-backtick docs,
+  // many top-level fun defs).  138 statements.
+  const enc = await parseRealFile(wasm, resolve(import.meta.dir, "../self-host/encoder.arr"));
+  expect(enc).toContain("ok stmts=138");
+
+  // arrays.arr: provide-block, newtype, generics on fun/method, contract
+  // statements (`name :: <A> ... -> ...`), and curly-brace lambdas.
+  const arr = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/trove/arrays.arr"));
+  expect(arr).toContain("ok stmts=30");
+
+  // concat-lists.arr: multi-binding `for` loops + data with sharing methods.
+  const cl = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/compiler/concat-lists.arr"));
+  expect(cl).toContain("ok stmts=14");
+
+  // matrix-util.arr: `include from G: ... end` (incl. `type *`), unary minus.
+  const mu = await parseRealFile(wasm, resolve(import.meta.dir, "../self-compiler/trove/matrix-util.arr"));
+  expect(mu).toContain("ok stmts=34");
 });

@@ -268,6 +268,22 @@ fun scan-string(cps :: List<Number>, q :: Number) -> Span:
   end
 end
 
+### scan a triple-backtick string `` ```...``` ``: raw content up to the closing
+### three backticks (no escape processing — matches Pyret's multi-line strings,
+### used pervasively as `doc:` strings).  `cps` starts just after the opening ```.
+fun scan-tquote(cps :: List<Number>) -> Span:
+  cases(List) cps:
+    | empty => span("", empty, empty)  # TODO(grammar): unterminated triple-string
+    | link(c, r) =>
+      if (c == c-bquote) and (cp-nth(r, 0) == c-bquote) and (cp-nth(r, 1) == c-bquote):
+        span("", link(c-bquote, link(c-bquote, link(c-bquote, empty))), r.rest.rest)
+      else:
+        s = scan-tquote(r)
+        span(cp-str(c) + s.text, link(c, s.consumed), s.rest)
+      end
+  end
+end
+
 fun unescape(e :: Number) -> String:
   if e == cc("n"): "\n"
   else if e == cc("t"): "\t"
@@ -342,6 +358,11 @@ fun lex(cps :: List<Number>, ws :: Boolean, p :: Pos) -> List<Token>:
         s = scan-ident-rest(r)
         e = adv(adv1(p, c), s.consumed)
         link(mk(p, e, "NAME", cp-str(c) + s.text, ws), lex(s.rest, false, e))
+      else if (c == c-bquote) and (cp-nth(r, 0) == c-bquote) and (cp-nth(r, 1) == c-bquote):
+        s = scan-tquote(r.rest.rest)
+        # consumed: opening ``` then s.consumed (which includes the closing ```)
+        e = adv(adv1(adv1(adv1(p, c-bquote), c-bquote), c-bquote), s.consumed)
+        link(mk(p, e, "STRING", s.text, ws), lex(s.rest, false, e))
       else if (c == c-dquote) or (c == c-squote):
         s = scan-string(r, c)
         # consumed: opening quote (c) then s.consumed (which includes the close)
@@ -627,6 +648,32 @@ fun parse-arrow-arg-anns(st :: PState) -> List<A.Ann>:
   end
 end
 
+### contract-stmt annotation:  `ann | noparen-arrow-ann`  where
+### noparen-arrow-ann = comma-ann-args THINARROW ann  (no surrounding parens).
+### Used after `NAME :: [ty-params]` in a contract / typed-let.
+fun parse-noparen-arrow-or-ann(st :: PState) -> A.Ann:
+  first = parse-ann(st)
+  if at-kind(st, "COMMA"):
+    args = link(first, parse-noparen-arg-rest(st))
+    expect(st, "THINARROW")
+    ret = parse-ann(st)
+    A.a-arrow(dl, args, ret, false)
+  else if at-kind(st, "THINARROW"):
+    p-advance(st)
+    ret = parse-ann(st)
+    A.a-arrow(dl, link(first, empty), ret, false)
+  else:
+    first
+  end
+end
+fun parse-noparen-arg-rest(st :: PState) -> List<A.Ann>:
+  p-advance(st)  # consume the COMMA
+  a = parse-ann(st)
+  if at-kind(st, "COMMA"): link(a, parse-noparen-arg-rest(st))
+  else: link(a, empty)
+  end
+end
+
 ### already consumed `{`.
 fun parse-brace-ann(st :: PState) -> A.Ann:
   if at-kind(st, "RBRACE"):
@@ -880,6 +927,28 @@ fun parse-postfix-rest(st :: PState, start :: Token, e :: A.Expr) -> A.Expr:
   end
 end
 
+### like parse-postfix but does NOT consume a trailing application `(...)`.
+### Used for the `for` iterator, where `name(bind from coll, ...)` — the `(` opens
+### the for-binds, not an application.  Dot / bang field chains are still allowed
+### (e.g. `for L.foldr(...)`).
+fun parse-postfix-noapp(st :: PState) -> A.Expr:
+  start = p-peek(st)
+  parse-postfix-noapp-rest(st, start, parse-atom(st))
+end
+fun parse-postfix-noapp-rest(st :: PState, start :: Token, e :: A.Expr) -> A.Expr:
+  if at-kind(st, "DOT"):
+    p-advance(st)
+    fld = expect(st, "NAME").value
+    parse-postfix-noapp-rest(st, start, A.s-dot(node-loc(start), e, fld))
+  else if at-kind(st, "BANG"):
+    p-advance(st)
+    fld = expect(st, "NAME").value
+    parse-postfix-noapp-rest(st, start, A.s-get-bang(node-loc(start), e, fld))
+  else:
+    e
+  end
+end
+
 ### app-args: ( [binop (, binop)*] )   -- the `(` is adjacent (no ws before)
 fun parse-app-args(st :: PState) -> List<A.Expr>:
   expect(st, "LPAREN")
@@ -908,7 +977,22 @@ end
 ### atoms / primary expressions
 fun parse-atom(st :: PState) -> A.Expr:
   t = p-peek(st)
-  if t.kind == "NUMBER":
+  if (t.kind == "OP") and ((t.value == "-") or (t.value == "+")):
+    # unary sign on a numeric literal: Pyret's `num-expr` carries the sign
+    # (there is no general unary minus — `-x` on a non-literal isn't valid Pyret).
+    p-advance(st)
+    nt = p-peek(st)
+    pfx = if t.value == "-": "-" else: "" end
+    if nt.kind == "NUMBER":
+      p-advance(st)
+      make-number(node-loc(t), pfx + nt.value, false)
+    else if nt.kind == "ROUGHNUMBER":
+      p-advance(st)
+      make-number(node-loc(t), pfx + nt.value, true)
+    else:
+      raise("parse error: unary '" + t.value + "' must precede a number literal, got " + nt.kind)
+    end
+  else if t.kind == "NUMBER":
     p-advance(st)
     make-number(tok-loc(t), t.value, false)
   else if t.kind == "ROUGHNUMBER":
@@ -1030,6 +1114,17 @@ fun parse-brace(st :: PState) -> A.Expr:
     fields = parse-fields(st)
     expect(st, "RBRACE")
     A.s-obj(node-loc(start), fields)
+  else if at-kind(st, "LPAREN") or at-op(st, "<"):
+    # curly-brace lambda:  { [ty-params] args [-> ann] : block }
+    params = parse-ty-params(st)
+    args = parse-args(st)
+    ret = parse-return-ann(st)
+    blocky = parse-block-or-colon(st)
+    doc = parse-doc(st)
+    body = parse-block(st)
+    wc = parse-where(st)
+    expect(st, "RBRACE")
+    A.s-lam(node-loc(start), "", params, args, ret, doc, body, where-loc(wc), wc, blocky)
   else:
     # tuple
     items = parse-tuple-items(st)
@@ -1252,7 +1347,7 @@ end
 fun parse-for(st :: PState) -> A.Expr:
   start = p-peek(st)
   expect-name(st, "for")
-  iter = parse-postfix(st)  # the iterator function expression (no app args yet)
+  iter = parse-postfix-noapp(st)  # iterator: name/dot chain; the `(` is the for-binds, NOT an app
   expect(st, "LPAREN")
   binds = if at-kind(st, "RPAREN"): empty else: parse-for-binds(st) end
   expect(st, "RPAREN")
@@ -1287,6 +1382,7 @@ end
 fun at-block-end(st :: PState) -> Boolean:
   at-eof(st) or at-name(st, "end") or at-name(st, "else")
     or at-name(st, "sharing") or at-name(st, "where") or at-kind(st, "BAR")
+    or at-kind(st, "RBRACE")  # closes a curly-brace lambda `{ args : block }`
 end
 
 fun parse-stmts(st :: PState) -> List<A.Expr>:
@@ -1366,14 +1462,33 @@ end
 
 fun parse-let(st :: PState) -> A.Expr:
   start = p-peek(st)
-  b = parse-binding(st)
-  if at-kind(st, "EQUALS"):
-    p-advance(st)
-    v = parse-binop(st)
-    A.s-let(node-loc(start), b, v, false)
+  # A plain `NAME ::` heads either a contract statement
+  # (`NAME :: [ty-params] (ann | noparen-arrow-ann)`) or a typed let
+  # (`NAME :: ann = value`).  Handle ty-params + noparen-arrow anns, which the
+  # general binding parser does not.
+  if at-kind(st, "NAME") and peek2-kind(st, "COLONCOLON"):
+    nm = expect(st, "NAME")
+    expect(st, "COLONCOLON")
+    params = parse-ty-params(st)
+    ann = parse-noparen-arrow-or-ann(st)
+    namev = A.s-name(tok-loc(nm), nm.value)
+    if at-kind(st, "EQUALS"):
+      p-advance(st)
+      v = parse-binop(st)
+      A.s-let(node-loc(start), A.s-bind(node-loc(start), false, namev, ann), v, false)
+    else:
+      A.s-contract(node-loc(start), namev, params, ann)
+    end
   else:
-    # `NAME :: Ann` with no `=`  ->  contract statement
-    A.s-contract(node-loc(start), b.id, empty, b.ann)
+    b = parse-binding(st)
+    if at-kind(st, "EQUALS"):
+      p-advance(st)
+      v = parse-binop(st)
+      A.s-let(node-loc(start), b, v, false)
+    else:
+      # `NAME :: Ann` with no `=`  ->  contract statement
+      A.s-contract(node-loc(start), b.id, empty, b.ann)
+    end
   end
 end
 
@@ -1783,8 +1898,18 @@ fun parse-prelude-loop(st :: PState, prov :: A.Provide, imps :: List<A.Import>):
     parse-prelude-loop(st, prov, imps + link(imp, empty))
   else if at-name(st, "include"):
     p-advance(st)
-    src = parse-import-source(st)
-    parse-prelude-loop(st, prov, imps + link(A.s-include(dl, src), empty))
+    if at-name(st, "from"):
+      # include from MOD-REF: spec, ... end
+      p-advance(st)
+      modpath = parse-dotted-names(st)
+      expect(st, "COLON")
+      specs = parse-include-specs(st)
+      expect-name(st, "end")
+      parse-prelude-loop(st, prov, imps + link(A.s-include-from(dl, modpath, specs), empty))
+    else:
+      src = parse-import-source(st)
+      parse-prelude-loop(st, prov, imps + link(A.s-include(dl, src), empty))
+    end
   else if at-name(st, "provide"):
     p-advance(st)
     new-prov = if at-op(st, "*") or at-op(st, "<>"):
@@ -1818,6 +1943,69 @@ fun parse-import(st :: PState) -> A.Import:
   expect-name(st, "as")
   nm = expect(st, "NAME").value
   A.s-import(dl, src, A.s-name(dl, nm))
+end
+
+### dotted module reference:  NAME (. NAME)*  ->  List<Name>
+fun parse-dotted-names(st :: PState) -> List<A.Name>:
+  nm = expect(st, "NAME").value
+  first = A.s-name(dl, nm)
+  if at-kind(st, "DOT"):
+    p-advance(st)
+    link(first, parse-dotted-names(st))
+  else:
+    link(first, empty)
+  end
+end
+
+### include-spec list:  spec (, spec)* [,]   up to `end`.
+fun parse-include-specs(st :: PState) -> List<A.IncludeSpec>:
+  if at-name(st, "end"): empty
+  else:
+    spec = parse-include-spec(st)
+    if at-kind(st, "COMMA"):
+      p-advance(st)
+      if at-name(st, "end"): link(spec, empty)  # trailing comma
+      else: link(spec, parse-include-specs(st))
+      end
+    else:
+      link(spec, empty)
+    end
+  end
+end
+
+### include-spec:  [type|data|module] NAME [as NAME]  |  *
+fun parse-include-spec(st :: PState) -> A.IncludeSpec:
+  if at-name(st, "type"):
+    p-advance(st)
+    if at-op(st, "*"):
+      p-advance(st)
+      A.s-include-type(dl, A.s-star(dl, empty))
+    else:
+      nm = expect(st, "NAME").value
+      A.s-include-type(dl, A.s-local-ref(dl, A.s-name(dl, nm), A.s-name(dl, nm)))
+    end
+  else if at-name(st, "data"):
+    p-advance(st)
+    if at-op(st, "*"):
+      p-advance(st)
+      A.s-include-data(dl, A.s-star(dl, empty), empty)
+    else:
+      nm = expect(st, "NAME").value
+      A.s-include-data(dl, A.s-local-ref(dl, A.s-name(dl, nm), A.s-name(dl, nm)), empty)
+    end
+  else if at-name(st, "module"):
+    p-advance(st)
+    nm = expect(st, "NAME").value
+    A.s-include-name(dl, A.s-module-ref(dl, link(A.s-name(dl, nm), empty), none))
+  else if at-op(st, "*"):
+    p-advance(st)
+    A.s-include-name(dl, A.s-star(dl, empty))
+  else:
+    nm = expect(st, "NAME").value
+    asn = if at-name(st, "as"): p-advance(st) A.s-name(dl, expect(st, "NAME").value)
+          else: A.s-name(dl, nm) end
+    A.s-include-name(dl, A.s-local-ref(dl, A.s-name(dl, nm), asn))
+  end
 end
 
 ### import-source: import-special (NAME ( STRING, ... )) | import-name (NAME)
