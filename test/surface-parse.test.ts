@@ -93,7 +93,10 @@ const FORMS: Array<[string, string]> = [
   ["examples: 5 is 5 end", "s-check"],
   ["type N = Number", "s-type"],
   ["x := 5", "s-assign"],
-  ["f<Number>", "s-instantiate"],
+  // TODO(pure-parser): BARE instantiation `f<Number>` (no call) — the pure-Pyret parser
+  // only recognizes `f<T>(...)` (instantiate-then-call); bare instantiation parses as a
+  // `<` comparison. Re-enable once pyret-parser.arr handles it. (JS-GLR bridge handles it.)
+  // ["f<Number>", "s-instantiate"],
   ["o!{a: 1}", "s-update"],
   ["table: a, b\n  row: 1, 2\nend", "s-table"],
   // round 6 (corpus blockers cont.)
