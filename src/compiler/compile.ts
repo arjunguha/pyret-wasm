@@ -696,7 +696,8 @@ class Compiler {
     // plain function rather than a `.make` object so the prelude stays CPS-safe — no
     // object literals/tuples, which the stoppable transform doesn't handle.)
     const dictSetFn =
-      (ctorName === "string-dict" || ctorName === "mutable-string-dict") ? "sd-from-raw" :
+      (ctorName === "string-dict") ? "sd-from-raw" :
+      (ctorName === "mutable-string-dict") ? "mut-sd-from-raw" :
       (ctorName === "set" || ctorName === "list-set" || ctorName === "tree-set") ? "set-from-raw" : null;
     if (dictSetFn) {
       const fn = this.resolveName(dictSetFn, ctx);

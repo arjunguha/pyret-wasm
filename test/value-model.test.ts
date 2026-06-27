@@ -68,3 +68,26 @@ test("raw-array builders: raw-array-of / from-list / map", async () => {
   expect(await result(`sum(raw-array-to-list(raw-array-from-list([list: 4, 5, 6])))`)).toBe("15");
   expect(await result(`sum(raw-array-to-list(raw-array-map(lam(x): x * x end, [raw-array: 2, 3, 4])))`)).toBe("29");
 });
+
+test("immutable string-dict: literal, get-value, fold-keys", async () => {
+  expect(await result(`[string-dict: "a", 1, "b", 2].get-value("b")`)).toBe("2");
+  expect(await result(`make-string-dict().has-key("x")`)).toBe("false");
+  expect(await result(`
+    d = [string-dict: "a", 10, "b", 20, "c", 30]
+    fold-keys(lam(acc, k): acc + d.get-value(k) end, 0, d)`)).toBe("60");
+});
+
+test("mutable string-dict: set-now mutates a shared cell; each-key-now", async () => {
+  expect(await result(`
+    d = make-mutable-string-dict()
+    d.set-now("x", 5)
+    d.set-now("y", 7)
+    d.set-now("x", 9)
+    d.get-value-now("x") + d.get-value-now("y")`)).toBe("16");
+  expect(await result(`
+    d = [mutable-string-dict: "a", 1, "b", 2]
+    var s = 0
+    d.each-key-now(lam(k): s := s + d.get-value-now(k) end)
+    s`)).toBe("3");
+  expect(await result(`[mutable-string-dict: "a", 1].has-key-now("a")`)).toBe("true");
+});

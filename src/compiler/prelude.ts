@@ -320,4 +320,55 @@ sharing:
   method union(self, other): foldl(lam(acc, e): acc.add(e) end, self, other.to-list()) end
 end
 fun set-from-raw(arr): foldl(lam(acc, e): acc.add(e) end, p-set(empty), raw-array-to-list(arr)) end
+
+fun make-string-dict(): s-str-dict(empty) end
+
+# ---- mutable string-dict: a shared 1-cell raw-array holding the entries list, so
+# set-now/remove-now mutations are visible through every reference. ----
+data MutDict:
+  | m-dict(cell)
+sharing:
+  method get-now(self, k): sd-get(raw-array-get(self.cell, 0), k) end,
+  method get-value-now(self, k):
+    cases(Option) sd-get(raw-array-get(self.cell, 0), k):
+      | some(v) => v | none => raise("Key not found: " + k) end end,
+  method set-now(self, k, v) block:
+    raw-array-set(self.cell, 0, link(kv(k, v), sd-del(raw-array-get(self.cell, 0), k)))
+    self end,
+  method has-key-now(self, k):
+    cases(Option) sd-get(raw-array-get(self.cell, 0), k): | some(v) => true | none => false end end,
+  method remove-now(self, k) block:
+    raw-array-set(self.cell, 0, sd-del(raw-array-get(self.cell, 0), k))
+    self end,
+  method keys-list-now(self): map(lam(p): cases(KV) p: | kv(pk, pv) => pk end end, raw-array-get(self.cell, 0)) end,
+  method keys-now(self): set-from-list(self.keys-list-now()) end,
+  method count-now(self): length(raw-array-get(self.cell, 0)) end,
+  method to-list-now(self): raw-array-get(self.cell, 0) end,
+  method each-key-now(self, f): each(f, self.keys-list-now()) end,
+  method map-keys-now(self, f): map(f, self.keys-list-now()) end,
+  method freeze(self): s-str-dict(raw-array-get(self.cell, 0)) end,
+  method merge-now(self, other) block:
+    each(lam(k): self.set-now(k, other.get-value-now(k)) end, other.keys-list-now())
+    self end
+end
+fun make-mutable-string-dict(): m-dict(raw-array-of(empty, 1)) end
+fun mut-sd-from-raw(arr):
+  d = make-mutable-string-dict()
+  fun loop(i, n):
+    if i >= n: d
+    else: block:
+      d.set-now(raw-array-get(arr, i), raw-array-get(arr, i + 1))
+      loop(i + 2, n)
+    end end
+  end
+  loop(0, raw-array-length(arr))
+end
+fun set-from-list(l): foldl(lam(acc, e): acc.add(e) end, p-set(empty), l) end
+
+# string-dict module functions usable on either dict kind; drive Pyret for-loops:
+#   for fold-keys(acc from base, k from d): ... end   /   for each-key-now(k from d): ... end
+fun dict-keys-list(d): if is-m-dict(d): d.keys-list-now() else: d.keys-list() end end
+fun fold-keys(f, init, d): foldl(f, init, dict-keys-list(d)) end
+fun each-key(f, d): each(f, dict-keys-list(d)) end
+fun each-key-now(f, d): each(f, dict-keys-list(d)) end
 `;
