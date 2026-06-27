@@ -11,33 +11,55 @@ has since moved to the **real** ambitious target: the seed compiles Pyret's actu
 (per user directive): (1) the TS **seed** (kept as bootstrap), (2) the **self-hosted**
 Pyret→WASM compiler (the deliverable), (3) a Pyret→Pyret **CPS** transform (stoppability).
 
-Done this push (suite: **219 tests, 0 fail**):
-- **Front-end:** the seed compiles Pyret's real passes (ast/well-formed/desugar/resolve-
-  scope/anf/...). `ast.arr` runs (constructs + `.tosource().pretty()`). `anf-program`
-  normalizes hand-built ASTs end-to-end.
+Done (suite: **~235 tests, 0 fail**):
+- **END-TO-END SELF-HOSTED COMPILE WORKS.** A real program flows through the entirely
+  Pyret-written compiler to a runnable WASM-GC module — `source → surface-parse →
+  anf-program → wasm-of-pyret → encoder/runtime → bytes` — with **NO JS codegen** (driver
+  `self-host/compile-driver.arr`; test `test/selfhost-e2e.test.ts`). Simple/anf-direct
+  programs work; the next rung is wiring desugar/resolve-scope (a minimal
+  `CompileEnvironment`) for operators/`if`/funcs/`check`.
+- **Front-end:** the seed compiles AND now LOADS Pyret's real passes
+  (ast/well-formed/desugar/resolve-scope/anf/compile-structs/…). `anf-program` normalizes
+  ASTs and round-trips through `.tosource().pretty()`.
 - **Parsers (two):** the temporary **JS-GLR `surface-parse`** path (`parse-bridge.ts` +
-  `self-host/parse-from-tree.arr`, ~38 forms) feeding the front-end now; AND the permanent
-  **pure-Pyret parser** (`self-host/pyret-parser.arr`, no JS) — full annotations/type/
-  newtype/check-ops/decimals + **real srclocs** — already turns real source into the real
-  `ast.arr` AST (`fun f(x): x + 1 end\nf(2)` → `s-fun s-app`). Seed keeps JS-GLR
+  `self-host/parse-from-tree.arr`, ~38 forms); AND the permanent **pure-Pyret parser**
+  (`self-host/pyret-parser.arr`, no JS) — full annotations/type/newtype/check-ops/decimals
+  + **real srclocs** — which parses real source into the real `ast.arr` AST and already
+  handles **~50 of 76** real compiler/library files (the largest overflow the WASM stack on
+  size-proportional recursion → next: make them tail-recursive). Seed keeps JS-GLR
   permanently; the self-hosted compiler must parse in pure Pyret (see parser-strategy memory).
 - **Backend (`self-host/wasm-of-pyret.arr` + `encoder.arr` + `runtime.arr`):** whole-module
   assembler (closures w/ free-var capture, variant ctors, `call_indirect`, linear memory,
   globals, **15 host imports w/ offset scheme** incl `$raise`); runtime kernels real
   (fixnum tower, strings, objects/variants, `$equal`, renderer `$render`/`$val_to_string`,
-  **check harness** `$check_is`/`$check_pred`, `$cons`/`$obj_extend`). `build-runtime()`
-  emits ~49 fns / ~3K bytes.
-- **CPS (`self-host/cps.arr`):** transforms fun/app/cases(+else)/if/ask/when/for/blocks into
-  yield-checked continuation-passing form; `is-prim` synced with the seed.
+  **check harness** `$check_is`/`$check_pred`, `$cons`/`$obj_extend`, `$str_to_codepoints`).
+- **CPS stoppability wired end-to-end (`self-host/cps.arr` → `src/build-stoppable.ts`):**
+  fun/app/cases(+else)/if/ask/when/for/blocks/tuples/objects → yield-checked CPS; prelude
+  is CPS'd alongside user code so built-in HOFs (`map`/`each`/`foldl`) are interruptible; an
+  infinite loop is stopped on one thread. `is-prim` synced with the seed.
 
-**THE singular remaining blocker → see `seed-module-system-blocker` memory.** The seed's
-whole-program *flattening* (`mergeMany` in `src/build.ts`) corrupts a global index when two
-large real modules are merged (minimal repro: `ast + encoder` → `Out of bounds array.get`;
-ruled out name-collision / func-scale / variant-scale). This blocks BOTH end-to-end backend
-verification AND assembling the full self-hosted compiler (which imports the whole front-end
-+ the whole backend). Next step: give the seed a real module system (per-module compilation /
-module-relative indices) instead of flattening. Everything else (CPS build-path integration,
-the fixpoint, the corpus run) is gated behind it.
+**The earlier "module-system blocker" is RESOLVED** (see `seed-module-system-blocker`
+memory): the desugar/well-formed load-hang + the `ast + encoder` OOB were a cross-module
+`shadow map` cycle, fixed by **program-order name resolution** (not index shifting), plus
+**module-aware `N.member`** so same-named bindings across modules disambiguate by alias.
+Whole front-end loads; `ast + encoder` co-import is clean. The full per-module-namespacing
+rewrite remains documented as future work (`self-host/NAMESPACE-NOTES.md`) but is not blocking.
+
+**Benchmarks (best of 3, this machine; `bun scripts/bench.ts`):**
+
+| program | direct seed→Wasm | stoppable Wasm | original Pyret (compute/total) |
+|---|---|---|---|
+| `adding-ones-2000` | 8.1 ms | 10.3 ms | ~5 ms / ~175 ms |
+| `recursion-triangle-20000` | stack overflow | 8.7 ms | ~12 ms / ~182 ms |
+| `tail-sum-1000000` | 122.7 ms | 142.6 ms | ~78 ms / ~248 ms |
+
+Stoppability costs ~1.1–1.3× (native tail calls ⇒ no trampoline); CPS also *enables* the
+deep non-tail recursion that overflows the direct path. See README for full methodology.
+
+**Remaining toward the fixpoint:** climb the self-hosted ladder (desugar/resolve →
+operators/`if`/funcs/`check` → full programs → corpus), make the pure-Pyret parser
+constant-stack so it reads the whole compiler, then `compiler.wasm` recompiling its own
+source byte-identically (`scripts/selfhost-fixpoint.ts` is the gate).
 
 ## Hard requirements (from the goal)
 

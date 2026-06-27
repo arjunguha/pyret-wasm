@@ -42,8 +42,43 @@ function append(text, cls) {
   interactions.scrollTop = interactions.scrollHeight;
 }
 
-// Render one output line: if it is a Pyret image value, draw it to a <canvas>;
-// otherwise append it as text. (Images render to text as `op(arg, ...)`.)
+// Errors get a bordered panel instead of a bare red line.
+function appendError(text) {
+  const box = document.createElement("div");
+  box.className = "error-box";
+  box.textContent = text.replace(/\n+$/, "");
+  interactions.appendChild(box);
+  interactions.scrollTop = interactions.scrollHeight;
+}
+
+const MAX_VALUE_LEN = 4000; // truncate pathologically long rendered values
+
+// Tokenize a printed Pyret value and wrap each token in a colored span, so lists
+// (`[list: 1, 2, 3]`), records (`{x: 1}`), tuples (`{1; 2}`), strings, numbers,
+// and booleans render richly. Plain prose passes through (only value-shaped
+// tokens are colored), matching CPO's value highlighting.
+const VALUE_RE = /("(?:[^"\\]|\\.)*")|(\btrue\b|\bfalse\b|\bnothing\b)|([A-Za-z_][\w-]*:)|(~?-?\d+\/\d+|~?-?\d+\.\d+|~?-?\d+)|([[\]{}();])/g;
+function appendValue(line) {
+  let text = line;
+  if (text.length > MAX_VALUE_LEN) text = text.slice(0, MAX_VALUE_LEN) + " …(truncated)";
+  const frag = document.createDocumentFragment();
+  let last = 0, m;
+  VALUE_RE.lastIndex = 0;
+  while ((m = VALUE_RE.exec(text))) {
+    if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const span = document.createElement("span");
+    span.className = m[1] ? "v-str" : m[2] ? "v-bool" : m[3] ? "v-kw" : m[4] ? "v-num" : "v-punct";
+    span.textContent = m[0];
+    frag.appendChild(span);
+    last = VALUE_RE.lastIndex;
+  }
+  frag.appendChild(document.createTextNode(text.slice(last) + "\n"));
+  interactions.appendChild(frag);
+  interactions.scrollTop = interactions.scrollHeight;
+}
+
+// Render one output line: image value → <canvas>; check-block result lines get
+// distinct styling; everything else is value-tokenized text.
 function appendLine(line) {
   if (window.PyretImage && window.PyretImage.isImageString(line)) {
     const canvas = window.PyretImage.renderToCanvas(line);
@@ -54,7 +89,13 @@ function appendLine(line) {
       return;
     }
   }
-  append(line + "\n");
+  if (/^\s*test failed:/.test(line)) { append(line + "\n", "check-fail"); return; }
+  if (/^Looks shipshape/.test(line)) { append(line + "\n", "check-pass"); return; }
+  if (/^Test results:/.test(line)) {
+    append(line + "\n", /\b0 failed/.test(line) ? "check-summary" : "check-summary warn");
+    return;
+  }
+  appendValue(line);
 }
 
 let outBuf = ""; // buffers streamed run output until newlines (for image detection)
@@ -105,6 +146,7 @@ function finish(result, t0) {
     statusEl.textContent = "stopped";
   } else if (result.error) {
     if (mode === "repl") flushReplValue();
+    appendError(result.error);
     statusEl.textContent = "error";
   } else {
     if (mode === "repl") flushReplValue();
@@ -129,7 +171,7 @@ async function execute(src, asRepl) {
     finish(result, t0);
   } catch (err) {
     if (mode === "repl") replBuf = "";
-    append(String((err && err.message) || err) + "\n", "out-err");
+    appendError(String((err && err.message) || err));
     handle = null;
     mode = "idle";
     setRunning(false);

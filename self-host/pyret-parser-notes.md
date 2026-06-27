@@ -169,3 +169,33 @@ for the pure-Pyret parser.
 - Cross-checking against the reference parser: the original Pyret in `../pyret`
   can parse the same sources (`pyret/lang`) so the produced AST shapes can be
   compared `tosource()`-to-`tosource()` as coverage grows.
+
+## Constant-stack tokenizer/parser (2026-06-27) — large files now parse
+
+The 25 largest real compiler files used to fail with **"Maximum call stack size
+exceeded"**: the tokenizer and the statement-list parser recursed proportionally to
+file length. Fixed by making the file-length-proportional recursions TAIL-RECURSIVE
+(accumulator + a local tail-recursive `rev`; the seed compiles native tail calls, so
+these now run in CONSTANT stack):
+
+- `lex` / `lex-punct` — thread a reverse `acc :: List<Token>`; every branch (skip,
+  comment, number, rough, name, string, triple-quote, punct, unknown) is now a tail
+  call. `tokenize` `rev`s the accumulator to forward order.
+- `parse-stmts` — `parse-stmts-acc(st, acc)` accumulates statements in reverse, then
+  `rev`s. (A program/block can hold hundreds of top-level statements.)
+- Added local `rev`/`rev-onto` because the prelude's `reverse` is itself non-tail AND
+  O(n^2) (append-based) — it would overflow / be quadratic on long token lists.
+
+RESULT: previously-overflowing files now parse, e.g. `anf.arr` (452 LOC),
+`desugar.arr` (1007), `well-formed.arr` (1410). Tested in
+`test/pyret-parser.test.ts` ("large compiler files parse").
+
+REMAINING BLOCKER (NOT stack, NOT grammar): the very largest files —
+`resolve-scope.arr` (1874 LOC), `type-check.arr` (2662), `ast.arr` (3739) — now fail
+with **"Length out of range of buffer"**, a HOST/MEMORY-sizing limit (linear memory /
+the `read-source` source buffer / `$str_to_codepoints`), surfaced in `src/runtime/run.ts`
++ the seed runtime — OUTSIDE pyret-parser.arr (not editable from this lane). Next
+follow-up: raise/auto-grow the linear-memory + source-buffer sizing (and/or stream
+`string-to-code-points`) so 100KB+ files fit. Until then, deeply NESTED expressions
+still recurse by nesting depth (bounded, fine) — only file-length recursion was the
+stack issue, and that is resolved.

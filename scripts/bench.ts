@@ -2,9 +2,10 @@
 // Benchmark the seed Pyret→Wasm pipeline on Pyret's own pitometer programs:
 // compile time + run time (best of N) per program.
 //
-// Other configs live elsewhere: original Pyret = scripts/bench-pyret-baseline.sh;
-// the stoppable (CPS) config will return once the Pyret→Pyret transform
-// (self-host/cps.arr) is wired in (stoppability is not part of the TS seed).
+// Other configs: original Pyret = scripts/bench-pyret-baseline.sh. The stoppable (CPS)
+// config is now wired (self-host/cps.arr via src/build-stoppable.ts) — to time it, build
+// with buildStoppableSourceFile() and run via runStoppable(wasm, { noYield: true }); see
+// the benchmark table in README.md / ROADMAP.md for representative numbers.
 //
 // usage: bun scripts/bench.ts [reps]
 

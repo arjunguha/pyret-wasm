@@ -42,6 +42,19 @@ import srcloc as S
 
 dl = A.dummy-loc
 
+### tail-recursive list reverse (constant stack via the seed's native tail calls).
+### The prelude's `reverse` is non-tail AND O(n^2) (append-based), so it overflows
+### / is quadratic on the long token + statement lists produced by large source
+### files.  We accumulate forward results in reverse, then `rev` them in one tail
+### loop — keeping the whole tokenize/parse pipeline constant-stack.
+fun rev-onto(l, acc):
+  cases(List) l:
+    | empty => acc
+    | link(f, r) => rev-onto(r, link(f, acc))
+  end
+end
+fun rev(l): rev-onto(l, empty) end
+
 ### ---- character codes ------------------------------------------------------
 fun cc(s :: String) -> Number:
   cases(List) string-to-code-points(s):
@@ -325,64 +338,68 @@ fun skip-block(cps :: List<Number>):
 end
 
 ### ---- the tokenizer --------------------------------------------------------
+### `lex`/`lex-punct` are TAIL-RECURSIVE with a reverse accumulator (`acc`): each
+### emitted token is consed onto `acc` and the loop tail-calls itself, so an entire
+### file tokenizes in CONSTANT stack (the seed compiles native tail calls).  The
+### accumulator holds tokens in reverse (EOF first); `tokenize` `rev`s to forward order.
 fun tokenize(src :: String) -> List<Token>:
-  lex(string-to-code-points(src), true, posn(1, 0, 0))
+  rev(lex(string-to-code-points(src), true, posn(1, 0, 0), empty))
 end
 
-fun lex(cps :: List<Number>, ws :: Boolean, p :: Pos) -> List<Token>:
+fun lex(cps :: List<Number>, ws :: Boolean, p :: Pos, acc :: List<Token>) -> List<Token>:
   cases(List) cps:
-    | empty => link(eof-at(p), empty)
+    | empty => link(eof-at(p), acc)
     | link(c, r) =>
       if is-ws(c):
-        lex(r, true, adv1(p, c))
+        lex(r, true, adv1(p, c), acc)
       else if c == c-hash:
         if cp-nth(r, 0) == c-bar:
           res = skip-block(r.rest)
           # consumed: leading `#|` then res.{1} (which includes the closing `|#`)
           p2 = adv(adv1(adv1(p, c-hash), c-bar), res.{1})
-          lex(res.{0}, true, p2)
+          lex(res.{0}, true, p2, acc)
         else:
           res = skip-line(r)
           p2 = adv(adv1(p, c-hash), res.{1})
-          lex(res.{0}, true, p2)
+          lex(res.{0}, true, p2, acc)
         end
       else if is-digit(c):
         s = scan-number(cps)
         e = adv(p, s.consumed)
-        link(mk(p, e, "NUMBER", s.text, ws), lex(s.rest, false, e))
+        lex(s.rest, false, e, link(mk(p, e, "NUMBER", s.text, ws), acc))
       else if (c == c-tilde) and is-digit(cp-nth(r, 0)):
         s = scan-number(r)
         e = adv(adv1(p, c-tilde), s.consumed)
-        link(mk(p, e, "ROUGHNUMBER", s.text, ws), lex(s.rest, false, e))
+        lex(s.rest, false, e, link(mk(p, e, "ROUGHNUMBER", s.text, ws), acc))
       else if is-ident-start(c):
         s = scan-ident-rest(r)
         e = adv(adv1(p, c), s.consumed)
-        link(mk(p, e, "NAME", cp-str(c) + s.text, ws), lex(s.rest, false, e))
+        lex(s.rest, false, e, link(mk(p, e, "NAME", cp-str(c) + s.text, ws), acc))
       else if (c == c-bquote) and (cp-nth(r, 0) == c-bquote) and (cp-nth(r, 1) == c-bquote):
         s = scan-tquote(r.rest.rest)
         # consumed: opening ``` then s.consumed (which includes the closing ```)
         e = adv(adv1(adv1(adv1(p, c-bquote), c-bquote), c-bquote), s.consumed)
-        link(mk(p, e, "STRING", s.text, ws), lex(s.rest, false, e))
+        lex(s.rest, false, e, link(mk(p, e, "STRING", s.text, ws), acc))
       else if (c == c-dquote) or (c == c-squote):
         s = scan-string(r, c)
         # consumed: opening quote (c) then s.consumed (which includes the close)
         e = adv(adv1(p, c), s.consumed)
-        link(mk(p, e, "STRING", s.text, ws), lex(s.rest, false, e))
+        lex(s.rest, false, e, link(mk(p, e, "STRING", s.text, ws), acc))
       else:
-        lex-punct(cps, ws, p)
+        lex-punct(cps, ws, p, acc)
       end
   end
 end
 
 ### operators and punctuation, longest-match first.
-fun lex-punct(cps :: List<Number>, ws :: Boolean, p :: Pos) -> List<Token>:
+fun lex-punct(cps :: List<Number>, ws :: Boolean, p :: Pos, acc :: List<Token>) -> List<Token>:
   c0 = cp-nth(cps, 0)
   c1 = cp-nth(cps, 1)
   c2 = cp-nth(cps, 2)
   # punctuation never spans a newline, so the end is n columns/chars along.
   fun emit(k :: String, v :: String, n :: Number):
     e = posn(p.line, p.col + n, p.char + n)
-    link(mk(p, e, k, v, ws), lex(drop-n(cps, n), false, e))
+    lex(drop-n(cps, n), false, e, link(mk(p, e, k, v, ws), acc))
   end
   # 3-char
   if (c0 == c-lt) and (c1 == c-eq) and (c2 == c-gt): emit("OP", "<=>", 3)
@@ -422,7 +439,7 @@ fun lex-punct(cps :: List<Number>, ws :: Boolean, p :: Pos) -> List<Token>:
   else if c0 == c-bar: emit("BAR", "|", 1)
   else:
     # TODO(grammar): BAD-OPER / UNKNOWN — for now, skip the offending char.
-    lex(drop-n(cps, 1), false, posn(p.line, p.col + 1, p.char + 1))
+    lex(drop-n(cps, 1), false, posn(p.line, p.col + 1, p.char + 1), acc)
   end
 end
 
@@ -1387,11 +1404,18 @@ fun at-block-end(st :: PState) -> Boolean:
     or at-kind(st, "RBRACE")  # closes a curly-brace lambda `{ args : block }`
 end
 
+### TAIL-RECURSIVE over the statement list (a block/program can have hundreds of
+### top-level statements; a non-tail `link(s, parse-stmts(...))` grows the stack per
+### statement and overflows on large files).  Accumulate in reverse, then `rev`.
 fun parse-stmts(st :: PState) -> List<A.Expr>:
-  if at-block-end(st): empty
+  parse-stmts-acc(st, empty)
+end
+
+fun parse-stmts-acc(st :: PState, acc :: List<A.Expr>) -> List<A.Expr>:
+  if at-block-end(st): rev(acc)
   else:
     s = parse-stmt(st)
-    link(s, parse-stmts(st))
+    parse-stmts-acc(st, link(s, acc))
   end
 end
 

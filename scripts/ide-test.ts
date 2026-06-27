@@ -30,6 +30,11 @@ try {
   else console.log("✓ Run works (fact(20) = 2432902008176640000)");
   if (!out1.includes("passed")) { console.log("✗ check summary missing"); failed = true; }
   else console.log("✓ check block ran");
+  // the passing summary line is styled distinctly (CPO-style)
+  const styledSummary = await page.evaluate(() =>
+    !!document.querySelector("#interactions .check-pass, #interactions .check-summary"));
+  if (styledSummary) console.log("✓ check summary styled (.check-pass)");
+  else { console.log("✗ check summary not styled"); failed = true; }
 
   // CodeMirror editor present
   const hasCM = await page.evaluate(() => !!document.querySelector(".CodeMirror"));
@@ -44,6 +49,26 @@ try {
   const replOut = await page.$eval("#interactions", (e) => e.textContent ?? "");
   if (replOut.includes("› x * 2") && replOut.includes("42")) console.log("✓ REPL evaluates expressions in context (x*2 = 42)");
   else { console.log("✗ REPL failed:", JSON.stringify(replOut.slice(-80))); failed = true; }
+
+  // Rich value rendering: a list renders with colored value tokens (numbers + brackets).
+  await page.evaluate(() => (window).cm.setValue("[list: 1, 2, 3]"));
+  await page.click("#run");
+  await page.waitForFunction(() => (document.getElementById("interactions")?.textContent ?? "").includes("[list: 1, 2, 3]"), { timeout: 20000 });
+  const vtok = await page.evaluate(() => ({
+    nums: document.querySelectorAll("#interactions .v-num").length,
+    punct: document.querySelectorAll("#interactions .v-punct").length,
+  }));
+  if (vtok.nums >= 3 && vtok.punct >= 2) console.log("✓ rich value rendering (list tokens colored)");
+  else { console.log("✗ value tokens not colored:", JSON.stringify(vtok)); failed = true; }
+
+  // Errors render in a bordered panel, not a bare line.
+  await page.evaluate(() => (window).cm.setValue("no-such-variable-zzz"));
+  await page.click("#run");
+  await page.waitForFunction(() => !!document.querySelector("#interactions .error-box")
+    || document.getElementById("status")?.textContent === "error", { timeout: 20000 });
+  const hasErrBox = await page.evaluate(() => !!document.querySelector("#interactions .error-box"));
+  if (hasErrBox) console.log("✓ errors render in a panel (.error-box)");
+  else { console.log("✗ error panel missing"); failed = true; }
 
   // Image test: a circle result renders to a <canvas> (image data lives in WASM,
   // the canvas drawing is minimal JS glue).

@@ -45,6 +45,21 @@
   canvas.pyret-image { display:inline-block; vertical-align:top; margin:4px 0; background:#fff; }
   .out-ok { color:var(--ok); }
   .repl-echo { color:var(--prompt); font-weight:600; }
+  /* Rich value rendering: color the tokens of a printed Pyret value (CPO-style). */
+  .v-str  { color:#b9543a; }            /* "strings" */
+  .v-num  { color:#2e7fd0; }            /* numbers / fractions / roughnums */
+  .v-bool { color:#8e44ad; font-weight:600; }  /* true / false / nothing */
+  .v-kw   { color:#7a8a99; }            /* list: / set: constructor labels */
+  .v-punct{ color:#9aa7b3; }            /* [ ] { } ( ) ; */
+  /* Check-block result lines, distinctly styled. */
+  .check-pass    { color:var(--ok); font-weight:600; }
+  .check-fail    { color:var(--err); }
+  .check-summary { font-weight:600; color:var(--ok); }
+  .check-summary.warn { color:#b9770e; }
+  /* Errors as a bordered panel rather than a bare red line. */
+  .error-box { display:block; margin:6px 0; padding:8px 10px; border:1px solid #e6a99f;
+    border-left:4px solid var(--err); border-radius:4px; background:#fdecea;
+    color:#922b21; white-space:pre-wrap; }
   .promptbar { display:flex; align-items:center; border-top:1px solid var(--border); background:var(--panel); padding:0 8px; }
   .promptbar .caret { color:var(--prompt); font-weight:700; padding:0 6px; }
   #repl { flex:1; border:0; outline:none; padding:8px 4px; font-family:"SF Mono", Menlo, Consolas, monospace; font-size:14px; background:transparent; }

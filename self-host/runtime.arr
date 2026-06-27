@@ -205,6 +205,55 @@ fun emit-plus() -> RtFun:
     .append(E.end-instr)
   rt-fun("$plus", [list: anyref, anyref], [list: anyref], empty, body)
 end
+# $minus(a, b) -> anyref : fixnum subtraction. TODO(port): num-tower contagion.
+fun emit-minus() -> RtFun:
+  body = fix-i64(0).append(fix-i64(1)).append(E.i64-sub).append(rt-call("$make_fix"))
+    .append(E.end-instr)
+  rt-fun("$minus", [list: anyref, anyref], [list: anyref], empty, body)
+end
+# $times(a, b) -> anyref : fixnum multiplication. TODO(port): num-tower contagion.
+fun emit-times() -> RtFun:
+  body = fix-i64(0).append(fix-i64(1)).append(E.i64-mul).append(rt-call("$make_fix"))
+    .append(E.end-instr)
+  rt-fun("$times", [list: anyref, anyref], [list: anyref], empty, body)
+end
+# $divide(a, b) -> anyref : fixnum division. TODO(port): rationals, zero check.
+fun emit-divide() -> RtFun:
+  body = fix-i64(0).append(fix-i64(1)).append(E.i64-div-s).append(rt-call("$make_fix"))
+    .append(E.end-instr)
+  rt-fun("$divide", [list: anyref, anyref], [list: anyref], empty, body)
+end
+# $lessthan(a, b) -> anyref (Pyret bool i31): fixnum <. TODO(port): num-tower.
+fun emit-lessthan() -> RtFun:
+  body = fix-i64(0).append(fix-i64(1)).append(E.i64-lt-s).append(E.ref-i31)
+    .append(E.end-instr)
+  rt-fun("$lessthan", [list: anyref, anyref], [list: anyref], empty, body)
+end
+# $greaterthan(a, b) -> anyref (Pyret bool i31): fixnum >. TODO(port): num-tower.
+fun emit-greaterthan() -> RtFun:
+  body = fix-i64(0).append(fix-i64(1)).append(E.i64-gt-s).append(E.ref-i31)
+    .append(E.end-instr)
+  rt-fun("$greaterthan", [list: anyref, anyref], [list: anyref], empty, body)
+end
+# $lessequal(a, b) -> anyref (Pyret bool i31): fixnum <=. TODO(port): num-tower.
+fun emit-lessequal() -> RtFun:
+  body = fix-i64(0).append(fix-i64(1)).append(E.i64-le-s).append(E.ref-i31)
+    .append(E.end-instr)
+  rt-fun("$lessequal", [list: anyref, anyref], [list: anyref], empty, body)
+end
+# $greaterequal(a, b) -> anyref (Pyret bool i31): fixnum >=. TODO(port): num-tower.
+fun emit-greaterequal() -> RtFun:
+  body = fix-i64(0).append(fix-i64(1)).append(E.i64-ge-s).append(E.ref-i31)
+    .append(E.end-instr)
+  rt-fun("$greaterequal", [list: anyref, anyref], [list: anyref], empty, body)
+end
+# $equal_wrap(a, b) -> anyref (Pyret bool i31): structural equality, wrapped as bool.
+# (equals-always and equal-now both dispatch here; same structural comparison.)
+fun emit-equal-wrap() -> RtFun:
+  body = E.local-get(0).append(E.local-get(1)).append(rt-call("$equal")).append(E.ref-i31)
+    .append(E.end-instr)
+  rt-fun("$equal_wrap", [list: anyref, anyref], [list: anyref], empty, body)
+end
 # $num_equal(a, b) -> i32 : fixnum i64 equality. TODO(port): rationals/rough/bignum.
 fun emit-num-equal() -> RtFun:
   body = fix-i64(0).append(fix-i64(1)).append(E.i64-eq).append(E.end-instr)
@@ -524,9 +573,12 @@ fun emit-make-object() -> RtFun:
   rt-fun("$make_object", [list: E.reft(T-NAMES), E.reft(T-FIELDS)], [list: E.reft(T-OBJECT)], empty, body)
 end
 # $obj_get(obj :: anyref, name :: $Str) -> anyref : first-match name scan -> value.
+# Returns null if obj is not a proper $Object — needed so checker bootstrap expression
+# (builtins.current-checker.results()) doesn't trap when builtins is not yet wired.
 # locals: i=3, n=4 (i32); names=2 (ref $Names).
 fun emit-obj-get() -> RtFun:
-  body = blk(anyref, [list:
+  # Inner scan body: assumes obj is a non-null $Object. Returns field or raises.
+  inner = blk(anyref, [list:
       E.local-get(0), E.ref-cast(T-OBJECT), E.struct-get(T-OBJECT, 0), E.local-set(2),
       E.local-get(2), E.array-len, E.local-set(4),
       E.i32-const(0), E.local-set(3),
@@ -539,10 +591,19 @@ fun emit-obj-get() -> RtFun:
             E.local-get(3), E.array-get(T-FIELDS), E.i-br(3) ]),
           E.local-get(3), E.i32-const(1), E.i32-add, E.local-set(3),
           E.i-br(0) ]) ]),
-      raise-host() ]).append(E.end-instr)
+      raise-host() ])
+  # Null-safe outer: if obj is not a non-null $Object, skip to null return.
+  # Note: ifel-bt expects tparts/eparts as List<List<Number>> (each element is a byte
+  # sequence); wrap `inner` (a flat List<Number>) in [list: inner].
+  body = ifel-bt(anyref,
+    [list: inner],
+    [list: E.i-ref-null(110)])
+  .append(E.end-instr)
+  # The test: ref.test (non-null $Object) returns 1 if non-null $Object.
+  full-body = E.local-get(0).append(E.ref-test(T-OBJECT)).append(body)
   rt-fun("$obj_get", [list: anyref, E.reft(T-STR)], [list: anyref],
          # locals: 2=names(ref $Names), 3=i, 4=n (i32)
-         [list: E.local-decl(1, E.reft(T-NAMES)), E.local-decl(2, i32t)], body)
+         [list: E.local-decl(1, E.reft(T-NAMES)), E.local-decl(2, i32t)], full-body)
 end
 # $obj_equal(a, b) -> i32 : same names in order, values $equal. locals: i=4, n=5 (i32);
 # na=2, nb=3 (ref $Names).
@@ -821,7 +882,11 @@ fun emit-yield() -> RtFun: todo("$yield", "decrement $gas; if>0 tail-call thunk 
 
 # The full ordered list (indices must match compile.arr's references).
 all-runtime-funs :: List<String> = [list:
-  "$make_fix","$make_rat","$make_rough","$plus","$num_equal","$num_compare",
+  "$make_fix","$make_rat","$make_rough","$plus",
+  "$minus","$times","$divide",
+  "$lessthan","$greaterthan","$lessequal","$greaterequal",
+  "$equal_wrap",
+  "$num_equal","$num_compare",
   "$num_modulo","$num_quotient","$num_expt","$num_to_i32","$num_to_string","$to_f64",
   "$mag_add","$mag_sub","$mag_mul","$mag_cmp","$mag_divmod","$mag_gcd",
   "$string_length","$str_concat","$str_equal","$str_from_mem","$str_to_codepoints",
@@ -835,7 +900,11 @@ all-runtime-funs :: List<String> = [list:
 # Assemble all runtime functions in order. TODO bodies trap; fleshed ones are real.
 fun build-runtime() -> List<RtFun>:
   [list:
-    emit-make-fix(), emit-make-rat(), emit-make-rough(), emit-plus(), emit-num-equal(),
+    emit-make-fix(), emit-make-rat(), emit-make-rough(), emit-plus(),
+    emit-minus(), emit-times(), emit-divide(),
+    emit-lessthan(), emit-greaterthan(), emit-lessequal(), emit-greaterequal(),
+    emit-equal-wrap(),
+    emit-num-equal(),
     emit-num-compare(), emit-num-modulo(), emit-num-quotient(), emit-num-expt(),
     emit-num-to-i32(), emit-num-to-string(), emit-to-f64(),
     emit-mag-add(), emit-mag-sub(), emit-mag-mul(), emit-mag-cmp(), emit-mag-divmod(), emit-mag-gcd(),
