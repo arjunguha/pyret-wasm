@@ -23,7 +23,7 @@ export class CompileError extends Error {
   }
 }
 
-interface VariantInfo { id: number; fields: string[]; methods?: { name: string; node: CstNode }[]; }
+interface VariantInfo { id: number; fields: string[]; refs?: boolean[]; methods?: { name: string; node: CstNode }[]; }
 
 const ARITH_FN: Record<string, string> = {
   PLUS: "$num_add", DASH: "$num_sub", TIMES: "$num_mul", SLASH: "$num_divide",
@@ -237,10 +237,11 @@ class Compiler {
       if (ctor) {
         const name = this.childNamed(ctor, "NAME")!.value!;
         const members = this.childNamed(ctor, "variant-members");
-        const fields = members
-          ? members.kids.filter((k) => k.name === "variant-member").map((vm) => this.bindingName(this.childNamed(vm, "binding")!))
-          : [];
-        this.variants.set(name, { id: this.nextVariantId++, fields, methods });
+        const memberNodes = members ? members.kids.filter((k) => k.name === "variant-member") : [];
+        const fields = memberNodes.map((vm) => this.bindingName(this.childNamed(vm, "binding")!));
+        // a `ref`-annotated member (`bx(ref v, w)`) becomes a MUTABLE field cell.
+        const refs = memberNodes.map((vm) => vm.kids.some((k) => k.name === "REF"));
+        this.variants.set(name, { id: this.nextVariantId++, fields, refs, methods });
       } else {
         const nm = this.childNamed(kid, "NAME");
         if (nm) this.variants.set(nm.value!, { id: this.nextVariantId++, fields: [], methods });
@@ -306,9 +307,12 @@ class Compiler {
 
   private makeVariant(name: string, info: VariantInfo, args: number[]): number {
     const m = this.m;
-    const fields = info.fields.length === 0
+    // ref-annotated fields are stored as mutable 1-cell boxes (so obj!f / obj!{f:v}
+    // can read/write them in place); non-ref fields store the value directly.
+    const stored = info.refs ? args.map((a, i) => (info.refs![i] ? this.makeBox(a) : a)) : args;
+    const fields = stored.length === 0
       ? m.ref.null(this.t.FieldsRefNull)
-      : m.array.new_fixed(this.t.Fields, args);
+      : m.array.new_fixed(this.t.Fields, stored);
     return m.call("$make_variant", [m.i32.const(info.id), this.strLiteralRaw(name), fields], this.t.VariantRef);
   }
 
@@ -565,6 +569,47 @@ class Compiler {
     return this.m.array.set(this.m.ref.cast(cell, this.t.FieldsRef), this.m.i32.const(0), value);
   }
 
+  // $variant_names entry (a Names array) for a variant value's runtime variant id.
+  private variantNamesOf(vget: number): number {
+    const m = this.m;
+    return m.ref.cast(
+      m.array.get(m.ref.cast(m.global.get("$variant_names", this.t.FieldsRefNull), this.t.FieldsRef),
+        m.call("$variant_id", [vget], binaryen.i32), binaryen.anyref, false),
+      this.t.NamesRef);
+  }
+
+  // `obj!field` (get-bang) — read a mutable `ref` field, stored as a 1-cell box, by name.
+  private compileGetBang(node: CstNode, ctx: Ctx): number {
+    const m = this.m;
+    const objExpr = node.kids[0]!;
+    const fieldName = node.kids[node.kids.length - 1]!.value!;
+    const tmp = ctx.addLocal(binaryen.anyref);
+    const vget = () => m.ref.cast(m.local.get(tmp, binaryen.anyref), this.t.VariantRef);
+    const cell = m.call("$variant_field_by_name",
+      [vget(), this.variantNamesOf(vget()), this.strLiteralRaw(fieldName)], binaryen.anyref);
+    return m.block(null, [m.local.set(tmp, this.compileExpr(objExpr, ctx, false)), this.unbox(cell)], binaryen.anyref);
+  }
+
+  // `obj!{f: v, ...}` (set-bang) — write mutable ref field cell(s) in place; returns the object.
+  private compileUpdate(node: CstNode, ctx: Ctx): number {
+    const m = this.m;
+    const objExpr = node.kids[0]!;
+    const fieldsNode = this.childNamed(node, "fields")!;
+    const entries = fieldsNode.kids.filter((k) => k.name === "field");
+    const tmp = ctx.addLocal(binaryen.anyref);
+    const vget = () => m.ref.cast(m.local.get(tmp, binaryen.anyref), this.t.VariantRef);
+    const parts: number[] = [m.local.set(tmp, this.compileExpr(objExpr, ctx, false))];
+    for (const f of entries) {
+      const key = this.childNamed(this.childNamed(f, "key")!, "NAME")!.value!;
+      const valNode = f.kids[f.kids.length - 1]!;
+      const cell = m.call("$variant_field_by_name",
+        [vget(), this.variantNamesOf(vget()), this.strLiteralRaw(key)], binaryen.anyref);
+      parts.push(this.setBox(cell, this.compileExpr(valNode, ctx, false)));
+    }
+    parts.push(m.local.get(tmp, binaryen.anyref));
+    return m.block(null, parts, binaryen.anyref);
+  }
+
   // ---- free variable analysis ----
   // A `method m(self, ...): ... end` field inside an obj-expr / extend-expr / data
   // with:/sharing: block. Its body is a closure (params incl. self are bound).
@@ -771,6 +816,10 @@ class Compiler {
         return this.compileObject(node, ctx);
       case "dot-expr":
         return this.compileDot(node, ctx);
+      case "get-bang-expr":
+        return this.compileGetBang(node, ctx);
+      case "update-expr":
+        return this.compileUpdate(node, ctx);
       case "extend-expr":
         return this.compileExtend(node, ctx);
       case "for-expr":
