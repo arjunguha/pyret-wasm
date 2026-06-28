@@ -63,6 +63,7 @@ fun rt-funcidx(name :: String) -> Number: NUM-IMPORTS + rt-index(name) end
 # funcidx of a host import (lives in the low import block; no offset).
 fun host-funcidx(name :: String) -> Number: R.host-import-index(name) end
 fun idx-make-fix(): rt-funcidx("$make_fix") end
+fun idx-make-rough(): rt-funcidx("$make_rough") end
 fun idx-make-object(): rt-funcidx("$make_object") end
 fun idx-obj-get(): rt-funcidx("$obj_get") end
 fun idx-obj-extend(): rt-funcidx("$obj_extend") end
@@ -269,8 +270,12 @@ end
 fun compile-aval(v, c :: Ctx) -> List<Number>:
   cases(N.AVal) v:
     | a-num(l, n) =>
-      # exact small ints -> $make_fix(i64). TODO(port): rationals/roughnums/bignum literals.
-      E.i64-const(n).append(E.i-call(idx-make-fix()))
+      # roughnum literal (~3.14) -> $make_rough(f64); exact integer -> $make_fix(i64).
+      # (Exact rational/bignum literals still TODO(port): need $make_rat / bignum limbs.)
+      if num-is-roughnum(n): E.f64-const(n).append(E.i-call(idx-make-rough()))
+      else if num-is-integer(n): E.i64-const(n).append(E.i-call(idx-make-fix()))
+      else: raise("a-num: exact rational/bignum literal not yet supported (need $make_rat): " + tostring(n))
+      end
     | a-str(l, s) => emit-str(s)
     | a-bool(l, b) => E.i32-const(if b: 1 else: 0 end).append(E.ref-i31)
     | a-id(l, id) =>
