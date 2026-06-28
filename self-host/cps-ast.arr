@@ -36,33 +36,33 @@ import ast as A
 import srcloc as S
 
 # ---- dummy-loc node builders (mirror compile-driver.arr) ----
-fun lml() -> A.Loc: S.builtin("cps-ast") end
-fun lnm(s :: String) -> A.Name: A.s-name(lml(), s) end
-fun lid(s :: String) -> A.Expr: A.s-id(lml(), lnm(s)) end
-fun lbind(s :: String) -> A.Bind: A.s-bind(lml(), false, lnm(s), A.a-blank) end
-fun lcall(name :: String, args :: List<A.Expr>) -> A.Expr: A.s-app(lml(), lid(name), args) end
+fun cps-lml() -> A.Loc: S.builtin("cps-ast") end
+fun cps-lnm(s :: String) -> A.Name: A.s-name(cps-lml(), s) end
+fun cps-lid(s :: String) -> A.Expr: A.s-id(cps-lml(), cps-lnm(s)) end
+fun cps-lbind(s :: String) -> A.Bind: A.s-bind(cps-lml(), false, cps-lnm(s), A.a-blank) end
+fun cps-lcall(name :: String, args :: List<A.Expr>) -> A.Expr: A.s-app(cps-lml(), cps-lid(name), args) end
 # `block: <stmts> end`
-fun lblock(stmts :: List<A.Expr>) -> A.Expr: A.s-block(lml(), stmts) end
+fun lblock(stmts :: List<A.Expr>) -> A.Expr: A.s-block(cps-lml(), stmts) end
 # a single-bind `let`/`var` expression: `<kw> nm = val  <body>`
 fun llet(nm :: String, val :: A.Expr, body :: A.Expr) -> A.Expr:
-  A.s-let-expr(lml(), [list: A.s-let-bind(lml(), lbind(nm), val)], body, true)
+  A.s-let-expr(cps-lml(), [list: A.s-let-bind(cps-lml(), cps-lbind(nm), val)], body, true)
 end
 fun lvar(nm :: String, val :: A.Expr, body :: A.Expr) -> A.Expr:
-  A.s-let-expr(lml(), [list: A.s-var-bind(lml(), lbind(nm), val)], body, true)
+  A.s-let-expr(cps-lml(), [list: A.s-var-bind(cps-lml(), cps-lbind(nm), val)], body, true)
 end
-fun ltrue() -> A.Expr: A.s-bool(lml(), true) end
-fun lfalse() -> A.Expr: A.s-bool(lml(), false) end
+fun ltrue() -> A.Expr: A.s-bool(cps-lml(), true) end
+fun lfalse() -> A.Expr: A.s-bool(cps-lml(), false) end
 # `if t: thn else: els end`
 fun lif(t :: A.Expr, thn :: A.Expr, els :: A.Expr) -> A.Expr:
-  A.s-if-else(lml(), [list: A.s-if-branch(lml(), t, thn)], els, false)
+  A.s-if-else(cps-lml(), [list: A.s-if-branch(cps-lml(), t, thn)], els, false)
 end
 # `lam(<params>): <body> end`
 fun llam(params :: List<A.Bind>, body :: A.Expr) -> A.Expr:
-  A.s-lam(lml(), "", [list:], params, A.a-blank, "", body, none, none, false)
+  A.s-lam(cps-lml(), "", [list:], params, A.a-blank, "", body, none, none, false)
 end
 # the per-call interrupt point: `yield-check(lam(): <body> end)`
 fun yield-wrap(body :: A.Expr) -> A.Expr:
-  lcall("yield-check", [list: llam([list:], body)])
+  cps-lcall("yield-check", [list: llam([list:], body)])
 end
 
 # ---- continuations (mirror cps.arr, now Expr-valued) ----
@@ -87,7 +87,7 @@ end
 # ---- continuation application / reification (mirror cps.arr) ----
 fun applyk(k :: Cont, v :: A.Expr) -> A.Expr:
   cases(Cont) k:
-    | k-var(nm) => lcall(nm, [list: v])
+    | k-var(nm) => cps-lcall(nm, [list: v])
     | k-fn(ap)  => ap(v)
   end
 end
@@ -95,10 +95,10 @@ end
 # Turn a continuation into a first-class VALUE expression (to pass as a function arg).
 fun reifyk(k :: Cont) -> A.Expr:
   cases(Cont) k:
-    | k-var(nm) => lid(nm)
+    | k-var(nm) => cps-lid(nm)
     | k-fn(ap) =>
       x = gensym("v")
-      llam([list: lbind(x)], ap(lid(x)))
+      llam([list: cps-lbind(x)], ap(cps-lid(x)))
   end
 end
 
@@ -199,13 +199,13 @@ fun t(node :: A.Expr, k :: Cont) -> A.Expr:
     | s-app(_, _, _) => t-app(node, k)
     | s-app-enriched(l, f, args, _) => t-app(A.s-app(l, f, args), k)
     | s-dot(_, obj, field) =>
-      t(obj, k-fn(lam(vo): applyk(k, A.s-dot(lml(), vo, field)) end))
+      t(obj, k-fn(lam(vo): applyk(k, A.s-dot(cps-lml(), vo, field)) end))
     | s-get-bang(_, obj, field) =>
-      t(obj, k-fn(lam(vo): applyk(k, A.s-get-bang(lml(), vo, field)) end))
+      t(obj, k-fn(lam(vo): applyk(k, A.s-get-bang(cps-lml(), vo, field)) end))
     | s-lam(_, _, _, _, _, _, _, _, _, _) => applyk(k, cps-lambda(node))
     | s-method(_, _, _, _, _, _, _, _, _, _) => applyk(k, cps-method-value(node))
     | s-if-else(_, branches, els, _) => t-if(branches, els, k)
-    | s-if(_, branches, _) => t-if(branches, lid("nothing"), k)  # no else -> nothing
+    | s-if(_, branches, _) => t-if(branches, cps-lid("nothing"), k)  # no else -> nothing
     | s-cases(_, typ, val, branches, _) => t-cases(typ, val, branches, none, k)
     | s-cases-else(_, typ, val, branches, els, _) => t-cases(typ, val, branches, some(els), k)
     | s-when(_, test-e, body, _) => t-when(test-e, body, k)
@@ -213,25 +213,25 @@ fun t(node :: A.Expr, k :: Cont) -> A.Expr:
     | s-if-pipe-else(_, branches, els, _) => t-ask(branches, some(els), k)
     | s-for(_, iter, binds, _, body, _) => t-for(iter, binds, body, k)
     | s-tuple(_, fields) =>
-      t-seq(fields, empty, lam(vs): applyk(k, A.s-tuple(lml(), vs)) end)
+      t-seq(fields, empty, lam(vs): applyk(k, A.s-tuple(cps-lml(), vs)) end)
     | s-tuple-get(_, tup, idx, _) =>
-      t(tup, k-fn(lam(v): applyk(k, A.s-tuple-get(lml(), v, idx, lml())) end))
+      t(tup, k-fn(lam(v): applyk(k, A.s-tuple-get(cps-lml(), v, idx, cps-lml())) end))
     | s-obj(_, fields) =>
-      cps-fields-then(fields, lam(fs): applyk(k, A.s-obj(lml(), fs)) end)
+      cps-fields-then(fields, lam(fs): applyk(k, A.s-obj(cps-lml(), fs)) end)
     | s-extend(_, supe, fields) =>
       t(supe, k-fn(lam(vsupe):
-        cps-fields-then(fields, lam(fs): applyk(k, A.s-extend(lml(), vsupe, fs)) end)
+        cps-fields-then(fields, lam(fs): applyk(k, A.s-extend(cps-lml(), vsupe, fs)) end)
       end))
     | s-update(_, supe, fields) =>
       t(supe, k-fn(lam(vsupe):
-        cps-fields-then(fields, lam(fs): applyk(k, A.s-update(lml(), vsupe, fs)) end)
+        cps-fields-then(fields, lam(fs): applyk(k, A.s-update(cps-lml(), vsupe, fs)) end)
       end))
     | s-construct(_, modifier, ctor, values) =>
-      t-seq(values, empty, lam(vs): applyk(k, A.s-construct(lml(), modifier, ctor, vs)) end)
+      t-seq(values, empty, lam(vs): applyk(k, A.s-construct(cps-lml(), modifier, ctor, vs)) end)
     | s-assign(_, id, value) =>
-      t(value, k-fn(lam(v): applyk(k, A.s-assign(lml(), id, v)) end))
+      t(value, k-fn(lam(v): applyk(k, A.s-assign(cps-lml(), id, v)) end))
     | s-instantiate(_, expr, params) =>
-      t(expr, k-fn(lam(v): applyk(k, A.s-instantiate(lml(), v, params)) end))
+      t(expr, k-fn(lam(v): applyk(k, A.s-instantiate(cps-lml(), v, params)) end))
     | else => raise("TODO(cps-ast): expression " + node.label())
   end
 end
@@ -252,11 +252,11 @@ fun t-op(op :: String, lhs :: A.Expr, rhs :: A.Expr, k :: Cont) -> A.Expr:
       cases(Option) op-cps-helper(op):
         | some(helper) =>
           t-seq([list: lhs, rhs], empty, lam(vs):
-            lcall(helper, [list: vs.get(0), vs.get(1), reifyk(k)])
+            cps-lcall(helper, [list: vs.get(0), vs.get(1), reifyk(k)])
           end)
         | none =>
           t-seq([list: lhs, rhs], empty, lam(vs):
-            applyk(k, A.s-op(lml(), lml(), op, vs.get(0), vs.get(1)))
+            applyk(k, A.s-op(cps-lml(), cps-lml(), op, vs.get(0), vs.get(1)))
           end)
       end
   end
@@ -270,25 +270,25 @@ fun t-app(node :: A.Expr, k :: Cont) -> A.Expr:
           # method call: evaluate receiver + args, then `recv.field(args, reifyk(k))`
           t(obj, k-fn(lam(vo):
             t-seq(args, empty, lam(vargs):
-              A.s-app(lml(), A.s-dot(lml(), vo, field), vargs + [list: reifyk(k)])
+              A.s-app(cps-lml(), A.s-dot(cps-lml(), vo, field), vargs + [list: reifyk(k)])
             end)
           end))
         | s-id(_, idn) =>
           name = idn.toname()
           if is-prim(name):
             # direct call (no continuation passed); its result feeds k
-            t-seq(args, empty, lam(vargs): applyk(k, A.s-app(lml(), f, vargs)) end)
+            t-seq(args, empty, lam(vargs): applyk(k, A.s-app(cps-lml(), f, vargs)) end)
           else:
             # CPS call: the continuation is the last argument
             t-seq(args, empty, lam(vargs):
-              A.s-app(lml(), f, vargs + [list: reifyk(k)])
+              A.s-app(cps-lml(), f, vargs + [list: reifyk(k)])
             end)
           end
         | else =>
           # general application: evaluate the callee to a value, then call it
           t(f, k-fn(lam(vf):
             t-seq(args, empty, lam(vargs):
-              A.s-app(lml(), vf, vargs + [list: reifyk(k)])
+              A.s-app(cps-lml(), vf, vargs + [list: reifyk(k)])
             end)
           end))
       end
@@ -322,8 +322,8 @@ fun t-cases(typ :: A.Ann, val :: A.Expr, branches :: List<A.CasesBranch>,
     t(val, k-fn(lam(vscrut):
       new-branches = map(lam(br): cps-cases-branch(br, kk) end, branches)
       cases(Option) els-opt:
-        | none => A.s-cases(lml(), typ, vscrut, new-branches, false)
-        | some(els) => A.s-cases-else(lml(), typ, vscrut, new-branches, t(els, kk), false)
+        | none => A.s-cases(cps-lml(), typ, vscrut, new-branches, false)
+        | some(els) => A.s-cases-else(cps-lml(), typ, vscrut, new-branches, t(els, kk), false)
       end
     end))
   end)
@@ -332,9 +332,9 @@ end
 fun cps-cases-branch(br :: A.CasesBranch, kk :: Cont) -> A.CasesBranch:
   cases(A.CasesBranch) br:
     | s-cases-branch(_, _, name, args, body) =>
-      A.s-cases-branch(lml(), lml(), name, args, t(body, kk))
+      A.s-cases-branch(cps-lml(), cps-lml(), name, args, t(body, kk))
     | s-singleton-cases-branch(_, _, name, body) =>
-      A.s-singleton-cases-branch(lml(), lml(), name, t(body, kk))
+      A.s-singleton-cases-branch(cps-lml(), cps-lml(), name, t(body, kk))
   end
 end
 
@@ -346,8 +346,8 @@ fun t-when(test-e :: A.Expr, body :: A.Expr, k :: Cont) -> A.Expr:
   with-reified-k(k, lam(kk):
     t(test-e, k-fn(lam(vc):
       lif(vc,
-        t(body, k-fn(lam(vb): lblock([list: vb, applyk(kk, lid("nothing"))]) end)),
-        applyk(kk, lid("nothing")))
+        t(body, k-fn(lam(vb): lblock([list: vb, applyk(kk, cps-lid("nothing"))]) end)),
+        applyk(kk, cps-lid("nothing")))
     end))
   end)
 end
@@ -364,7 +364,7 @@ fun t-ask-branches(brs :: List<A.IfPipeBranch>, els-opt :: Option<A.Expr>, kk ::
     | empty =>
       cases(Option) els-opt:
         | some(e) => t(e, kk)
-        | none => lcall("raise", [list: A.s-str(lml(), "ask: no branch matched")])
+        | none => cps-lcall("raise", [list: A.s-str(cps-lml(), "ask: no branch matched")])
       end
     | link(br, rest) =>
       cases(A.IfPipeBranch) br:
@@ -378,13 +378,13 @@ end
 
 # for ITER(p from e, ...): body end  ==>  ITER(lam(p,...,kg): yield-check(...) end, e..., reify k)
 fun t-for(iter :: A.Expr, binds :: List<A.ForBind>, body :: A.Expr, k :: Cont) -> A.Expr:
-  params = map(lam(b): lbind(bind-name(b.bind)) end, binds)
+  params = map(lam(b): cps-lbind(bind-name(b.bind)) end, binds)
   from-exprs = map(lam(b): b.value end, binds)
   kg = gensym("k")
-  lam-src = llam(params + [list: lbind(kg)], yield-wrap(t(body, k-var(kg))))
+  lam-src = llam(params + [list: cps-lbind(kg)], yield-wrap(t(body, k-var(kg))))
   t(iter, k-fn(lam(viter):
     t-seq(from-exprs, empty, lam(vs):
-      A.s-app(lml(), viter, link(lam-src, vs) + [list: reifyk(k)])
+      A.s-app(cps-lml(), viter, link(lam-src, vs) + [list: reifyk(k)])
     end)
   end))
 end
@@ -411,7 +411,7 @@ fun rebuild-data-fields(fs :: List<A.Member>, vs :: List<A.Expr>) -> List<A.Memb
       cases(List) vs:
         | empty => empty
         | link(v, vrest) =>
-          link(A.s-data-field(lml(), f.name, v), rebuild-data-fields(frest, vrest))
+          link(A.s-data-field(cps-lml(), f.name, v), rebuild-data-fields(frest, vrest))
       end
   end
 end
@@ -420,8 +420,8 @@ fun cps-method-field(m :: A.Member) -> A.Member:
   cases(A.Member) m:
     | s-method-field(_, name, _, args, _, _, body, _, _, _) =>
       kg = gensym("k")
-      params = map(lam(b): lbind(bind-name(b)) end, args) + [list: lbind(kg)]
-      A.s-method-field(lml(), name, [list:], params, A.a-blank, "",
+      params = map(lam(b): cps-lbind(bind-name(b)) end, args) + [list: cps-lbind(kg)]
+      A.s-method-field(cps-lml(), name, [list:], params, A.a-blank, "",
         yield-wrap(t(body, k-var(kg))), none, none, false)
     | else => raise("TODO(cps-ast): non-method member in method position " + m.label())
   end
@@ -450,9 +450,9 @@ fun cps-fun-def(fn :: A.Expr) -> A.Expr:
   cases(A.Expr) fn:
     | s-fun(_, name, _, args, _, _, body, _, _, _) =>
       kg = gensym("k")
-      params = map(lam(b): lbind(bind-name(b)) end, args) + [list: lbind(kg)]
+      params = map(lam(b): cps-lbind(bind-name(b)) end, args) + [list: cps-lbind(kg)]
       cbody = yield-wrap(t(body, k-var(kg)))
-      A.s-fun(lml(), name, [list:], params, A.a-blank, "", cbody, none, none, false)
+      A.s-fun(cps-lml(), name, [list:], params, A.a-blank, "", cbody, none, none, false)
   end
 end
 
@@ -460,9 +460,9 @@ fun cps-lambda(node :: A.Expr) -> A.Expr:
   cases(A.Expr) node:
     | s-lam(_, _, _, args, _, _, body, _, _, _) =>
       kg = gensym("k")
-      params = map(lam(b): lbind(bind-name(b)) end, args) + [list: lbind(kg)]
+      params = map(lam(b): cps-lbind(bind-name(b)) end, args) + [list: cps-lbind(kg)]
       cbody = yield-wrap(t(body, k-var(kg)))
-      A.s-lam(lml(), "", [list:], params, A.a-blank, "", cbody, none, none, false)
+      A.s-lam(cps-lml(), "", [list:], params, A.a-blank, "", cbody, none, none, false)
   end
 end
 
@@ -471,8 +471,8 @@ fun cps-method-value(node :: A.Expr) -> A.Expr:
   cases(A.Expr) node:
     | s-method(_, _, _, args, _, _, body, _, _, _) =>
       kg = gensym("k")
-      params = map(lam(b): lbind(bind-name(b)) end, args) + [list: lbind(kg)]
-      A.s-method(lml(), "", [list:], params, A.a-blank, "",
+      params = map(lam(b): cps-lbind(bind-name(b)) end, args) + [list: cps-lbind(kg)]
+      A.s-method(cps-lml(), "", [list:], params, A.a-blank, "",
         yield-wrap(t(body, k-var(kg))), none, none, false)
   end
 end
@@ -485,18 +485,23 @@ end
 # pure-Pyret parser emits.
 fun cps-data-def(d :: A.Expr) -> A.Expr:
   cases(A.Expr) d:
-    | s-data(_, name, params, mixins, variants, shared, _, _) =>
-      A.s-data(lml(), name, params, mixins,
+    # PRESERVE the original data/variant locs.  The backend keys each constructor's
+    # table slot by `tostring(variant-loc)`, so collapsing every variant to a single
+    # synthetic loc (cps-lml()) COLLIDES their slots -> the codegen's slot lookup finds no
+    # entry ("cases: no branch matched" at compile time).  Keeping the real srclocs both
+    # avoids the collision and gives accurate error positions.
+    | s-data(l, name, params, mixins, variants, shared, _, _) =>
+      A.s-data(l, name, params, mixins,
         map(cps-variant, variants), map(cps-member, shared), none, none)
   end
 end
 
 fun cps-variant(v :: A.Variant) -> A.Variant:
   cases(A.Variant) v:
-    | s-variant(_, _, name, members, with-members) =>
-      A.s-variant(lml(), lml(), name, members, map(cps-member, with-members))
-    | s-singleton-variant(_, name, with-members) =>
-      A.s-singleton-variant(lml(), name, map(cps-member, with-members))
+    | s-variant(l, cl, name, members, with-members) =>
+      A.s-variant(l, cl, name, members, map(cps-member, with-members))
+    | s-singleton-variant(l, name, with-members) =>
+      A.s-singleton-variant(l, name, map(cps-member, with-members))
   end
 end
 
@@ -527,8 +532,8 @@ fun t-check-block(name-opt :: Option<String>, body :: A.Expr, keyword-check :: B
     | else => [list: body]
   end
   cps-check-tests(tests, empty, lam(new-tests):
-    chk = A.s-check(lml(), name-opt, lblock(new-tests), keyword-check)
-    lblock([list: chk, applyk(k, lid("nothing"))])
+    chk = A.s-check(cps-lml(), name-opt, lblock(new-tests), keyword-check)
+    lblock([list: chk, applyk(k, cps-lid("nothing"))])
   end)
 end
 
@@ -548,7 +553,7 @@ fun cps-check-tests(ts :: List<A.Expr>, acc :: List<A.Expr>,
             | some(right) =>
               t(left, k-fn(lam(lv):
                 t(right, k-fn(lam(rv):
-                  new-test = A.s-check-test(lml(), op, none, lv, some(rv), none)
+                  new-test = A.s-check-test(cps-lml(), op, none, lv, some(rv), none)
                   cps-check-tests(rest, acc + [list: new-test], kf)
                 end))
               end))
@@ -560,7 +565,7 @@ end
 
 # ---- statement sequences ----
 fun t-stmts(stmts :: List<A.Expr>, i :: Number, k :: Cont) -> A.Expr:
-  if is-empty(stmts): applyk(k, lid("nothing"))
+  if is-empty(stmts): applyk(k, cps-lid("nothing"))
   else:
     last = i == (stmts.length() - 1)
     s = stmts.get(i)
@@ -604,7 +609,7 @@ fun collect-fun-defs(stmts :: List<A.Expr>) -> List<String>:
 end
 
 # ---- collect top-level data constructor names (for is-prim: ctors are called directly) ----
-fun variant-name(v :: A.Variant) -> String:
+fun cps-variant-name(v :: A.Variant) -> String:
   cases(A.Variant) v:
     | s-variant(_, _, name, _, _) => name
     | s-singleton-variant(_, name, _) => name
@@ -613,7 +618,7 @@ end
 fun collect-ctors(stmts :: List<A.Expr>) -> List<String>:
   for fold(acc from empty, s from stmts):
     cases(A.Expr) s:
-      | s-data(_, _, _, _, variants, _, _, _) => acc + map(variant-name, variants)
+      | s-data(_, _, _, _, variants, _, _, _) => acc + map(cps-variant-name, variants)
       | else => acc
     end
   end
@@ -645,8 +650,8 @@ fun cps-program(prog :: A.Program) -> A.Expr block:
         end
       end
       rest = filter(lam(s): not(A.is-s-fun(s)) and not(A.is-s-data(s)) end, stmts)
-      driver = if is-empty(rest): lcall("finish-result", [list: lid("nothing")])
-        else: t-stmts(rest, 0, k-fn(lam(v): lcall("finish-result", [list: v]) end))
+      driver = if is-empty(rest): cps-lcall("finish-result", [list: cps-lid("nothing")])
+        else: t-stmts(rest, 0, k-fn(lam(v): cps-lcall("finish-result", [list: v]) end))
         end
       lblock(decls + [list: driver])
   end

@@ -1,11 +1,10 @@
-// Headless smoke test of the web IDE. The IDE now runs ONLY through the fully
-// self-hosted, stoppable compiler (self-host/compile-driver.arr + the CPS transform
-// self-host/cps.arr) — NO seed, NO fallback. That compiler isn't fully ready yet
-// (other work is bringing it online), so this test verifies the WIRING (optimistic):
-// the runtime loads, a Run goes through BOTH driver wasms (CPS transform → self-hosted
-// compile), the trampoline drives it, and a Run reaches a terminal state — it does NOT
-// touch the seed. Program-execution correctness is reported informationally; it lights
-// up as the self-hosted compiler matures. Requires the server running on PORT (8099).
+// Headless smoke test of the web IDE. The IDE now runs ONLY through ONE artifact: the
+// self-hosted, stoppable compile driver (self-host/cps-compile-driver.wasm = pure-Pyret
+// parser + CPS stoppability transform + the Pyret-written backend) — NO seed, NO JS
+// parser, NO fallback. This test verifies the WIRING: the runtime loads, a Run goes
+// through the single driver wasm, the trampoline drives it to a terminal state, the
+// program actually computes, the Stop button interrupts an infinite loop, and the bundle
+// pulls NO JS-GLR parser. Requires the server running on PORT (8099).
 import puppeteer from "puppeteer-core";
 
 const URL = `http://localhost:${process.env.PORT ?? 8099}/`;
@@ -31,14 +30,17 @@ try {
   const hasCM = await page.evaluate(() => !!document.querySelector(".CodeMirror"));
   if (hasCM) console.log("✓ CodeMirror editor mounted"); else fail("CodeMirror missing");
 
-  // The bundle must wire the self-hosted compiler driver (deployable = self-hosted only).
+  // The bundle must wire the single self-hosted driver — and must NOT pull any JS-GLR
+  // parser (no parser-bundle) or the old two-driver wasms.
   const bundle = await (await fetch(`${URL}main.bundle.js`)).text();
-  if (bundle.includes("selfhost-driver.wasm")) console.log("✓ bundle wires the self-hosted compiler driver");
-  else fail("bundle missing selfhost-driver.wasm reference");
+  if (bundle.includes("cps-compile-driver.wasm")) console.log("✓ bundle wires the single self-hosted stoppable driver");
+  else fail("bundle missing cps-compile-driver.wasm reference");
+  if (!bundle.includes("parser-bundle")) console.log("✓ bundle has NO JS-GLR parser (parser-bundle gone)");
+  else fail("bundle still references parser-bundle (JS parser not removed)");
 
-  // Run a tiny program; the IDE must drive it through BOTH the CPS transform and the
-  // self-hosted compiler (both driver wasms fetched) and reach a terminal state.
-  await page.evaluate(() => (window).cm.setValue("5"));
+  // Run an arithmetic program; the IDE must drive it through the single driver wasm and
+  // reach a terminal state with the correct value.
+  await page.evaluate(() => (window).cm.setValue("print(21 + 21)"));
   await page.click("#run");
   await page.waitForFunction(() => {
     const s = document.getElementById("status")?.textContent ?? "";
@@ -47,18 +49,27 @@ try {
   const status = await page.$eval("#status", (e) => e.textContent ?? "");
   const out = await page.$eval("#interactions", (e) => e.textContent ?? "");
 
-  if (fetched.has("cps-driver.wasm")) console.log("✓ run goes through the CPS stoppability transform (cps-driver.wasm)");
-  else fail("cps-driver.wasm not fetched — CPS transform not wired");
-  if (fetched.has("selfhost-driver.wasm")) console.log("✓ run goes through the SELF-HOSTED compiler (selfhost-driver.wasm)");
-  else fail("selfhost-driver.wasm not fetched — self-hosted compiler not wired");
+  if (fetched.has("cps-compile-driver.wasm")) console.log("✓ run goes through the single self-hosted stoppable driver");
+  else fail("cps-compile-driver.wasm not fetched — driver not wired");
+  if (![...fetched].some((f) => f === "parser-bundle.js")) console.log("✓ no JS parser wasm/bundle fetched at runtime");
 
-  // Reaching a terminal state proves the path executes end-to-end (no hang). Whether
-  // the program actually computed 5 depends on the self-hosted compiler's readiness —
-  // report it, don't fail on it (optimistic wiring).
   console.log(`✓ run reached a terminal state (status=${JSON.stringify(status)})`);
-  if (out.includes("5")) console.log("  ✓ (bonus) self-hosted compiler already runs `5` → 5");
-  else console.log("  · self-hosted compiler can't run `5` yet (expected; surfaced as an error, NOT a seed fallback):",
-                   JSON.stringify(out.slice(0, 100)));
+  if (out.includes("42")) console.log("✓ self-hosted+CPS compiler runs `print(21 + 21)` → 42");
+  else fail("expected 42 in output, got: " + JSON.stringify(out.slice(0, 120)));
+
+  // Stop button: an infinite loop must be cooperatively interruptible (the whole point
+  // of the CPS stoppability transform).
+  await page.evaluate(() => { (window).__pausesSeen = 0; (window).cm.setValue("fun spin(): spin() end\nspin()"); });
+  await page.click("#run");
+  // Wait until the loop is actually spinning + pausing on gas (proves compile finished,
+  // the RunHandle is live, and the trampoline is yielding) before clicking Stop.
+  await page.waitForFunction(() => ((window).__pausesSeen ?? 0) > 0, { timeout: 60000 });
+  await page.click("#stop");
+  await page.waitForFunction(() => {
+    const s = document.getElementById("status")?.textContent ?? "";
+    return s === "stopped" || s.includes("Stop");
+  }, { timeout: 30000 });
+  console.log("✓ Stop button interrupts an infinite loop (cooperative stop)");
 } catch (e) {
   fail("test threw: " + String(e).slice(0, 200));
 } finally {
