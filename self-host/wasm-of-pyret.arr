@@ -782,6 +782,7 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       objl = c.next-local
       fldl = c.next-local + 1
       cll  = c.next-local + 2
+      max-local-used := num-max(max-local-used, cll + 1)   # these temps aren't bind-local'd
       c2 = ctx(c.locals, c.next-local + 3, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
       tyidx = closure-call-type-idx()
       arg-instrs = args.map(lam(a): compile-aval(a, c2) end)
@@ -1299,11 +1300,14 @@ fun compile-prog(prog) -> List<Number>:
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry
       # would append a second `end`).
-      rt-code = RT-FUNS.map(lam(rf): E.byte-vec(E.vec(rf.locals).append(rf.body)) end)
+      # NB: `map(f, RT-FUNS)` (function form), NOT `RT-FUNS.map(...)` — method dispatch on the
+      # global RT-FUNS (built by build-runtime) currently mis-resolves under self-hosting; the
+      # function form is equivalent and works. TODO: root-cause the a-method-app-on-global path.
+      rt-code = map(lam(rf): E.byte-vec(E.vec(rf.locals).append(rf.body)) end, RT-FUNS)
 
       # ----- type section: GC rec-group ++ a func type per runtime fn ++ closure ++ main
       #       ++ one func type per host import (referenced by the import section) -----
-      rt-types = RT-FUNS.map(lam(rf): E.func-type-vt(rf.params, rf.results) end)
+      rt-types = map(lam(rf): E.func-type-vt(rf.params, rf.results) end, RT-FUNS)
       closure-type = E.func-type-vt([list: E.anyref, E.reftnull(T-FIELDS)], [list: E.anyref])
       main-type = E.func-type-vt(empty, [list: E.anyref])
       import-types = R.host-imports.map(lam(hi): E.func-type-vt(hi.params, hi.results) end)
