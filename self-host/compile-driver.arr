@@ -90,6 +90,23 @@ fun concat-all(lsts :: List) -> List:
   for fold(acc from [list:], x from lsts): acc + x end
 end
 
+# ── constant-stack list helpers ──────────────────────────────────────────────
+# The seed's prelude `map`/`foldr` are NON-tail (`link(f(x), map(f, r))`), so they
+# recurse depth = list-length and OVERFLOW the WASM stack on long lists — e.g. a module
+# with a long run of top-level `fun`s, or a `data` with 100+ variants. The seed compiles
+# NATIVE tail calls, so these accumulator-based versions run in CONSTANT stack. Use `tmap`
+# (not `.map`) for every driver traversal over a possibly-long, size-proportional list.
+fun trev(l :: List, acc :: List) -> List:
+  cases(List) l:
+    | empty => acc
+    | link(x, r) => trev(r, link(x, acc))
+  end
+end
+fun tmap(f, l :: List) -> List:
+  # foldl is tail-recursive in the prelude; build reversed then reverse (both tail).
+  trev(foldl(lam(acc, x): link(f(x), acc) end, [list:], l), [list:])
+end
+
 # Bind the names inside tuple-bind `tb` by reading from already-named `src-id` (an
 # s-id of the holder). Recurses for nested tuple-binds. Returns a list of let-binds.
 fun destructure-from(bl, tb :: A.Bind, src-id :: A.Expr) -> List<A.LetBind>:
@@ -202,9 +219,9 @@ end
 fun desugar-variant(v) -> A.Variant:
   cases(A.Variant) v:
     | s-variant(l, cl, vname, members, with-members) =>
-      A.s-variant(l, cl, vname, members.map(strip-member), with-members.map(desugar-member))
+      A.s-variant(l, cl, vname, tmap(strip-member, members), tmap(desugar-member, with-members))
     | s-singleton-variant(l, vname, with-members) =>
-      A.s-singleton-variant(l, vname, with-members.map(desugar-member))
+      A.s-singleton-variant(l, vname, tmap(desugar-member, with-members))
   end
 end
 
@@ -231,6 +248,59 @@ fun builtin-app-name(f) -> Option:
       if (nm == "print") or (nm == "display"): some(nm) else: none end
     | else => none
   end
+end
+
+# ── `_` curry desugaring ─────────────────────────────────────────────────────
+# `_` is s-id(s-underscore). In operand position it means "make a lambda over this hole":
+#   _ + 1   -> lam(a): a + 1 end       _ + _ -> lam(a, b): a + b end
+#   f(_, x) -> lam(a): f(a, x) end     _.foo -> lam(a): a.foo end
+# Real Pyret does this in desugar.arr's curry pass; without it `_` reaches the backend as
+# an unbound id -> null-ref. We detect underscore operands, replace each with a fresh param,
+# and wrap the (re-desugared) expression in an s-lam over those params.
+fun is-underscore-operand(e :: A.Expr) -> Boolean:
+  # The pure-Pyret parser lexes `_` as a plain name "_" (s-id(s-name(_, "_"))); the JS-GLR
+  # bridge may instead give s-underscore. Match both.
+  cases(A.Expr) e:
+    | s-id(_, n) =>
+      cases(A.Name) n:
+        | s-underscore(_) => true
+        | s-name(_, s) => s == "_"
+        | else => false
+      end
+    | else => false
+  end
+end
+
+# {fresh-bind-list; replacement-expr (UN-desugared)}: an underscore slot becomes a fresh
+# param + an s-id to it; any other expr passes through unchanged (desugared by the re-entry).
+fun curry-slot(loc, e :: A.Expr):
+  if is-underscore-operand(e):
+    nm = fresh-tuple-name()
+    {[list: A.s-bind(loc, false, A.s-name(loc, nm), A.a-blank)]; A.s-id(loc, A.s-name(loc, nm))}
+  else:
+    {[list:]; e}
+  end
+end
+
+fun any-underscore(args :: List<A.Expr>) -> Boolean:
+  cases(List) args:
+    | empty => false
+    | link(a, r) => if is-underscore-operand(a): true else: any-underscore(r) end
+  end
+end
+
+# Replace underscore args with fresh params (tail-recursive): {fresh-binds; new-args}.
+fun curry-args-acc(loc, args :: List<A.Expr>, bacc :: List, aacc :: List):
+  cases(List) args:
+    | empty => {trev(bacc, [list:]); trev(aacc, [list:])}
+    | link(a, r) =>
+      {bs; ax} = curry-slot(loc, a)
+      curry-args-acc(loc, r, trev(bs, bacc), link(ax, aacc))
+  end
+end
+
+fun curry-lam(loc, binds :: List, inner :: A.Expr) -> A.Expr:
+  A.s-lam(fresh-loc(), "", [list:], binds, A.a-blank, "", desugar-expr(inner), none, none, false)
 end
 
 # ── cases-based AST desugaring (no visit()) ──────────────────────────────────
@@ -273,6 +343,13 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-ref(_, _) => e
 
     | s-op(loc, op-loc, op-str, lhs, rhs) =>
+      if is-underscore-operand(lhs) or is-underscore-operand(rhs):
+        # curry: `_ + e` / `e + _` / `_ + _` -> lam over the hole(s); re-desugar the op
+        # with fresh ids (no underscores left -> falls through to the normal op handling).
+        {lb; lx} = curry-slot(loc, lhs)
+        {rb; rx} = curry-slot(loc, rhs)
+        curry-lam(loc, lb + rb, A.s-op(loc, op-loc, op-str, lx, rx))
+      else:
       # `and`/`or` are SHORT-CIRCUIT — desugar to `if`, not a strict binary call.
       #   a and b -> if a: b else: false end
       #   a or b  -> if a: true else: b end
@@ -297,8 +374,14 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         A.s-app-enriched(loc, A.s-id(loc, A.s-global(gname)),
           [list: desugar-expr(lhs), desugar-expr(rhs)], no-info)
       end
+      end
 
     | s-app(loc, f, args) =>
+      if any-underscore(args):
+        # curry: `f(_, x)` -> `lam(a): f(a, x) end` (re-desugar the app with fresh ids).
+        {newbinds; newargs} = curry-args-acc(loc, args, [list:], [list:])
+        curry-lam(loc, newbinds, A.s-app(loc, f, newargs))
+      else:
       # `print(x)` / `display(x)` are intrinsics: lower to a prim-app the backend maps to
       # the host print import (otherwise `print` resolves to an unbound global -> null).
       app-prim-name = builtin-app-name(f)
@@ -307,6 +390,7 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
           A.prim-app-info-c(false))
       else:
         A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), no-info)
+      end
       end
 
     | s-app-enriched(loc, f, args, info) =>
@@ -367,18 +451,18 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       A.s-let(loc, strip-bind(bind), desugar-expr(expr), closure-val)
 
     | s-let-expr(loc, binds, body, blocky) =>
-      new-binds = concat-all(binds.map(lam(b):
+      new-binds = concat-all(tmap(lam(b):
         cases(A.LetBind) b:
           | s-let-bind(bl, bind, val) => expand-letbind(bl, bind, desugar-expr(val))
           | s-var-bind(bl, bind, val) => [list: A.s-var-bind(bl, strip-bind(bind), desugar-expr(val))]
         end
-      end))
+      end, binds))
       A.s-let-expr(loc, new-binds, desugar-expr(body), blocky)
 
     | s-letrec(loc, binds, body, blocky) =>
-      new-binds = binds.map(lam(b):
+      new-binds = tmap(lam(b):
         A.s-letrec-bind(b.l, strip-bind(b.b), desugar-expr(b.value))
-      end)
+      end, binds)
       A.s-letrec(loc, new-binds, desugar-expr(body), blocky)
 
     | s-var(loc, bind, val) =>
@@ -388,7 +472,13 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       A.s-assign(loc, id, desugar-expr(val))
 
     | s-dot(loc, obj, field) =>
-      A.s-dot(loc, desugar-expr(obj), field)
+      if is-underscore-operand(obj):
+        # curry: `_.foo` -> `lam(a): a.foo end`
+        {bs; ox} = curry-slot(loc, obj)
+        curry-lam(loc, bs, A.s-dot(loc, ox, field))
+      else:
+        A.s-dot(loc, desugar-expr(obj), field)
+      end
 
     | s-get-bang(loc, obj, field) =>
       A.s-get-bang(loc, desugar-expr(obj), field)
@@ -475,21 +565,21 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       # NB: build the chain with an EXPLICIT recursion (not foldr): the seed's prelude
       # foldr calls its function with SWAPPED args (f(acc, elt)), so a foldr-based build
       # produced a malformed chain.  (Seed prelude bug, out of scope here.)
-      build-link-chain(loc, values.map(desugar-expr), no-info)
+      build-link-chain(loc, tmap(desugar-expr, values), no-info)
 
     | s-data(loc, name, params, mixins, variants, shared, chk-loc, chk) =>
       A.s-data-expr(loc, name, A.s-name(loc, name), params, mixins,
-        variants.map(desugar-variant), shared.map(desugar-member), chk-loc, chk)
+        tmap(desugar-variant, variants), tmap(desugar-member, shared), chk-loc, chk)
 
     | s-cases(loc, typ, val, branches, blocky) =>
       A.s-cases-else(loc, typ, desugar-expr(val),
-        branches.map(desugar-cases-branch),
+        tmap(desugar-cases-branch, branches),
         A.s-prim-app(loc, "throwNoCasesMatched", [list:], A.prim-app-info-c(false)),
         blocky)
 
     | s-cases-else(loc, typ, val, branches, _else, blocky) =>
       A.s-cases-else(loc, typ, desugar-expr(val),
-        branches.map(desugar-cases-branch), desugar-expr(_else), blocky)
+        tmap(desugar-cases-branch, branches), desugar-expr(_else), blocky)
 
     | s-paren(_, inner) => desugar-expr(inner)
 
@@ -503,19 +593,22 @@ end
 
 # ── Desugar a statement list, hoisting consecutive s-fun into s-letrec ────────
 
-fun collect-funs(stmts):
-  # Returns {fun-list; remaining-stmts} splitting at first non-s-fun
+fun collect-funs-acc(stmts, acc :: List):
+  # Tail-recursive: accumulate the run of consecutive s-fun (reversed), stop at the
+  # first non-s-fun. (Was non-tail — overflowed on a long run of top-level funs, the
+  # dominant self-compile "Maximum call stack" blocker on the largest modules.)
   cases(List) stmts:
-    | empty => {[list:]; [list:]}
+    | empty => {trev(acc, [list:]); [list:]}
     | link(f, rest) =>
-      is-sfun = A.is-s-fun(f)
-      if is-sfun:
-        {more-funs; remaining} = collect-funs(rest)
-        {link(f, more-funs); remaining}
-      else:
-        {[list:]; stmts}
+      if A.is-s-fun(f): collect-funs-acc(rest, link(f, acc))
+      else: {trev(acc, [list:]); stmts}
       end
   end
+end
+
+fun collect-funs(stmts):
+  # Returns {fun-list; remaining-stmts} splitting at first non-s-fun
+  collect-funs-acc(stmts, [list:])
 end
 
 fun fun-to-letrec-bind(fn :: A.Expr) -> A.LetrecBind:
@@ -562,7 +655,7 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
         | s-fun(_, _, _, _, _, _, _, _, _, _) =>
           # Collect a run of consecutive s-fun definitions
           {funs; remaining} = collect-funs(stmts)
-          letrec-binds = funs.map(fun-to-letrec-bind)
+          letrec-binds = tmap(fun-to-letrec-bind, funs)
           remaining-desugared = desugar-stmts(remaining)
           [list: A.s-letrec(l, letrec-binds, stmts-to-body(remaining-desugared), false)]
         | s-data(dl, dname, _, _, variants, _, _, _) =>
@@ -572,11 +665,11 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
           objname = "$data$" + dname
           obj-id = A.s-id(dl, A.s-name(dl, objname))
           data-bind = A.s-let-bind(dl, A.s-bind(dl, false, A.s-name(dl, objname), A.a-blank), data-expr)
-          ctor-binds = variants.map(lam(v):
+          ctor-binds = tmap(lam(v):
             vn = surface-variant-name(v)
             A.s-let-bind(dl, A.s-bind(dl, false, A.s-name(dl, vn), A.a-blank),
               A.s-dot(dl, obj-id, vn))
-          end)
+          end, variants)
           body = stmts-to-body(desugar-stmts(rest))
           [list: A.s-let-expr(dl, link(data-bind, ctor-binds), body, false)]
         | s-let(ll, bind, val, _) =>
