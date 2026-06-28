@@ -179,8 +179,15 @@ fun mem-type(min, max): append([list: 1], append(leb-u(min), leb-u(max))) end
 
 # ===== f64 IEEE-754 -> 8 little-endian bytes (for f64.const) =====
 fun pow2(e): if e <= 0: 1 else: 2 * pow2(e - 1) end end
-fun split-le(bits, i):  # 8 little-endian bytes of a 64-bit integer `bits`
-  if i == 8: empty else: link(num-modulo(num-quotient(bits, pow2(8 * i)), 256), split-le(bits, i + 1)) end
+fun split-le(bits, i, sign):  # 8 little-endian bytes of the 63-bit magnitude `bits`,
+  # OR-ing the sign into the high bit of the most-significant byte (index 7). `bits` stays
+  # < 2^63 (fixnum-range) so num-modulo/num-quotient never hit the bignum path.
+  if i == 8: empty
+  else:
+    base = num-modulo(num-quotient(bits, pow2(8 * i)), 256)
+    byte = if i == 7: base + (sign * 128) else: base end
+    link(byte, split-le(bits, i + 1, sign))
+  end
 end
 fun norm-exp(ax, e):    # find e with 1 <= ax/2^e < 2  (ax > 0)
   if ax >= 2: norm-exp(ax / 2, e + 1)
@@ -194,10 +201,19 @@ fun f64-bits(x):
     ax = num-abs(x)
     e = norm-exp(ax, 0)
     biased = e + 1023
-    frac = (ax / pow2(e)) - 1               # in [0,1)
-    mant = num-floor(frac * pow2(52))       # 52-bit mantissa (TODO(port): round-to-nearest-even)
-    bits = ((sign * pow2(63)) + (biased * pow2(52))) + mant
-    split-le(bits, 0)
+    # scale ax into [1,2): pow2 only handles e>=0, so divide by 2^e for e>=0 and multiply by
+    # 2^(-e) for e<0 (|x|<1). Both are exact in f64 (powers of two only shift the exponent).
+    scaled = if e >= 0: ax / pow2(e) else: ax * pow2(0 - e) end
+    frac = scaled - 1                       # in [0,1)
+    # 52-bit mantissa. frac*2^52 is EXACTLY the integer mantissa (x has 52 mantissa bits, and
+    # mul/div by powers of two is exact in f64) but is still a ROUGHNUM. num-to-rational converts
+    # that integer-valued roughnum to an EXACT integer (it floors = identity here) — so the bytes
+    # are exact. (num-floor keeps it rough, and num-modulo on a roughnum ref.cast-traps — the bug.)
+    mant = num-to-rational(frac * pow2(52))
+    # magnitude bits only (biased exponent + mantissa, < 2^63 = fixnum-range); the sign goes into
+    # the top byte inside split-le, avoiding a 2^63 bignum (which traps split-le).
+    magbits = (biased * pow2(52)) + mant
+    split-le(magbits, 0, sign)
   end
 end
 

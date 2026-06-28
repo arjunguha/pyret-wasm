@@ -59,3 +59,14 @@ test("self-hosted backend: deep nested-if chain compiles + runs", async () => {
   for (let i = 0; i < n; i = i + 1) expr = "if true: " + expr + " else: 1 / 0 end";
   await expect(runSourceSelfHosted("if (" + expr + ") == 0: 0 else: 1 / 0 end")).resolves.toBeDefined();
 });
+
+// Roughnum LITERALS (~3.14, PI, …) used to compile to corrupt IEEE-754 bytes — the encoder's
+// f64-bits did num-modulo/num-quotient on a ROUGHNUM, which ref.cast-traps DURING compilation.
+// Now f64-bits emits faithful IEEE-754 bytes (exact mantissa via num-to-rational; magnitude-only
+// split with the sign OR'd into the top byte), so roughnum literals compile + run.
+// (Faithful rough RENDERING + rough arithmetic remain — the rough-tower TODO in runtime.arr.)
+test("self-hosted backend: roughnum literals compile + run (faithful f64-bits, no encode trap)", async () => {
+  for (const lit of ["~3.14", "~0.5", "~-2.5", "~5.0"]) {
+    await expect(runSourceSelfHosted(`x = ${lit}\nprint("ok")`)).resolves.toBeDefined();
+  }
+});
