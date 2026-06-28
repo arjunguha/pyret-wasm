@@ -214,12 +214,9 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), info)
 
     | s-block(loc, stmts) =>
-      ds = desugar-stmts(stmts)
       # anf raises "Empty block" on an empty stmt list (e.g. a block whose only
-      # statements were erased type-aliases) — emit `nothing` instead.
-      if is-empty(ds): A.s-id(loc, A.s-name(loc, "nothing"))
-      else: A.s-block(loc, ds)
-      end
+      # statements were erased type-aliases/contracts) — nonempty-block emits `nothing`.
+      nonempty-block(loc, desugar-stmts(stmts))
 
     | s-if-else(loc, branches, _else, blocky) =>
       A.s-if-else(loc,
@@ -434,6 +431,15 @@ fun surface-variant-name(v) -> String:
   end
 end
 
+# Build an s-block that is NEVER empty: an empty statement list (e.g. a body/module
+# whose statements were all erased contracts/types) would trip anf.arr's "Empty block",
+# so substitute a `nothing` statement. Used at every s-block-producing site.
+fun nonempty-block(loc, desugared :: List<A.Expr>) -> A.Expr:
+  if is-empty(desugared): A.s-block(loc, [list: A.s-id(loc, A.s-name(loc, "nothing"))])
+  else: A.s-block(loc, desugared)
+  end
+end
+
 # the remaining statements as a single body expression (for let/letrec bodies)
 fun stmts-to-body(desugared :: List<A.Expr>) -> A.Expr:
   l = A.dummy-loc
@@ -494,7 +500,7 @@ fun desugar-program(prog :: A.Program) -> A.Program:
   cases(A.Program) prog:
     | s-program(loc, use, prov, prov-types, provides, imports, body) =>
       new-body = cases(A.Expr) body:
-        | s-block(bl, stmts) => A.s-block(bl, desugar-stmts(stmts))
+        | s-block(bl, stmts) => nonempty-block(bl, desugar-stmts(stmts))
         | else => desugar-expr(body)
       end
       A.s-program(loc, use, prov, prov-types, provides, imports, new-body)
