@@ -646,50 +646,70 @@ fun stmts-to-body(desugared :: List<A.Expr>) -> A.Expr:
   end
 end
 
-fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
-  l = A.dummy-loc
+# Partition a statement list (tail-recursively) into (a) the letrec-binds for ALL
+# `s-fun` / `s-data` (object + constructors) / `s-rec` definitions — wherever they
+# appear — and (b) the remaining statements (value `s-let`/`s-var` + expressions), both
+# in source order. `s-type`/`s-newtype`/`s-contract` are erased. This makes the whole
+# level ONE mutually-recursive scope: definitions are hoisted ahead of the value
+# bindings, so a value initializer can forward-reference a fun/constructor defined later.
+# (Top-level names become mutable globals in the backend, so visibility is total — the
+# ONLY thing that mattered was init ORDER; fun/data/rec bindings are effect-free, so
+# moving them ahead of the value bindings/expressions preserves observable behavior.)
+fun partition-top(stmts, bind-acc :: List, rest-acc :: List):
+  cases(List) stmts:
+    | empty => { trev(bind-acc, [list:]); trev(rest-acc, [list:]) }
+    | link(f, more) =>
+      cases(A.Expr) f:
+        | s-fun(_, _, _, _, _, _, _, _, _, _) =>
+          partition-top(more, link(fun-to-letrec-bind(f), bind-acc), rest-acc)
+        | s-data(dl, dname, _, _, variants, _, _, _) =>
+          objname = "$data$" + dname
+          obj-id = A.s-id(dl, A.s-name(dl, objname))
+          obj-bind = A.s-letrec-bind(dl, A.s-bind(dl, false, A.s-name(dl, objname), A.a-blank),
+            desugar-expr(f))   # -> s-data-expr
+          ctor-binds = tmap(lam(v):
+              vn = surface-variant-name(v)
+              A.s-letrec-bind(dl, A.s-bind(dl, false, A.s-name(dl, vn), A.a-blank),
+                A.s-dot(dl, obj-id, vn))
+            end, variants)
+          # keep order [obj-bind, ctor0, ctor1, …] in the final (un-reversed) list
+          partition-top(more, trev(link(obj-bind, ctor-binds), bind-acc), rest-acc)
+        | s-rec(rl, bind, val) =>
+          partition-top(more,
+            link(A.s-letrec-bind(rl, strip-bind(bind), desugar-expr(val)), bind-acc), rest-acc)
+        | s-type(_, _, _, _) => partition-top(more, bind-acc, rest-acc)       # erased
+        | s-newtype(_, _, _) => partition-top(more, bind-acc, rest-acc)       # erased
+        | s-contract(_, _, _, _) => partition-top(more, bind-acc, rest-acc)   # erased
+        | else => partition-top(more, bind-acc, link(f, rest-acc))            # let/var/expr
+      end
+  end
+end
+
+# Desugar the non-hoisted statements (value `s-let`/`s-var` + expressions) in source
+# order into a nested s-let-expr / expression list.
+fun desugar-rest(stmts :: List<A.Expr>) -> List<A.Expr>:
   cases(List) stmts:
     | empty => empty
     | link(f, rest) =>
       cases(A.Expr) f:
-        | s-fun(_, _, _, _, _, _, _, _, _, _) =>
-          # Collect a run of consecutive s-fun definitions
-          {funs; remaining} = collect-funs(stmts)
-          letrec-binds = tmap(fun-to-letrec-bind, funs)
-          remaining-desugared = desugar-stmts(remaining)
-          [list: A.s-letrec(l, letrec-binds, stmts-to-body(remaining-desugared), false)]
-        | s-data(dl, dname, _, _, variants, _, _, _) =>
-          # bind the data object to a fresh name, then bind each constructor name to
-          # its field of that object (so bare `ctor(args)` / cases over it resolve).
-          data-expr = desugar-expr(f)   # -> s-data-expr
-          objname = "$data$" + dname
-          obj-id = A.s-id(dl, A.s-name(dl, objname))
-          data-bind = A.s-let-bind(dl, A.s-bind(dl, false, A.s-name(dl, objname), A.a-blank), data-expr)
-          ctor-binds = tmap(lam(v):
-            vn = surface-variant-name(v)
-            A.s-let-bind(dl, A.s-bind(dl, false, A.s-name(dl, vn), A.a-blank),
-              A.s-dot(dl, obj-id, vn))
-          end, variants)
-          body = stmts-to-body(desugar-stmts(rest))
-          [list: A.s-let-expr(dl, link(data-bind, ctor-binds), body, false)]
         | s-let(ll, bind, val, _) =>
-          # top-level `x = e` (or tuple-bind `{a; b} = e`) → s-let-expr over the rest
-          body = stmts-to-body(desugar-stmts(rest))
+          body = stmts-to-body(desugar-rest(rest))
           [list: A.s-let-expr(ll, expand-letbind(ll, bind, desugar-expr(val)), body, false)]
         | s-var(ll, bind, val) =>
-          # top-level `var x = e` → s-let-expr with a var-bind over the rest
-          body = stmts-to-body(desugar-stmts(rest))
+          body = stmts-to-body(desugar-rest(rest))
           [list: A.s-let-expr(ll, [list: A.s-var-bind(ll, strip-bind(bind), desugar-expr(val))], body, false)]
-        | s-type(_, _, _, _) => desugar-stmts(rest)        # type alias: erased
-        | s-newtype(_, _, _) => desugar-stmts(rest)        # newtype: erased
-        | s-contract(_, _, _, _) => desugar-stmts(rest)    # `name :: Ann` contract: erased
-        | s-rec(rl, bind, val) =>
-          # top-level `rec x = e` → recursive let (s-letrec) over the remaining statements
-          body = stmts-to-body(desugar-stmts(rest))
-          [list: A.s-letrec(rl, [list: A.s-letrec-bind(rl, strip-bind(bind), desugar-expr(val))], body, false)]
         | else =>
-          link(desugar-expr(f), desugar-stmts(rest))
+          link(desugar-expr(f), desugar-rest(rest))
       end
+  end
+end
+
+fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
+  l = A.dummy-loc
+  {hoisted; rest} = partition-top(stmts, [list:], [list:])
+  body = desugar-rest(rest)
+  if is-empty(hoisted): body
+  else: [list: A.s-letrec(l, hoisted, stmts-to-body(body), false)]
   end
 end
 

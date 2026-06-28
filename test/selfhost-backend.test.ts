@@ -105,12 +105,13 @@ test("self-hosted backend: a function with >512 locals instantiates (no fixed lo
   await expect(runSourceSelfHosted(src)).resolves.toBeDefined();
 });
 
-// THE FIXPOINT BLOCKER (compiler2 runs): top-level FORWARD REFERENCES. The merged compiler's
-// top-level value initializers reference funs/data-ctors defined LATER, so compiler2's main()
-// null-refs at init (the global isn't set yet). Root cause is the DRIVER's desugar-stmts
-// (self-host/compile-driver.arr), which only hoists CONSECUTIVE s-fun runs instead of hoisting
-// ALL top-level fun/data defs into one outer s-letrec (as the seed / real Pyret desugar-scope
-// do). Backend (wasm-of-pyret) is NOT at fault. Un-skip once the driver hoists.
-test.skip("self-hosted: top-level value can forward-reference a later fun (driver hoist)", async () => {
+// FIXED (driver hoist): top-level FORWARD REFERENCES. The merged compiler's top-level value
+// initializers reference funs/data-ctors defined LATER, so compiler2's main() used to null-ref
+// at init (the global wasn't set yet). The driver's desugar-stmts now hoists ALL top-level
+// fun/data/rec definitions into ONE outer s-letrec (initialized before the value bindings) —
+// top-level names are globals, so visibility is total and only init ORDER mattered.
+test("self-hosted: top-level value forward-references a later fun / data-ctor (driver hoist)", async () => {
   await expect(runSourceSelfHosted("x = f(5)\nfun f(n): n + 1 end\nif x == 6: 0 else: 1 / 0 end")).resolves.toBeDefined();
+  await expect(runSourceSelfHosted("y = mk(3)\ndata D: | mk(n) end\nif y.n == 3: 0 else: 1 / 0 end")).resolves.toBeDefined();
+  await expect(runSourceSelfHosted("fun g(): x end\nx = 7\nif g() == 7: 0 else: 1 / 0 end")).resolves.toBeDefined();
 });
