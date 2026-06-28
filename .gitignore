@@ -16,3 +16,6 @@ web/*.map
 # agent worktrees / local state
 .claude/
 probe*.ts
+
+# benchmark scratch
+.bench-tmp/

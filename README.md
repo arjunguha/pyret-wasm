@@ -300,7 +300,7 @@ Targets **WASM-GC + tail calls** only — universal in current browsers since Sa
 
 ## Benchmarks
 
-Three configurations, on Pyret's own `pitometer` programs
+Two configurations, on Pyret's own `pitometer` programs
 (`pyret/lang/pitometer/programs/`). Numbers below were taken on this machine; treat them
 as relative, not absolute.
 
@@ -308,33 +308,45 @@ as relative, not absolute.
 
 | Config | What runs | Harness | Timing |
 |---|---|---|---|
-| **direct Pyret→Wasm (seed)** | `buildSourceFile` (Pyret→CST→binaryen→wasm), then `WebAssembly.instantiate` + call `main` | `bun scripts/bench.ts` on **bun 1.3.14** | best of N; "run" excludes compile |
-| **stoppable Pyret→Wasm** | `buildStoppableSourceFile` (Pyret CPS transform first) run through `runStoppable` with `noYield:true` (raw throughput; still interruptible) | manual driver over the same programs, **bun 1.3.14** | best of 3 |
-| **original Pyret** | a rebuilt `phaseA` standalone (`--build-runnable`), executed with **Node** | `bash scripts/bench-pyret-baseline.sh` on **Node v24** | best of 3; total includes ~183 ms Node+runtime startup |
+| **CPS self-hosted Pyret→WASM (CLI, immediate-resume)** | `web/cps-compile-driver.wasm` — the self-hosted Pyret compiler + CPS stoppability transform, the SAME artifact the web IDE ships, compiled entirely in WASM (no JS seed, no fallback). Emitted module run via immediate-resume trampoline (no event-loop yield — raw throughput). CLI: `pyretc run --stoppable <file.arr>` | `bun scripts/bench-cps.ts 5` on **bun 1.3.14** | best of 5; "run" excludes compile |
+| **original Pyret** | a rebuilt `phaseA` standalone (`--build-runnable`), executed with **Node** | `bash scripts/bench-pyret-baseline.sh` on **Node v24.18.0** | best of 3; total includes ~165 ms Node+runtime startup |
 
-### Results (best of 3, this machine)
+### Results (freshly measured, this machine)
 
-| program | direct Pyret→Wasm (run) | stoppable Pyret→Wasm (run) | original Pyret (compute / total)¹ |
-|---|---|---|---|
-| `adding-ones-2000` | 8.1 ms | 10.3 ms | 22 ms / 205 ms |
-| `recursion-triangle-20000` | **stack overflow** | 8.7 ms | 21 ms / 204 ms |
-| `tail-sum-1000000` | 122.7 ms | 142.6 ms | 97 ms / 280 ms |
+| program | CPS self-hosted Pyret→WASM (run) | original Pyret (compute / total)¹ |
+|---|---|---|
+| `adding-ones-2000` | **compile fail**² | 18 ms / 183 ms |
+| `recursion-triangle-20000` | **5.5 ms** ✓ (was: stack overflow on direct path) | 30 ms / 195 ms |
+| `tail-sum-1000000` | 107 ms | 90 ms / 255 ms |
 
-¹ original-Pyret figures **freshly measured** (`bash scripts/bench-pyret-baseline.sh`, Node
-v24, best of 3, after rebuilding `phaseA` per the recipe above): *total* is wall-clock
-including a ~183 ms Node+runtime startup baseline (a trivial `print(1)`), and *compute* is
-total minus that baseline. The direct/stoppable columns are measured with `bun scripts/bench.ts 5`.
+¹ original-Pyret figures **freshly measured** (`bash scripts/bench-pyret-baseline.sh`, Node v24.18.0,
+best of 3, `phaseA` already built): *total* is wall-clock including a ~165 ms Node+runtime startup
+baseline (a trivial `print(1)`), and *compute* is total minus that baseline. Startup varies slightly
+run-to-run; all compute figures are rounded to the nearest 5 ms.
+
+² `adding-ones-2000` is a single expression with 2000 literal additions. The CPS driver's recursive
+AST traversal hits the JS call stack limit before emitting any code. The original Pyret compiler
+handles it fine because it does not recurse as deeply. This is a compiler-side stack limit, not a
+runtime limit; a trampoline or iterative AST walk in the CPS transform would fix it.
 
 ### Takeaways (honest)
 
-- **Stoppability is nearly free (~1.1–1.3×)** — native WASM tail calls mean the CPS form
-  doesn't trampoline.
-- **CPS *enables* deep non-tail recursion** (`recursion-triangle-20000`) that overflows the
-  direct path's native stack; original Pyret survives the same case via its own Stopify
-  trampoline.
-- Our WASM **beats original Pyret on the short programs** (no ~183 ms Node startup).
-- Original Pyret **wins `tail-sum`**: `js-numbers` keeps sums under 2⁵³ *unboxed*, while our
-  runtime allocates a `$Fixnum` every step — a concrete optimization target (see Next steps).
+- **`recursion-triangle-20000` now RUNS under the CPS path** — 5.5 ms versus a stack overflow on the
+  direct seed path. CPS converts deep non-tail recursion into native WASM tail calls, so arbitrarily
+  deep non-tail recursion becomes constant-stack. Original Pyret survives the same case via its own
+  Stopify trampoline (~30 ms compute).
+- **CPS self-hosted is the SAME artifact the web IDE ships** — no separate seed compile, no JS codegen
+  at runtime. The CLI flag `pyretc run --stoppable` exercises the identical path.
+- **`tail-sum` is close** (107 ms vs 90 ms compute). Our runtime allocates a `$Fixnum` GC object every
+  step; `js-numbers` keeps sums under 2⁵³ unboxed. An unboxed-i64 fast path would close this gap.
+- **`adding-ones-2000` compile fails** — a compiler stack-depth bug, not a runtime issue. Not a
+  regression; the direct seed path compiles it fine. Fix is an iterative CPS AST walk.
+- Compile times (best-of-1): triangle ~555 ms, tail-sum ~430 ms. These run once at startup and
+  are not included in the "run" column. Compile performance is a future optimization target.
+
+Methodology: `bun 1.3.14`, Node v24.18.0; all figures machine-relative, not absolute. Config B
+"run" = best-of-5 wall-clock, prelude prepended, immediate-resume (no setTimeout between pauses).
+Config A startup baseline = average of three `trivial` (`print(1)`) measurements (~165 ms).
 
 ---
 
