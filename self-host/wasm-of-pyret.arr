@@ -449,13 +449,24 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
           # The closure is used twice (passed as arg0 AND its fnIndex is the table selector),
           # so stash it in a temp local. Stack order for call_indirect: [arg0=closure,
           # arg1=fields, selector=closure.fnIndex].  tyidx = the closure-call func type.
-          cl = c.next-local
+          # A method taken as a VALUE (`f = o.m`) is a $Method wrapping a $Closure — unwrap
+          # it so it's callable, else `ref.cast T-CLOSURE` traps.
+          cl   = c.next-local        # the callee value as evaluated (anyref)
+          clos = c.next-local + 1    # the actual $Closure ($Method unwrapped)
+          c2 = ctx(c.locals, c.next-local + 2, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
           tyidx = closure-call-type-idx()
-          compile-aval(f, c)
+          compile-aval(f, c2)
             .append(E.local-set(cl))
-            .append(E.local-get(cl))                                  # arg0: the closure
-            .append(pack-fields(args, c))                             # arg1: args as $Fields
-            .append(E.local-get(cl)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))  # selector
+            .append(E.local-get(cl)).append(E.ref-test-null(T-METHOD))   # is the callee a $Method?
+            .append(E.i-if(ANYREF-BT))
+            .append(E.local-get(cl)).append(E.ref-cast(T-METHOD)).append(E.struct-get(T-METHOD, 0))  # its $Closure
+            .append(E.i-else)
+            .append(E.local-get(cl))                                  # already a $Closure
+            .append(E.i-end)
+            .append(E.local-set(clos))
+            .append(E.local-get(clos))                                # arg0: the closure
+            .append(pack-fields(args, c2))                            # arg1: args as $Fields
+            .append(E.local-get(clos)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))  # selector
             .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
       end
     | a-prim-app(l, fname, args, info) => compile-prim-app(fname, args, c)
