@@ -456,7 +456,7 @@ fun compile-prim-app(fname :: String, args, c :: Ctx) -> List<Number>:
         # loop — the browser renders this line and Stop is serviced before the next print.
         # In non-CPS code there are no yield-checks, so this is a harmless global write.
         .append(E.i32-const(0)).append(E.global-set(R.GI-GAS))
-        .append(E.local-get(v))                                     # result = the value
+        .append(E.i32-const(2)).append(E.ref-i31)                   # print returns nothing (Pyret)
     # ---- control-flow aborts + the unmapped tail -> $raise host import ----
     | throw-prims.member(fname) then: raise-instr()
     | otherwise: raise-instr()   # TODO(port): makeArrayN, getMaker*, getColonField, getBracket, makeSome/None, run-task...
@@ -681,10 +681,21 @@ fun compile-finish-result(value, c :: Ctx) -> List<Number> block:
   E.concat-bytes([list:
     compile-aval(value, c2), E.local-set(v),
     E.local-get(v), E.global-set(R.GI-RESULT),                 # stash final result
-    E.i32-const(R.SCRATCH-OFFSET),                              # addr (under the len)
-    E.local-get(v), E.i-call(rt-funcidx("$val_to_string")),    # render -> len
-    E.i-call(host-funcidx("print")),                           # print(addr, len)
-    E.i32-const(2), E.ref-i31 ])                               # nothing
+    # Display the result UNLESS it is `nothing` (the i31 whose value is 2). Pyret doesn't
+    # echo `nothing`; and since print/`:=`/when now return nothing, an explicit print as the
+    # last expression no longer double-prints (print emits the line; this skips the echo).
+    E.local-get(v), E.ref-test(I31-HT), E.i-if([list: 127]),   # is the result an i31?
+      E.local-get(v), E.ref-cast(I31-HT), E.i31-get-s, E.i32-const(2), E.i32-eq,  # i31 == 2 -> nothing
+    E.i-else,
+      E.i32-const(0),                                          # non-i31 -> not nothing
+    E.i-end,
+    E.i32-eqz,                                                 # 1 if NOT nothing
+    E.i-if([list: 64]),                                        # then: render + print the value
+      E.i32-const(R.SCRATCH-OFFSET),                           # addr (under the len)
+      E.local-get(v), E.i-call(rt-funcidx("$val_to_string")), # render -> len
+      E.i-call(host-funcidx("print")),                        # print(addr, len)
+    E.i-end,
+    E.i32-const(2), E.ref-i31 ])                               # finish-result returns nothing
 end
 
 # cps-op-<op>(a, b, k): if a is a number (or string for PLUS), feed the primitive result to

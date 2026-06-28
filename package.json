@@ -10,6 +10,7 @@
   "scripts": {
     "pyretc": "bun run src/cli.ts",
     "test": "bun test ./test",
+    "test:par": "bun scripts/test-par.ts",
     "build:web": "bun scripts/gen-cps-compile-driver.ts && bun build web/main.ts --target=browser --sourcemap=linked --outfile=web/main.bundle.js",
     "serve": "bun scripts/serve.ts"
   },
