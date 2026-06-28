@@ -417,7 +417,6 @@ test("self-hosted: variant field access via a-dot (a(5).x)", async () => {
   expect(result.error).toBeUndefined();
 });
 
-<<<<<<< HEAD
 // ── driver-desugar forms: op^ (reverse app), op<> (not-equal), ask:, when ─────
 const EXPECT = "fun expect(v, e): if v == e: 0 else: 1 / 0 end end\n";
 
