@@ -205,7 +205,14 @@ intrinsic-names :: List<String> = [list:
   "num-modulo", "num-quotient", "num-expt", "num-to-roughnum", "num-is-roughnum",
   "num-floor", "num-ceiling", "num-round", "num-is-integer", "num-to-rational",
   "prim-raw-array-get", "prim-raw-array-set", "prim-raw-array-length", "prim-raw-array-of",
-  "time-now", "read-source", "emit-byte" ]
+  "time-now", "read-source", "emit-byte",
+  # CPS stoppability intrinsics (call-only; lowered in compile-cps-intrinsic). Like the
+  # other intrinsics they have NO runtime value, so excluding them from lambda captures
+  # is essential — otherwise a CPS'd body (every fn body is `yield-check(lam(): ... end)`)
+  # would bind them as null caps, bypass the dispatch, and null-trap on call.
+  "yield-check", "finish-result",
+  "cps-op-plus", "cps-op-minus", "cps-op-times", "cps-op-divide",
+  "cps-op-lessthan", "cps-op-greaterthan", "cps-op-lessequal", "cps-op-greaterequal" ]
 fun name-is-intrinsic(id) -> Boolean:
   cases(A.Name) id:
     | s-name(_, s) => intrinsic-names.member(s)
@@ -596,6 +603,144 @@ fun find-arith(tbl, key :: String):
   end
 end
 
+# ===== stoppable (CPS) codegen intrinsics =====
+# The CPS pass (self-host/cps.arr, mirrored by src/compiler/cps.ts) rewrites the program
+# into continuation-passing style and emits three intrinsic call families the backend must
+# lower (the seed lowers them in compile.ts; this is the self-hosted port):
+#   yield-check(thunk)            -- per-fn/loop interrupt point  -> runtime $yield (tail)
+#   finish-result(v)             -- the halt continuation         -> stash $result + print
+#   cps-op-<op>(a, b, k)         -- overloadable binop threading k -> num path or CPS method
+# These are emitted as calls to FREE globals (yield-check / finish-result / cps-op-plus ...),
+# so they're dispatched here only when the name is NOT locally/top-level bound (shadowable).
+
+# cps-op-<name> -> the op code (PLUS/DASH/.../GEQ), else none.
+fun cps-op-code(nm :: String) -> Option:
+  ask:
+    | nm == "cps-op-plus" then: some("PLUS")
+    | nm == "cps-op-minus" then: some("DASH")
+    | nm == "cps-op-times" then: some("TIMES")
+    | nm == "cps-op-divide" then: some("SLASH")
+    | nm == "cps-op-lessthan" then: some("LT")
+    | nm == "cps-op-greaterthan" then: some("GT")
+    | nm == "cps-op-lessequal" then: some("LEQ")
+    | nm == "cps-op-greaterequal" then: some("GEQ")
+    | otherwise: none
+  end
+end
+# op code -> the runtime fn for the numeric/string path (these dispatch num internally).
+fun cps-op-rt(opc :: String) -> String:
+  ask:
+    | opc == "PLUS" then: "$plus"  | opc == "DASH" then: "$minus"
+    | opc == "TIMES" then: "$times" | opc == "SLASH" then: "$divide"
+    | opc == "LT" then: "$lessthan" | opc == "GT" then: "$greaterthan"
+    | opc == "LEQ" then: "$lessequal" | otherwise: "$greaterequal"
+  end
+end
+# op code -> the data-overload method name (a._plus(b, k) etc.).
+fun cps-op-method(opc :: String) -> String:
+  ask:
+    | opc == "PLUS" then: "_plus"  | opc == "DASH" then: "_minus"
+    | opc == "TIMES" then: "_times" | opc == "SLASH" then: "_divide"
+    | opc == "LT" then: "_lessthan" | opc == "GT" then: "_greaterthan"
+    | opc == "LEQ" then: "_lessequal" | otherwise: "_greaterequal"
+  end
+end
+
+# yield-check(thunk): compile the thunk arg and (tail-)call the runtime $yield, which does
+# the gas/pause bookkeeping then tail-calls the thunk. Tail-call-to-tail-call keeps the
+# stack flat (the whole point of CPS over native return_call).
+fun compile-yield-check(thunk, c :: Ctx, tail :: Boolean) -> List<Number>:
+  compile-aval(thunk, c)
+    .append(if tail: E.i-return-call(rt-funcidx("$yield")) else: E.i-call(rt-funcidx("$yield")) end)
+end
+
+# finish-result(v): stash v in $result, render+print it (matching the non-stoppable last-
+# expression printing), then return nothing. Mirrors compile.ts compileFinishResult.
+fun compile-finish-result(value, c :: Ctx) -> List<Number> block:
+  v = c.next-local
+  max-local-used := num-max(max-local-used, v + 1)
+  c2 = ctx(c.locals, c.next-local + 1, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  E.concat-bytes([list:
+    compile-aval(value, c2), E.local-set(v),
+    E.local-get(v), E.global-set(R.GI-RESULT),                 # stash final result
+    E.i32-const(R.SCRATCH-OFFSET),                              # addr (under the len)
+    E.local-get(v), E.i-call(rt-funcidx("$val_to_string")),    # render -> len
+    E.i-call(host-funcidx("print")),                           # print(addr, len)
+    E.i32-const(2), E.ref-i31 ])                               # nothing
+end
+
+# cps-op-<op>(a, b, k): if a is a number (or string for PLUS), feed the primitive result to
+# the continuation k; otherwise tail-dispatch the CPS operator method a._op(b, k) so a data
+# overload (now CPS'd with a trailing continuation) stays reachable + interruptible.
+# Mirrors compile.ts compileCpsOp.
+fun compile-cps-op(opc :: String, args, c :: Ctx, tail :: Boolean) -> List<Number> block:
+  base = c.next-local
+  a-loc = base
+  b-loc = base + 1
+  k-loc = base + 2
+  fldl = base + 3      # method-dispatch: looked-up field
+  cll = base + 4       # method-dispatch: the cast $Closure
+  max-local-used := num-max(max-local-used, base + 5)
+  c2 = ctx(c.locals, base + 5, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  tyidx = closure-call-type-idx()
+  meth-name = cps-op-method(opc)
+  # primitive result (a, b are num/str here): rt fn (anyref, anyref) -> anyref.
+  prim-result = E.local-get(a-loc).append(E.local-get(b-loc)).append(E.i-call(rt-funcidx(cps-op-rt(opc))))
+  # numeric/string path: k(prim-result)  -- a 1-arg (tail-aware) closure call.
+  num-path = E.local-get(k-loc)
+    .append(prim-result).append(E.array-new-fixed(T-FIELDS, 1))
+    .append(E.local-get(k-loc)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))
+    .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+  # method path: a.<meth>(b, k) via $lookup_method (mirrors a-method-app).
+  call-args = pack-instrs([list: E.local-get(a-loc), E.local-get(b-loc), E.local-get(k-loc)])
+  method-path = E.local-get(fldl).append(E.ref-cast(T-METHOD)).append(E.struct-get(T-METHOD, 0)).append(E.local-set(cll))
+    .append(E.local-get(cll)).append(call-args)
+    .append(E.local-get(cll)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))
+    .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+  plain-path = E.local-get(fldl).append(E.ref-cast(T-CLOSURE)).append(E.local-set(cll))
+    .append(E.local-get(cll)).append(call-args)
+    .append(E.local-get(cll)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))
+    .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+  meth-dispatch = E.local-get(a-loc).append(emit-str(meth-name)).append(E.i-call(rt-funcidx("$lookup_method")))
+    .append(E.local-set(fldl))
+    .append(E.local-get(fldl)).append(E.ref-test-null(T-METHOD))
+    .append(E.i-if(ANYREF-BT)).append(method-path).append(E.i-else).append(plain-path).append(E.i-end)
+  is-num = E.local-get(a-loc).append(E.ref-test-null(T-NUM))
+  cond = if opc == "PLUS":
+      is-num.append(E.local-get(a-loc)).append(E.ref-test-null(T-STR)).append(E.i32-or)
+    else: is-num end
+  E.concat-bytes([list:
+    compile-aval(args.get(0), c2), E.local-set(a-loc),
+    compile-aval(args.get(1), c2), E.local-set(b-loc),
+    compile-aval(args.get(2), c2), E.local-set(k-loc),
+    cond, E.i-if(ANYREF-BT), num-path, E.i-else, meth-dispatch, E.i-end ])
+end
+
+# Dispatch a CPS stoppability intrinsic call, if the callee is an unbound global matching one.
+fun compile-cps-intrinsic(f, args, c :: Ctx, tail :: Boolean) -> Option:
+  cases(Option) intrinsic-name-of(f):
+    | none => none
+    | some(nm) =>
+      ikey = cases(N.AVal) f: | a-id(_, iid) => name-key(iid) | else => "" end
+      ibound = cases(Option) lookup-local-opt(c, ikey):
+        | some(_) => true
+        | none => cases(Option) gmap-lookup(c, ikey): | some(_) => true | none => false end
+      end
+      if ibound: none
+      else:
+        ask:
+          | (nm == "yield-check") and (length(args) == 1) then: some(compile-yield-check(args.first, c, tail))
+          | (nm == "finish-result") and (length(args) == 1) then: some(compile-finish-result(args.first, c))
+          | otherwise:
+            cases(Option) cps-op-code(nm):
+              | none => none
+              | some(opc) => if length(args) == 3: some(compile-cps-op(opc, args, c, tail)) else: none end
+            end
+        end
+      end
+  end
+end
+
 # ===== ALettable -> instructions (leaves the value; `tail` => return_call) =====
 fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
   cases(N.ALettable) lt:
@@ -614,6 +759,9 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       end
     | a-id-var-modref(l, id, uri, name) => E.i-ref-null(110)                # TODO(port): module ref
     | a-app(l, f, args, info) =>
+      cases(Option) compile-cps-intrinsic(f, args, c, tail):
+        | some(cinstrs) => cinstrs
+        | none =>
       # Fast path: well-known Pyret global arithmetic/comparison operators that desugar
       # emits as s-app(s-id(s-global("_plus")), [a, b]) etc. These map directly to
       # runtime functions that take (anyref, anyref) -> anyref and need no closure wrap.
@@ -686,6 +834,7 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
             .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
           end
           end
+      end
       end
     | a-prim-app(l, fname, args, info) => compile-prim-app(fname, args, c)
     | a-if(l, cnd, t, e) =>
@@ -1296,6 +1445,17 @@ fun compile-prog(prog) -> List<Number>:
           compile-aexpr(body, main-ctx, false), check-summary-instrs])
       end
       main-code = E.code-entry(locals-decl(0), main-body-bytes)
+      # ----- resume (() -> anyref): tail-call the captured continuation ($paused-thunk).
+      # The JS trampoline (run-stoppable.ts) calls the exported `resume` after each pause
+      # (do_pause throw). 0 locals; validates even with no closures (the table is always
+      # declared). Sits right after main in the funcidx space. Mirrors the seed's $resume.
+      resume-funcidx = main-funcidx + 1
+      resume-body = E.concat-bytes([list:
+        E.global-get(R.GI-PAUSED-THUNK),                                    # arg0: the thunk closure
+        E.array-new-fixed(T-FIELDS, 0),                                     # arg1: empty $Fields
+        E.global-get(R.GI-PAUSED-THUNK), E.ref-cast(T-CLOSURE), E.struct-get(T-CLOSURE, 0),  # selector
+        E.i-return-call-indirect(closure-call-type-idx(), 0) ])
+      resume-code = E.code-entry(empty, resume-body)
       lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry
@@ -1317,7 +1477,7 @@ fun compile-prog(prog) -> List<Number>:
       rt-func-decls = range(0, num-rt).map(lam(i): E.leb-u(NUM-GC-TYPES + i) end)
       lam-func-decls = range(0, num-lams).map(lam(_): E.leb-u(closure-call-type-idx()) end)
       ctor-func-decls = range(0, num-ctors).map(lam(_): E.leb-u(closure-call-type-idx()) end)
-      func-c = E.vec(rt-func-decls.append(lam-func-decls).append(ctor-func-decls).append([list: E.leb-u(main-type-idx())]))
+      func-c = E.vec(rt-func-decls.append(lam-func-decls).append(ctor-func-decls).append([list: E.leb-u(main-type-idx()), E.leb-u(main-type-idx())]))
 
       # ----- table + element segment: lambda funcidxs then ctor funcidxs -----
       # ALWAYS declare table 0 (even size 0): the runtime kernels themselves use
@@ -1353,10 +1513,11 @@ fun compile-prog(prog) -> List<Number>:
 
       # ----- exports: main (func 0) + the memory (so the host reads rendered strings) -----
       export-c = E.vec([list: E.export-entry("main", 0, main-funcidx),
+                              E.export-entry("resume", 0, resume-funcidx),
                               E.export-entry("memory", 2, 0)])
 
       # ----- code section -----
-      code-c = E.vec(rt-code.append(lam-code).append(ctor-code).append([list: main-code]))
+      code-c = E.vec(rt-code.append(lam-code).append(ctor-code).append([list: main-code, resume-code]))
 
       E.wasm-module-of(type-c, import-c, func-c, table-c, mem-c, global-c, export-c, elem-c, code-c)
   end

@@ -63,21 +63,34 @@ GI-LINK-ID = 0
 GI-EMPTY-ID = 1
 GI-PASSED = 2
 GI-TOTAL = 3
-NUM-RT-GLOBALS = 4
-GI-VARIANT-NAMES = 4    # first global after the runtime block (when variants exist)
-GI-VARIANT-METHODS = 5  # (ref null $Fields): per-variant-id methods object, set at each
+# Stoppable (CPS) codegen globals. yield-check ($yield) decrements $gas and, at 0, stashes
+# the captured continuation in $paused-thunk and host-throws (do_pause) back to the JS
+# trampoline (run-stoppable.ts), which resumes by calling the exported `resume` (which
+# tail-calls $paused-thunk). $result holds the final value (finish-result). MIRRORS the
+# seed (src/compiler/runtime.ts $gas/$paused_thunk/$result + compile.ts compileYieldCheck).
+GI-GAS = 4
+GI-PAUSED-THUNK = 5
+GI-RESULT = 6
+NUM-RT-GLOBALS = 7
+GI-VARIANT-NAMES = 7    # first global after the runtime block (when variants exist)
+GI-VARIANT-METHODS = 8  # (ref null $Fields): per-variant-id methods object, set at each
                         # a-data-expr; consumed by $lookup_method for method dispatch.
+# yield-check ticks between event-loop yields (mirrors seed GAS_RESET).
+GAS-RESET = 100000
 
 # fixed scratch region in linear memory for marshalling strings to the host (runtime.ts).
 SCRATCH-OFFSET = 1024
 
-# the 4 fixed runtime globals, in index order, for the assembler to emit.
+# the fixed runtime globals, in index order, for the assembler to emit.
 fun rt-globals() -> List:
   [list:
-    E.global-entry(i32t, 1, E.i32-const(0 - 1)),   # $link_id  = -1
-    E.global-entry(i32t, 1, E.i32-const(0 - 1)),   # $empty_id = -1
-    E.global-entry(i32t, 1, E.i32-const(0)),       # $passed   = 0
-    E.global-entry(i32t, 1, E.i32-const(0)) ]      # $total    = 0
+    E.global-entry(i32t, 1, E.i32-const(0 - 1)),       # $link_id      = -1
+    E.global-entry(i32t, 1, E.i32-const(0 - 1)),       # $empty_id     = -1
+    E.global-entry(i32t, 1, E.i32-const(0)),           # $passed       = 0
+    E.global-entry(i32t, 1, E.i32-const(0)),           # $total        = 0
+    E.global-entry(i32t, 1, E.i32-const(GAS-RESET)),   # $gas          = GAS-RESET
+    E.global-entry(anyref, 1, E.i-ref-null(110)),      # $paused-thunk = null
+    E.global-entry(anyref, 1, E.i-ref-null(110)) ]     # $result       = null
 end
 
 # value-type byte shorthands
@@ -1097,7 +1110,32 @@ fun emit-check-pred() -> RtFun:
 end
 
 # ===== CPS stop-button primitives (compile.arr adds these in {stoppable}) =====
-fun emit-yield() -> RtFun: todo("$yield", "decrement $gas; if>0 tail-call thunk closure; else reset+store paused_thunk+call $do_pause; unreachable") end
+# $yield(thunk): the per-function/loop interrupt point the CPS pass inserts (as
+# `yield-check(lam(): rest end)`). Burns one gas tick and TAIL-CALLS the thunk to
+# continue; when gas is exhausted, resets gas, captures the thunk in $paused-thunk,
+# and host-throws (do_pause) to unwind to the JS trampoline (run-stoppable.ts), which
+# resumes via the exported `resume`. Because BOTH the call to $yield (from yield-check's
+# lowering) and $yield's call to the thunk are native tail calls, the stack stays flat —
+# the captured thunk is the entire rest of the program. Mirrors compile.ts compileYieldCheck.
+fun emit-yield() -> RtFun:
+  # param local 0 = thunk (anyref, a $Closure). local 1 = the cast (ref $Closure).
+  body = seq([list:
+    E.global-get(GI-GAS), E.i32-const(0), E.i32-gt-s,
+    ifel-bt(E.bt-empty,
+      [list: seq([list: E.global-get(GI-GAS), E.i32-const(1), E.i32-sub, E.global-set(GI-GAS)])],
+      [list: seq([list:
+        E.i32-const(GAS-RESET), E.global-set(GI-GAS),
+        E.local-get(0), E.global-set(GI-PAUSED-THUNK),
+        E.i-call(host-import-index("do_pause")) ])]),     # throws PauseSignal; never returns here
+    # tail-call the 0-arg thunk: [closure, empty $Fields, selector] -> return_call_indirect
+    E.local-get(0), E.ref-cast(T-CLOSURE), E.local-set(1),
+    E.local-get(1),
+    E.array-new-fixed(T-FIELDS, 0),
+    E.local-get(1), E.struct-get(T-CLOSURE, 0),
+    E.i-return-call-indirect(closure-call-tyidx(), 0) ]).append(E.end-instr)
+  rt-fun("$yield", [list: anyref], [list: anyref],
+    [list: E.local-decl(1, E.reft(T-CLOSURE))], body)
+end
 
 # The full ordered list (indices must match compile.arr's references).
 all-runtime-funs :: List<String> = [list:
