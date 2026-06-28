@@ -300,9 +300,11 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       end))
 
     | s-extend(loc, obj, fields) =>
-      A.s-extend(loc, desugar-expr(obj), fields.map(lam(f):
-        A.s-data-field(f.l, f.name, desugar-expr(f.value))
-      end))
+      # desugar-member handles BOTH s-data-field and s-method-field (the latter -> a
+      # data-field carrying an s-method value); reading f.value directly crashed on
+      # method fields (they have .body, not .value) — the `default-map-visitor.{ method
+      # ... }` extend idiom that blocked ast-util/desugar-check/type-check/etc.
+      A.s-extend(loc, desugar-expr(obj), fields.map(desugar-member))
 
     | s-obj(loc, fields) =>
       # desugar-member handles BOTH s-data-field and s-method-field (the latter -> a
