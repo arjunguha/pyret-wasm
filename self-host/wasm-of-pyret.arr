@@ -64,6 +64,7 @@ fun rt-funcidx(name :: String) -> Number: NUM-IMPORTS + rt-index(name) end
 fun host-funcidx(name :: String) -> Number: R.host-import-index(name) end
 fun idx-make-fix(): rt-funcidx("$make_fix") end
 fun idx-make-rough(): rt-funcidx("$make_rough") end
+fun idx-make-rat(): rt-funcidx("$make_rat") end
 fun idx-make-object(): rt-funcidx("$make_object") end
 fun idx-obj-get(): rt-funcidx("$obj_get") end
 fun idx-obj-extend(): rt-funcidx("$obj_extend") end
@@ -268,21 +269,29 @@ fun load-capture(c :: Ctx, key) -> List<Number>:
   end
 end
 
+# Smallest denominator d>=1 making n*d an exact integer. n is an exact non-integer
+# rational; since n is already reduced this yields the REDUCED num/den (num = n*d).
+# (num-numerator/num-denominator aren't seed builtins, hence this minimal-den search.)
+fun find-min-den(n, d :: Number) -> Number:
+  if num-is-integer(n * d): d else: find-min-den(n, d + 1) end
+end
+
 # ===== AVal -> instructions (leaves one anyref on the stack) =====
 fun compile-aval(v, c :: Ctx) -> List<Number>:
   cases(N.AVal) v:
     | a-num(l, n) =>
-      # roughnum literal (~3.14) -> $make_rough(f64); exact integer -> $make_fix(i64).
-      # (Exact rational/bignum literals still TODO(port): need $make_rat / bignum limbs.)
-      # BUG(roughnum-literal): a ROUGH n traps with "ref.cast failed" because encoder's
-      # f64-bits does Pyret arithmetic that stays rough on rough input — `num-floor(rough)`
-      # returns a rough (not an exact int), so the byte/split-le computation is corrupt.
-      # `num-to-rational(n)` would make it exact BUT is LOSSY here (truncates: ~3.14->3,
-      # ~0.5->0), giving wrong values — so NOT used. Needs a faithful roughnum->f64-bits
-      # (a host import, or exact dyadic extraction). Blocks constants.arr/checker.arr.
+      # roughnum literal (~3.14) -> $make_rough(f64); exact integer -> $make_fix(i64);
+      # exact non-integer (rational, e.g. 1/2, 3.14=157/50) -> $make_rat($make_fix(num),
+      # $make_fix(den)) with the reduced num/den from the minimal-denominator search.
+      # (Bignum literals beyond i64 are still TODO(port): need $Bignum limbs.)
       if num-is-roughnum(n): E.f64-const(n).append(E.i-call(idx-make-rough()))
       else if num-is-integer(n): E.i64-const(n).append(E.i-call(idx-make-fix()))
-      else: raise("a-num: exact rational/bignum literal not yet supported (need $make_rat): " + tostring(n))
+      else:
+        den = find-min-den(n, 1)
+        num = n * den                            # exact integer (n is reduced -> so are num/den)
+        E.i64-const(num).append(E.i-call(idx-make-fix()))
+          .append(E.i64-const(den)).append(E.i-call(idx-make-fix()))
+          .append(E.i-call(idx-make-rat()))
       end
     | a-str(l, s) => emit-str(s)
     | a-bool(l, b) => E.i32-const(if b: 1 else: 0 end).append(E.ref-i31)

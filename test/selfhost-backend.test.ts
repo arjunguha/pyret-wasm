@@ -69,6 +69,14 @@ test("self-hosted backend: roughnum literals compile + run (faithful f64-bits, n
   }
 });
 
+// EXACT-RATIONAL LITERALS: `1/2`, `3.14`(=157/50) compile to a $Rational via $make_rat
+// (num/den extracted by the minimal-denominator search in a-num) and render as "num/den".
+// This was the LAST self-compile blocker for the merged compiler (compiler2 now builds).
+test("self-hosted backend: exact-rational literals compile, run + render num/den", async () => {
+  expect(await selfHosted("print(1/2)")).toBe("1/2");
+  expect(await selfHosted("print(3.14)")).toBe("157/50");
+});
+
 // Rough number TOWER (self-host/runtime.arr): rendering ($render_rough) + arithmetic /
 // comparison with Pyret contagion (any rough operand -> rough result). Previously
 // $render_num printed the "roughnum" placeholder and rough ops ref.cast-trapped.

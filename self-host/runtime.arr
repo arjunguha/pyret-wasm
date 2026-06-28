@@ -191,9 +191,17 @@ fun emit-make-rough() -> RtFun:
   rt-fun("$make_rough", [list: f64t], [list: E.reft(T-NUM)], empty, body)
 end
 
-# $make_rat(num :: $Num, den :: $Num) -> $Num : gcd-reduce then struct.new $Rational
+# $make_rat(num :: $Num, den :: $Num) -> $Num : struct.new $Rational {TAG-RAT,num,den}.
+# Literal num/den arrive already-reduced + den>0 (the a-num extractor uses the minimal
+# denominator), so no gcd/sign-normalize is needed here. (Reduction for general rational
+# ARITHMETIC results is a separate TODO(port): $gcd.)
 fun emit-make-rat() -> RtFun:
-  todo("$make_rat", "reduce num/den via $gcd, normalize sign, struct.new $Rational {TAG-RAT,num,den}")
+  body = E.i32-const(TAG-RAT)
+    .append(E.local-get(0))                 # num :: (ref $Num)
+    .append(E.local-get(1))                 # den :: (ref $Num)
+    .append(E.struct-new(T-RAT))
+    .append(E.end-instr)
+  rt-fun("$make_rat", [list: E.reft(T-NUM), E.reft(T-NUM)], [list: E.reft(T-NUM)], empty, body)
 end
 
 # ===== number tower: ops (FIXNUM + ROUGH; rational/bignum still TODO) =====
@@ -360,7 +368,16 @@ fun emit-to-f64() -> RtFun:
   body = E.local-get(0).append(E.struct-get(T-NUM, 0)).append(E.i32-const(TAG-ROUGH)).append(E.i32-eq)
     .append(ifel-bt(f64t,
         [list: E.local-get(0), E.ref-cast(T-ROUGH), E.struct-get(T-ROUGH, 1)],
-        [list: E.local-get(0), E.ref-cast(T-FIX), E.struct-get(T-FIX, 1), E.f64-convert-i64-s]))
+        [list:
+          E.local-get(0), E.struct-get(T-NUM, 0), E.i32-const(TAG-RAT), E.i32-eq,
+          ifel-bt(f64t,
+            # rational: to_f64(num) / to_f64(den)
+            [list:
+              E.local-get(0), E.ref-cast(T-RAT), E.struct-get(T-RAT, 1), rt-call("$to_f64"),
+              E.local-get(0), E.ref-cast(T-RAT), E.struct-get(T-RAT, 2), rt-call("$to_f64"),
+              E.f64-div],
+            # fixnum
+            [list: E.local-get(0), E.ref-cast(T-FIX), E.struct-get(T-FIX, 1), E.f64-convert-i64-s])]))
     .append(E.end-instr)
   rt-fun("$to_f64", [list: E.reft(T-NUM)], [list: f64t], empty, body)
 end
@@ -423,17 +440,26 @@ fun emit-render-rough() -> RtFun:
            E.local-decl(1, i32t), E.local-decl(2, i64t)], body)
 end
 # $render_num(v :: $Num, addr :: i32) -> i32 end-addr. Roughnums via $render_rough;
-# everything else uses the fixnum decimal path (exact rational/bignum render still TODO).
+# rationals as "num/den" (recursive render of each $Num part); else the fixnum decimal path.
+# Local 2 (i32) holds the mid-address (after the numerator + the '/').
 fun emit-render-num() -> RtFun:
   body = blk(i32t, [list:
       E.local-get(0), E.struct-get(T-NUM, 0), E.i32-const(TAG-ROUGH), E.i32-eq, iff([list:
         E.local-get(0), E.ref-cast(T-ROUGH), E.struct-get(T-ROUGH, 1), E.local-get(1), rt-call("$render_rough"),
         E.i-br(1) ]),
+      # rational: a1 = render_num(num, addr); store '/' at a1; render_num(den, a1+1) -> end-addr
+      E.local-get(0), E.struct-get(T-NUM, 0), E.i32-const(TAG-RAT), E.i32-eq, iff([list:
+        E.local-get(0), E.ref-cast(T-RAT), E.struct-get(T-RAT, 1), E.local-get(1), rt-call("$render_num"),
+        E.local-set(2),
+        E.local-get(2), E.i32-const(47), E.i32-store8,                 # '/'
+        E.local-get(0), E.ref-cast(T-RAT), E.struct-get(T-RAT, 2),
+        E.local-get(2), E.i32-const(1), E.i32-add, rt-call("$render_num"),
+        E.i-br(1) ]),
       # fixnum: addr + $write_i64((cast $Fixnum).payload, addr)
       E.local-get(1),
       E.local-get(0), E.ref-cast(T-FIX), E.struct-get(T-FIX, 1), E.local-get(1), rt-call("$write_i64"),
       E.i32-add ]).append(E.end-instr)
-  rt-fun("$render_num", [list: E.reft(T-NUM), i32t], [list: i32t], empty, body)
+  rt-fun("$render_num", [list: E.reft(T-NUM), i32t], [list: i32t], [list: E.local-decl(1, i32t)], body)
 end
 # $num_to_string(v) -> i32 length written at SCRATCH-OFFSET.
 fun emit-num-to-string() -> RtFun:
