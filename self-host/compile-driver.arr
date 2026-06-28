@@ -338,7 +338,10 @@ end
 # would read a null module value -> ref.cast. We flatten it to the bare global `member`,
 # detecting a module alias by Pyret naming convention: a Capitalized head whose `member` is a
 # known top-level global (modules/types are Capitalized; values/`self`/locals are lowercase,
-# so real field access like `self.flat-width` is never flattened). `shadow-exports` maps a
+# so real field access like `self.flat-width` is never flattened). The lowercase builtin
+# module alias `lists` is the one exception (e.g. `lists.any`, `lists.fold`) — it is never a
+# local value, and the `top-globals.member(field)` guard keeps real field access safe.
+# `shadow-exports` maps a
 # module-level shadowed surface name to its resolve-shadows fresh name, so `PP.str` resolves
 # to pprint's SMART ctor (the final binding) rather than the raw variant ctor.
 var top-globals :: List<String> = [list:]
@@ -562,7 +565,7 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
 
     | s-dot(loc, obj, field) =>
       is-modref = cases(A.Expr) obj:
-        | s-id(_, nm) => A.is-s-name(nm) and is-uppercase-start(nm.s)
+        | s-id(_, nm) => A.is-s-name(nm) and (is-uppercase-start(nm.s) or (nm.s == "lists"))
             and (top-globals.member(field) or is-variant-pred-name(field))
         | else => false
       end

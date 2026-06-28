@@ -290,13 +290,26 @@ fun box-read(idx :: Number) -> List<Number>:
   # cast anyref local to (ref $Fields) before array.get (WASM requires the concrete type)
   E.local-get(idx).append(E.ref-cast(T-FIELDS)).append(E.i32-const(0)).append(E.array-get(T-FIELDS))
 end
-# load a free var's CURRENT value at a capture site: just local-get its local. For a `var`
-# that local already holds the 1-cell BOX, so the box (not the value) is captured -> shared
-# mutation. A name not bound as a local (e.g. a top-level def) captures as null. TODO(port).
+# load a free var's CURRENT value at a capture site. For a `var` the local already holds the
+# 1-cell BOX, so the box (not the value) is captured -> shared mutation. A name not bound as a
+# local (e.g. a top-level def) captures as null. TODO(port).
+#
+# bind-caps (in the lambda) decides box-vs-plain for a capture by GLOBAL gvars membership,
+# which is keyed by surface name and so conflates a plain local with a same-named top-level
+# var (e.g. a cases-branch param `field` shadowing a top-level `field` def). When that happens
+# bind-caps will box-READ the capture, so here we must pack a BOX: a real var (e.v) already
+# holds its box (pass it for shared mutation), but a plain local holds a value -> wrap it in a
+# fresh 1-cell box so the box-read in the lambda recovers the value (no shared mutation needed
+# since the shadowing local is a let, not a var).
 fun load-capture(c :: Ctx, key) -> List<Number>:
-  cases(Option) lookup-local-opt(c, key):
+  cases(Option) lookup-ventry-opt(c, key):
     | none => E.i-ref-null(110)
-    | some(i) => E.local-get(i)
+    | some(e) =>
+      if c.gvars.member(key) and not(e.v):
+        E.local-get(e.i).append(E.array-new-fixed(T-FIELDS, 1))
+      else:
+        E.local-get(e.i)
+      end
   end
 end
 
