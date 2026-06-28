@@ -487,3 +487,28 @@ test("self-hosted: lambda body that is empty after erasing a type alias runs", a
   const { result } = await selfHostRun("f = lam(): block: type T = Number end end\nf()\n0");
   expect(result.error).toBeUndefined();
 });
+
+// ── tuple-binds: let, `as`, params (lam/fun), nested ─────────────────────────
+// ANF can't consume s-tuple-bind; the driver lowers `{a; b} = e`, tuple params, and
+// tuple cases-binds to a fresh name + tuple-get lets (mirrors real Pyret desugar-scope).
+test("self-hosted: let tuple-bind {a; b} = {1; 2} -> a + b == 3", async () => {
+  const { result } = await selfHostRun(EXPECT + "{a; b} = {1; 2}\nexpect(a + b, 3)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: tuple-bind with `as` name binds both parts and the whole", async () => {
+  const { result } = await selfHostRun(
+    EXPECT + "{a; b} as t = {3; 4}\nexpect(a + b, 7)\nexpect(t.{0} + t.{1}, 7)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: tuple-bind fun param fun f({a; b}): a + b end -> f({3; 4}) == 7", async () => {
+  const { result } = await selfHostRun(EXPECT + "fun f({a; b}): a + b end\nexpect(f({3; 4}), 7)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: tuple-bind lambda param", async () => {
+  const { result } = await selfHostRun(EXPECT + "g = lam({a; b}): a * b end\nexpect(g({5; 6}), 30)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: nested tuple-bind {a; {b; c}} = {1; {2; 3}}", async () => {
+  const { result } = await selfHostRun(EXPECT + "{a; {b; c}} = {1; {2; 3}}\nexpect(a + b + c, 6)");
+  expect(result.error).toBeUndefined();
+});
