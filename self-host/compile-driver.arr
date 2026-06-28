@@ -685,8 +685,62 @@ fun partition-top(stmts, bind-acc :: List, rest-acc :: List):
   end
 end
 
+# Does bind `b` (re)bind the name `n`? (so a substitution must stop under it)
+fun bind-has-name(b :: A.Bind, n :: String) -> Boolean:
+  cases(A.Bind) b:
+    | s-bind(_, _, nm, _) => A.is-s-name(nm) and (nm.s == n)
+    | s-tuple-bind(_, fs, as-n) =>
+      lists.any(lam(x): bind-has-name(x, n) end, fs) or
+      cases(Option) as-n: | none => false | some(ab) => bind-has-name(ab, n) end
+  end
+end
+
+# Capture-avoiding rename of FREE references to the bare name `fromn` -> Name `ton`,
+# over a surface expression. Covers the forms that appear in `shadow X = val` values
+# (lambdas + their app/dot/op bodies); stops under a binder that rebinds `fromn`.
+fun subst-id(e :: A.Expr, fromn :: String, ton) -> A.Expr:
+  sub = lam(x): subst-id(x, fromn, ton) end
+  cases(A.Expr) e:
+    | s-id(l, n) => if A.is-s-name(n) and (n.s == fromn): A.s-id(l, ton) else: e end
+    | s-app(l, f, args) => A.s-app(l, sub(f), map(sub, args))
+    | s-app-enriched(l, f, args, info) => A.s-app-enriched(l, sub(f), map(sub, args), info)
+    | s-prim-app(l, fn, args, info) => A.s-prim-app(l, fn, map(sub, args), info)
+    | s-op(l, ol, op, lft, rgt) => A.s-op(l, ol, op, sub(lft), sub(rgt))
+    | s-dot(l, o, fld) => A.s-dot(l, sub(o), fld)
+    | s-get-bang(l, o, fld) => A.s-get-bang(l, sub(o), fld)
+    | s-paren(l, x) => A.s-paren(l, sub(x))
+    | s-tuple(l, fs) => A.s-tuple(l, map(sub, fs))
+    | s-tuple-get(l, t, i, il) => A.s-tuple-get(l, sub(t), i, il)
+    | s-construct(l, m, c, vs) => A.s-construct(l, m, sub(c), map(sub, vs))
+    | s-lam(l, nm, ps, args, ann, doc, body, ck, cl, bl) =>
+      if lists.any(lam(a): bind-has-name(a, fromn) end, args): e
+      else: A.s-lam(l, nm, ps, args, ann, doc, sub(body), ck, cl, bl)
+      end
+    | s-block(l, stmts) => A.s-block(l, map(sub, stmts))   # lambda bodies are blocks!
+    | s-if-else(l, branches, els, bl) =>
+      A.s-if-else(l, map(lam(b): A.s-if-branch(b.l, sub(b.test), sub(b.body)) end, branches), sub(els), bl)
+    | s-if(l, branches, bl) =>
+      A.s-if(l, map(lam(b): A.s-if-branch(b.l, sub(b.test), sub(b.body)) end, branches), bl)
+    | s-user-block(l, bdy) => A.s-user-block(l, sub(bdy))
+    | else => e
+  end
+end
+
+var shadow-uid :: Number = 0
+fun fresh-shadow-name(base :: String) -> String block:
+  shadow-uid := shadow-uid + 1
+  "$sh#" + base + "#" + tostring(shadow-uid)
+end
+
 # Desugar the non-hoisted statements (value `s-let`/`s-var` + expressions) in source
 # order into a nested s-let-expr / expression list.
+#
+# SHADOW handling: a top-level `shadow X = val` whose `val` references X expects X to mean
+# the PRIOR binding (Pyret `let`s are NON-recursive), but X is a mutable global the new
+# binding OVERWRITES — so val's self-references would see the NEW binding at run time (e.g.
+# infinite recursion in pprint's `shadow str = lam(s): str(s,…) end`). Fix: capture the prior
+# X in a fresh global `orig` and substitute X->orig inside `val`, then bind X = val'. References
+# AFTER the shadow keep using X (the new binding); references inside val see the prior one.
 fun desugar-rest(stmts :: List<A.Expr>) -> List<A.Expr>:
   cases(List) stmts:
     | empty => empty
@@ -694,7 +748,24 @@ fun desugar-rest(stmts :: List<A.Expr>) -> List<A.Expr>:
       cases(A.Expr) f:
         | s-let(ll, bind, val, _) =>
           body = stmts-to-body(desugar-rest(rest))
-          [list: A.s-let-expr(ll, expand-letbind(ll, bind, desugar-expr(val)), body, false)]
+          is-shadow = cases(A.Bind) bind:
+            | s-bind(_, shadows, nm, _) => shadows and A.is-s-name(nm)
+            | else => false
+          end
+          if is-shadow:
+            nm = bind.id
+            orig-name = A.s-name(ll, fresh-shadow-name(nm.s))
+            # OUTER let binds orig = (prior X); its value `X` must resolve to the prior
+            # binding, so orig lives in its OWN let — NOT alongside the new X (which would
+            # make `orig = X` see the new X under letrec-ish bind visibility).
+            orig-bind = A.s-let-bind(ll, A.s-bind(ll, false, orig-name, A.a-blank), A.s-id(ll, nm))
+            shadow-val = desugar-expr(subst-id(val, nm.s, orig-name))
+            sbinds = expand-letbind(ll, A.s-bind(ll, true, nm, A.a-blank), shadow-val)
+            [list: A.s-let-expr(ll, [list: orig-bind],
+                A.s-let-expr(ll, sbinds, body, false), false)]
+          else:
+            [list: A.s-let-expr(ll, expand-letbind(ll, bind, desugar-expr(val)), body, false)]
+          end
         | s-var(ll, bind, val) =>
           body = stmts-to-body(desugar-rest(rest))
           [list: A.s-let-expr(ll, [list: A.s-var-bind(ll, strip-bind(bind), desugar-expr(val))], body, false)]
