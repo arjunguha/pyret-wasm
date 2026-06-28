@@ -75,12 +75,110 @@ fun strip-cases-bind(cb :: A.CasesBind) -> A.CasesBind:
   end
 end
 
+# ── tuple-bind desugaring ────────────────────────────────────────────────────
+# ANF can't consume `s-tuple-bind` (it reads `.id`), so `{a; b} = e`, tuple-bind
+# params, and tuple cases-binds must be lowered to a fresh name + `tuple-get` lets
+# (mirrors real Pyret's desugar-scope). These helpers build plain ast.arr nodes
+# only; callers pass already-desugared sub-expressions.
+
+fun fresh-tuple-name() -> String block:
+  lam-uid := lam-uid + 1
+  "$tup#" + tostring(lam-uid)
+end
+
+fun concat-all(lsts :: List) -> List:
+  for fold(acc from [list:], x from lsts): acc + x end
+end
+
+# Bind the names inside tuple-bind `tb` by reading from already-named `src-id` (an
+# s-id of the holder). Recurses for nested tuple-binds. Returns a list of let-binds.
+fun destructure-from(bl, tb :: A.Bind, src-id :: A.Expr) -> List<A.LetBind>:
+  cases(A.Bind) tb:
+    | s-bind(_, _, _, _) => [list: A.s-let-bind(bl, strip-bind(tb), src-id)]
+    | s-tuple-bind(tbl, fields, as-name) =>
+      as-binds = cases(Option) as-name:
+        | none => [list:]
+        | some(ab) => [list: A.s-let-bind(tbl, strip-bind(ab), src-id)]
+      end
+      field-binds = concat-all(
+        map2(lam(f, i): destructure-from(tbl, f, A.s-tuple-get(tbl, src-id, i, tbl)) end,
+          fields, range(0, fields.length())))
+      as-binds + field-binds
+  end
+end
+
+# Expand a single let-bind whose bind may be a tuple-bind: fresh = val, then
+# destructure. Plain binds pass through (annotation-stripped). `val` is desugared.
+fun expand-letbind(bl, tb :: A.Bind, val :: A.Expr) -> List<A.LetBind>:
+  cases(A.Bind) tb:
+    | s-bind(_, _, _, _) => [list: A.s-let-bind(bl, strip-bind(tb), val)]
+    | s-tuple-bind(tbl, _, _) =>
+      fresh = fresh-tuple-name()
+      fresh-bind = A.s-bind(tbl, false, A.s-name(tbl, fresh), A.a-blank)
+      fresh-id = A.s-id(tbl, A.s-name(tbl, fresh))
+      link(A.s-let-bind(bl, fresh-bind, val), destructure-from(tbl, tb, fresh-id))
+  end
+end
+
+# Split a parameter list: tuple-bind params become fresh names; their destructuring
+# let-binds are returned to prepend to the body. Returns {new-params; prelude-binds}.
+fun split-params(args :: List<A.Bind>):
+  cases(List) args:
+    | empty => {[list:]; [list:]}
+    | link(a, rest) =>
+      {rps; rbs} = split-params(rest)
+      cases(A.Bind) a:
+        | s-bind(_, _, _, _) => {link(strip-bind(a), rps); rbs}
+        | s-tuple-bind(tbl, _, _) =>
+          fresh = fresh-tuple-name()
+          fresh-bind = A.s-bind(tbl, false, A.s-name(tbl, fresh), A.a-blank)
+          fresh-id = A.s-id(tbl, A.s-name(tbl, fresh))
+          {link(fresh-bind, rps); destructure-from(tbl, a, fresh-id) + rbs}
+      end
+  end
+end
+
+# Wrap a (desugared) body in a let-expr binding the param-destructuring prelude.
+fun wrap-body(bl, prelude :: List<A.LetBind>, body :: A.Expr) -> A.Expr:
+  if is-empty(prelude): body
+  else: A.s-let-expr(bl, prelude, body, false)
+  end
+end
+
+# Desugar a lambda's args+body, destructuring any tuple-bind params into the body.
+fun desugar-lam-parts(bl, args :: List<A.Bind>, body :: A.Expr):
+  {new-args; prelude} = split-params(args)
+  {new-args; wrap-body(bl, prelude, desugar-expr(body))}
+end
+
 # ── helpers for cases / data desugaring ──────────────────────────────────────
+
+# Split cases-branch binds: a tuple cases-bind becomes a fresh-name cases-bind plus
+# destructuring let-binds to prepend to the branch body. Returns {new-binds; prelude}.
+fun split-cases-binds(cbs :: List<A.CasesBind>):
+  cases(List) cbs:
+    | empty => {[list:]; [list:]}
+    | link(cb, rest) =>
+      {rcs; rbs} = split-cases-binds(rest)
+      cases(A.CasesBind) cb:
+        | s-cases-bind(cl, ft, bind) =>
+          cases(A.Bind) bind:
+            | s-bind(_, _, _, _) => {link(A.s-cases-bind(cl, ft, strip-bind(bind)), rcs); rbs}
+            | s-tuple-bind(tbl, _, _) =>
+              fresh = fresh-tuple-name()
+              fresh-bind = A.s-bind(tbl, false, A.s-name(tbl, fresh), A.a-blank)
+              fresh-id = A.s-id(tbl, A.s-name(tbl, fresh))
+              {link(A.s-cases-bind(cl, ft, fresh-bind), rcs); destructure-from(tbl, bind, fresh-id) + rbs}
+          end
+      end
+  end
+end
 
 fun desugar-cases-branch(b) -> A.CasesBranch:
   cases(A.CasesBranch) b:
     | s-cases-branch(l, pl, name, args, body) =>
-      A.s-cases-branch(l, pl, name, args.map(strip-cases-bind), desugar-expr(body))
+      {new-args; prelude} = split-cases-binds(args)
+      A.s-cases-branch(l, pl, name, new-args, wrap-body(l, prelude, desugar-expr(body)))
     | s-singleton-cases-branch(l, pl, name, body) =>
       A.s-singleton-cases-branch(l, pl, name, desugar-expr(body))
   end
@@ -94,8 +192,9 @@ fun desugar-member(m) -> A.Member:
       # anf reads each member's `.value` (get-value); s-method-field has no `.value`, so
       # feeding it to anf raises "$err_no_field". (Mirrors real Pyret's desugar, which
       # lowers method fields to data-field + s-method before anf.)
+      {new-args; new-body} = desugar-lam-parts(l, args, body)
       A.s-data-field(fresh-loc(), name,
-        A.s-method(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), cl, ck, bl))
+        A.s-method(fresh-loc(), name, params, new-args, A.a-blank, doc, new-body, cl, ck, bl))
     | else => m
   end
 end
@@ -252,25 +351,28 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         desugar-expr(_else), blocky)
 
     | s-lam(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
-      A.s-lam(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), chk-loc, chk, blocky)
+      {new-args; new-body} = desugar-lam-parts(loc, args, body)
+      A.s-lam(fresh-loc(), name, params, new-args, A.a-blank, doc, new-body, chk-loc, chk, blocky)
 
     | s-fun(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
       # s-fun in non-statement position: turn into a self-named lambda
-      A.s-lam(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), chk-loc, chk, blocky)
+      {new-args; new-body} = desugar-lam-parts(loc, args, body)
+      A.s-lam(fresh-loc(), name, params, new-args, A.a-blank, doc, new-body, chk-loc, chk, blocky)
 
     | s-method(loc, name, params, args, ann, doc, body, chk-loc, chk, blocky) =>
-      A.s-method(fresh-loc(), name, params, strip-binds(args), A.a-blank, doc, desugar-expr(body), chk-loc, chk, blocky)
+      {new-args; new-body} = desugar-lam-parts(loc, args, body)
+      A.s-method(fresh-loc(), name, params, new-args, A.a-blank, doc, new-body, chk-loc, chk, blocky)
 
     | s-let(loc, bind, expr, closure-val) =>
       A.s-let(loc, strip-bind(bind), desugar-expr(expr), closure-val)
 
     | s-let-expr(loc, binds, body, blocky) =>
-      new-binds = binds.map(lam(b):
+      new-binds = concat-all(binds.map(lam(b):
         cases(A.LetBind) b:
-          | s-let-bind(bl, bind, val) => A.s-let-bind(bl, strip-bind(bind), desugar-expr(val))
-          | s-var-bind(bl, bind, val) => A.s-var-bind(bl, strip-bind(bind), desugar-expr(val))
+          | s-let-bind(bl, bind, val) => expand-letbind(bl, bind, desugar-expr(val))
+          | s-var-bind(bl, bind, val) => [list: A.s-var-bind(bl, strip-bind(bind), desugar-expr(val))]
         end
-      end)
+      end))
       A.s-let-expr(loc, new-binds, desugar-expr(body), blocky)
 
     | s-letrec(loc, binds, body, blocky) =>
@@ -324,10 +426,11 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-for(loc, iterator, bindings, _, body, _) =>
       # `for ITER(b0 from e0, b1 from e1): body end`
       #   -> ITER(lam(b0, b1): body end, e0, e1)
-      args = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, b, _) => strip-bind(b) end end)
+      raw-args = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, b, _) => b end end)
       srcs = bindings.map(lam(fb): cases(A.ForBind) fb: | s-for-bind(_, _, v) => desugar-expr(v) end end)
-      lam-e = A.s-lam(fresh-loc(), "", [list:], args, A.a-blank, "",
-        desugar-expr(body), none, none, false)
+      {new-args; new-body} = desugar-lam-parts(loc, raw-args, body)
+      lam-e = A.s-lam(fresh-loc(), "", [list:], new-args, A.a-blank, "",
+        new-body, none, none, false)
       A.s-app-enriched(loc, desugar-expr(iterator), link(lam-e, srcs), no-info)
 
     | s-instantiate(loc, body, params) =>
@@ -418,7 +521,8 @@ end
 fun fun-to-letrec-bind(fn :: A.Expr) -> A.LetrecBind:
   cases(A.Expr) fn:
     | s-fun(fl, fname, fparams, fargs, fann, fdoc, fbody, fchk-loc, fchk, fblocky) =>
-      lam-val = A.s-lam(fresh-loc(), fname, fparams, strip-binds(fargs), A.a-blank, fdoc, desugar-expr(fbody),
+      {new-args; new-body} = desugar-lam-parts(fl, fargs, fbody)
+      lam-val = A.s-lam(fresh-loc(), fname, fparams, new-args, A.a-blank, fdoc, new-body,
                         fchk-loc, fchk, fblocky)
       A.s-letrec-bind(fl, A.s-bind(fl, false, A.s-name(fl, fname), A.a-blank), lam-val)
   end
@@ -476,9 +580,9 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
           body = stmts-to-body(desugar-stmts(rest))
           [list: A.s-let-expr(dl, link(data-bind, ctor-binds), body, false)]
         | s-let(ll, bind, val, _) =>
-          # top-level `x = e` → s-let-expr binding x over the remaining statements
+          # top-level `x = e` (or tuple-bind `{a; b} = e`) → s-let-expr over the rest
           body = stmts-to-body(desugar-stmts(rest))
-          [list: A.s-let-expr(ll, [list: A.s-let-bind(ll, strip-bind(bind), desugar-expr(val))], body, false)]
+          [list: A.s-let-expr(ll, expand-letbind(ll, bind, desugar-expr(val)), body, false)]
         | s-var(ll, bind, val) =>
           # top-level `var x = e` → s-let-expr with a var-bind over the rest
           body = stmts-to-body(desugar-stmts(rest))
