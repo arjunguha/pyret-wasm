@@ -489,7 +489,8 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
         .append(pack-fields(fields.map(lam(f): f.value end), c))
         .append(E.i-call(idx-make-object()))
     | a-extend(l, supe, fields) =>
-      compile-aval(supe, c)
+      # supe flows as anyref (uniform value model); $obj_extend wants (ref $Object) — cast.
+      compile-aval(supe, c).append(E.ref-cast(T-OBJECT))
         .append(emit-names(fields))
         .append(pack-fields(fields.map(lam(f): f.value end), c))
         .append(E.i-call(idx-obj-extend()))
