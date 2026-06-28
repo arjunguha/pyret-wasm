@@ -1,5 +1,6 @@
 // Node adapter: load Pyret's tokenizer + GLR parser via requirejs (filesystem)
-// and parse with the shared core. (Browser uses parser-browser.ts instead.)
+// and parse with the shared core. SEED/build-time + tests only — the web bundle no
+// longer uses any JS parser (it parses inside the self-hosted wasm driver).
 
 import { createRequire } from "module";
 import { fileURLToPath } from "url";

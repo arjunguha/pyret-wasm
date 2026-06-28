@@ -1,33 +1,23 @@
 // UI-THREAD runner (no Web Worker). Compiles + runs Pyret on the main thread
 // (required so user code can do async image loading + JS interop).
 //
-// The IDE runs ONLY through the fully self-hosted, stoppable compiler — the
-// deployable artifact: the Pyret-in-Pyret compiler (web/selfhost-driver.wasm) plus
-// the Pyret→Pyret CPS stoppability transform (web/cps-driver.wasm). There is NO
-// seed path, NO fallback, NO JS codegen. Run pipeline:
-//   1. CPS-transform (prelude + user code) → continuation-passing Pyret SOURCE,
-//      via the seed-compiled CPS driver (self-host/cps.arr) — inserts the
-//      yield-check/$do_pause points.
-//   2. Compile that source with the SELF-HOSTED compiler (self-host/compile-driver.arr,
-//      which parses with the no-JS Pyret parser and emits WASM via wasm-of-pyret) →
-//      the program's module bytes.
-//   3. Run on a single-thread trampoline (driven HERE) with DEBUGGER controls —
-//      Pause (freeze at the next yield), Resume, single-Step, Stop — built on the
-//      $do_pause points, serviced same-thread on the event loop.
+// The IDE runs ONLY through ONE artifact: the fully self-hosted, stoppable compile
+// driver (web/cps-compile-driver.wasm). It does, ENTIRELY in WASM (no JS parser, no
+// seed, no fallback, no JS codegen):
+//   source -> pure-Pyret parser -> CPS stoppability transform (yield-check/$do_pause)
+//          -> desugar -> ANF -> wasm-of-pyret backend  -> the program's module bytes.
+// We then run that module on a single-thread trampoline (driven HERE) with DEBUGGER
+// controls — Pause (freeze at the next yield), Resume, single-Step, Stop — built on the
+// $do_pause points, serviced same-thread on the event loop.
 // This self-hosted stoppable compiler isn't fully ready yet: programs it can't compile
 // surface a real error (we deliberately do NOT fall back to the seed). The wiring is
-// optimistic — it lights up as the self-hosted compiler's coverage + stoppable codegen
-// come online.
+// optimistic — it lights up as the self-hosted compiler's coverage comes online.
 
 // IMPORTANT: the browser bundle must NOT import the SEED compiler (src/compiler/compile.ts
-// → binaryen, ~21MB) or any module that transitively pulls it. serializeCstNode comes from
-// the browser-safe ../src/cst-serialize.ts (NOT build-stoppable-core.ts, which imports
-// compile.ts). The only compiler on the web is the prebuilt self-hosted + CPS driver wasm.
-import { serializeCstNode } from "../src/cst-serialize.ts";
-import { PRELUDE_SRC } from "../src/compiler/prelude.ts";
-import { parsePyretBrowser } from "../src/parser/parser-browser.ts";
+// → binaryen, ~21MB), the JS-GLR parser, or any module that transitively pulls them. The
+// ONLY compiler on the web is the prebuilt cps-compile-driver.wasm; the only TS here is the
+// host imports + the stoppable trampoline + IDE glue.
 import { buildHostImports, newHostState, PauseSignal, PyretError } from "../src/runtime/run.ts";
-import { ParseError } from "../src/parser/parse-core.ts";
 
 export type RunState = "running" | "paused";
 
@@ -40,74 +30,47 @@ export interface RunHandle {
   promise: Promise<{ output: string; error?: string; stopped: boolean; pauses: number; stoppable: boolean }>;
 }
 
-// The CPS driver wasm (built by `bun run build:web` -> web/cps-driver.wasm), fetched once.
+// The single stoppable compile driver wasm (built by `bun run build:web` ->
+// web/cps-compile-driver.wasm), fetched once. It is the whole compiler written in
+// Pyret — pure-Pyret parser + CPS stoppability transform + the Pyret-written backend
+// — seed-compiled to WASM. NO JS parser, NO seed, NO separate CPS pass.
 let _driver: Promise<Uint8Array> | null = null;
-function cpsDriverWasm(): Promise<Uint8Array> {
+function compileDriverWasm(): Promise<Uint8Array> {
   if (!_driver) {
-    _driver = fetch("cps-driver.wasm").then((r) => {
-      if (!r.ok) throw new Error("cps-driver.wasm not found");
+    _driver = fetch("cps-compile-driver.wasm").then((r) => {
+      if (!r.ok) throw new Error("cps-compile-driver.wasm not found");
       return r.arrayBuffer();
     }).then((b) => new Uint8Array(b));
   }
   return _driver;
 }
 
-// The SELF-HOSTED compiler driver wasm (built by `bun run build:web` ->
-// web/selfhost-driver.wasm), fetched once. This is the real compiler written in
-// Pyret (front-end + Pyret-written backend), seed-compiled to WASM.
-let _shDriver: Promise<Uint8Array> | null = null;
-function selfhostDriverWasm(): Promise<Uint8Array> {
-  if (!_shDriver) {
-    _shDriver = fetch("selfhost-driver.wasm").then((r) => {
-      if (!r.ok) throw new Error("selfhost-driver.wasm not found");
-      return r.arrayBuffer();
-    }).then((b) => new Uint8Array(b));
-  }
-  return _shDriver;
-}
-
-// Compile `src` with the SELF-HOSTED compiler — NO JS, NO seed. Run the seed-compiled
-// driver on the source (handed to it via read-source() / sourceBytes; surface-parse is
-// the no-JS Pyret parser, so no JS parser is involved), collecting the WASM bytes it
-// emits via `emit-byte`. Those bytes ARE the program's module, produced entirely by
-// Pyret-in-WASM. Throws if the self-hosted compiler can't compile the program — the
-// caller surfaces that error and does NOT fall back to the seed.
-async function compileSelfHosted(src: string): Promise<Uint8Array> {
-  const driver = await selfhostDriverWasm();
+// Compile `src` to a STOPPABLE WASM module via the single self-hosted driver — NO JS,
+// NO seed. The driver reads the editor source via read-source() (state.sourceBytes),
+// parses it with the pure-Pyret parser, applies the CPS stoppability transform, and
+// emits the program's module bytes via emit-byte. Those bytes ARE the program's module,
+// produced entirely by Pyret-in-WASM, carrying the yield-check / $do_pause interrupt
+// points. Throws if the self-hosted compiler can't compile the program — the caller
+// surfaces that error and does NOT fall back to the seed.
+async function compileStoppable(src: string): Promise<Uint8Array> {
+  const driver = await compileDriverWasm();
   const state = newHostState(() => {}); // discard the compiler's own stdout
   state.sourceBytes = new TextEncoder().encode(src);
   const { instance } = await WebAssembly.instantiate(driver as BufferSource, buildHostImports(state));
   state.instance = instance;
-  state.memory = instance.exports.memory as WebAssembly.Memory;
-  (instance.exports.main as () => void)(); // runs the driver, emitting the target module's bytes
-  if (!state.emitted || state.emitted.length === 0) throw new Error("self-hosted compiler emitted no bytes");
-  return new Uint8Array(state.emitted);
-}
-
-// CPS-transform (prelude + user code, together) into continuation-passing Pyret
-// SOURCE, via the seed-compiled CPS driver (self-host/cps.arr). The transformed
-// source carries the yield-check / $do_pause calls that make it cooperatively
-// stoppable; we then hand that source to the self-hosted compiler.
-async function cpsTransform(src: string): Promise<string> {
-  const program = await parsePyretBrowser(PRELUDE_SRC + "\n" + src);
-  const serialized = serializeCstNode(program);
-  const driver = await cpsDriverWasm();
-  const state = newHostState();
-  state.sourceBytes = new TextEncoder().encode(serialized);
-  const { instance } = await WebAssembly.instantiate(driver as BufferSource, buildHostImports(state));
-  state.instance = instance;
   const mem = instance.exports.memory as WebAssembly.Memory;
   state.memory = mem;
-  // The serialized CST is large (prelude alone ~285KB); pre-grow linear memory.
-  const need = state.sourceBytes.length * 8 + (2 << 20);
+  // Compiling a large program can allocate a lot; pre-grow linear memory generously.
+  const need = state.sourceBytes.length * 16 + (4 << 20);
   const have = mem.buffer.byteLength;
   if (need > have) {
     const want = Math.ceil((need - have) / 65536);
-    const room = 256 - Math.ceil(have / 65536);
+    const room = 512 - Math.ceil(have / 65536);
     if (room > 0) { try { mem.grow(Math.min(want, room)); } catch { /* best effort */ } }
   }
-  (instance.exports.main as () => void)();
-  return state.captured.trim();
+  (instance.exports.main as () => void)(); // runs the driver, emitting the target module's bytes
+  if (!state.emitted || state.emitted.length === 0) throw new Error("self-hosted compiler emitted no bytes");
+  return new Uint8Array(state.emitted);
 }
 
 interface ControlledOpts {
@@ -184,16 +147,10 @@ function runControlled(wasm: Uint8Array, opts: ControlledOpts = {}): ControlledH
   return { promise, stop, pause, resume, step };
 }
 
-// Augment a build-time error with a clickable source location (the browser path
-// otherwise drops the line/col the CLI prints). startLine is 1-based, startCol
-// 0-based — the IDE turns "line L, column C" into a clickable cursor jump.
+// Normalize a build-time error. The parser + compiler now live INSIDE the wasm driver,
+// so parse/compile errors surface as plain Errors (or PyretError) thrown out of the
+// driver's main() — there is no JS ParseError/CompileError type on the web anymore.
 function withLocation(e: unknown): Error {
-  if (e instanceof ParseError && e.pos) {
-    const err = new Error(`${e.message} (at line ${e.pos.startLine}, column ${e.pos.startCol})`);
-    return err;
-  }
-  // NB: no CompileError branch — that's the SEED compiler's error type, and the seed
-  // is not on the web. The self-hosted compiler surfaces errors as plain Errors.
   return e instanceof Error ? e : new Error(String(e));
 }
 
@@ -206,19 +163,15 @@ async function runProgram(
   src: string,
   opts: { stdout: (s: string) => void; onState?: (s: RunState) => void; onPause?: (n: number) => void },
 ): Promise<RunHandle> {
-  // The IDE runs ONLY through the fully self-hosted, stoppable compiler — the
-  // deployable artifact (the Pyret-in-Pyret compiler + the CPS stoppability
-  // transform). NO seed, NO fallback, NO JS codegen. Pipeline:
-  //   1. CPS-transform (prelude + user) -> continuation-passing Pyret source (cps.arr),
-  //   2. compile that source with the SELF-HOSTED compiler (compile-driver.arr),
-  //   3. run on the single-thread trampoline (Pause/Step/Resume/Stop).
-  // This compiler isn't fully ready yet — programs it can't handle surface a real
-  // error (we do NOT silently fall back to the seed). Wired optimistically: it lights
-  // up as the self-hosted compiler's coverage + stoppable codegen come online.
+  // The IDE runs ONLY through ONE artifact: the self-hosted, stoppable compile driver
+  // (cps-compile-driver.wasm = pure-Pyret parser + CPS stoppability transform + the
+  // Pyret-written backend). NO seed, NO fallback, NO JS parser, NO JS codegen. Then run
+  // on the single-thread trampoline (Pause/Step/Resume/Stop). This compiler isn't fully
+  // ready yet — programs it can't handle surface a real error (we do NOT silently fall
+  // back to the seed). Wired optimistically: it lights up as the compiler's coverage grows.
   let wasm: Uint8Array;
   try {
-    const transformed = await cpsTransform(src);
-    wasm = await compileSelfHosted(transformed);
+    wasm = await compileStoppable(src);
   } catch (buildErr) {
     throw withLocation(buildErr); // real compile/parse error -> caller shows it (with location)
   }
