@@ -107,15 +107,29 @@ data Ctx: ctx(locals, next-local :: Number, vars, fenv, lams, dreg, gvars, nlams
 fun name-key(n): if A.is-s-name(n): "name#" + n.s else: tostring(n) end end
 fun bind-local(c :: Ctx, key, idx :: Number) -> Ctx block:
   max-local-used := num-max(max-local-used, idx + 1)
-  ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  ctx(link({k: key, i: idx, v: false}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
 fun bind-var(c :: Ctx, key, idx :: Number) -> Ctx block:
   max-local-used := num-max(max-local-used, idx + 1)
-  ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), link(key, c.vars), c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  ctx(link({k: key, i: idx, v: true}, c.locals), num-max(c.next-local, idx + 1), link(key, c.vars), c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
 fun is-var(c :: Ctx, key) -> Boolean: c.vars.member(key) end
 fun lookup-local-opt(c :: Ctx, key):
   find-pair-opt(c.locals, key)
+end
+# Like lookup-local-opt but returns the WHOLE entry {k; i; v} of the FIRST (newest, so
+# shadowing-aware) match. Reads use THIS entry's `v` (is-it-a-box) flag rather than the
+# name-keyed `is-var`: when a plain `let` shadows a `var`/letrec-bound name of the same name
+# (anf lowers a hoisted `fun g` to a `var g`, then `shadow g = <let>`), `is-var` stays true
+# for the name but the shadow's entry has v=false, so the read must local-get, not box-read.
+fun lookup-ventry-opt(c :: Ctx, key):
+  fun go(ps):
+    cases(List) ps:
+      | empty => none
+      | link(f, r) => if f.k == key: some(f) else: go(r) end
+    end
+  end
+  go(c.locals)
 end
 fun find-pair-opt(ps, key):
   cases(List) ps:
@@ -297,9 +311,9 @@ fun compile-aval(v, c :: Ctx) -> List<Number>:
     | a-bool(l, b) => E.i32-const(if b: 1 else: 0 end).append(E.ref-i31)
     | a-id(l, id) =>
       k = name-key(id)
-      cases(Option) lookup-local-opt(c, k):
+      cases(Option) lookup-ventry-opt(c, k):                                 # per-entry v (shadowing-aware)
         | none => resolve-nonlocal(c, k)                                     # top-level global, else null
-        | some(i) => if is-var(c, k): box-read(i) else: E.local-get(i) end
+        | some(e) => if e.v: box-read(e.i) else: E.local-get(e.i) end
       end
     | a-id-safe-letrec(l, id) =>                                             # letrec-safe read: same as a-id
       k = name-key(id)
@@ -431,9 +445,9 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
     | a-val(l, v) => compile-aval(v, c)
     | a-id-var(l, id) =>
       k = name-key(id)
-      cases(Option) lookup-local-opt(c, k):
+      cases(Option) lookup-ventry-opt(c, k):                                 # per-entry v (shadowing-aware)
         | none => resolve-nonlocal(c, k)
-        | some(i) => if is-var(c, k): box-read(i) else: E.local-get(i) end
+        | some(e) => if e.v: box-read(e.i) else: E.local-get(e.i) end
       end
     | a-id-letrec(l, id, safe) =>
       k = name-key(id)

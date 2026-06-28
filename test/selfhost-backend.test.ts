@@ -125,3 +125,22 @@ test("self-hosted: operator + dispatches to a data _plus method (no ref.cast)", 
     "x = a(1)\ny = x + a(2)\nif y.n == 3: 0 else: 1 / 0 end"
   )).resolves.toBeDefined();
 });
+
+// Shadowing a hoisted `fun`/`data`-variant or a `var` with a plain `let`, then using the
+// shadow, used to ref.cast-trap: anf lowers a hoisted `fun g` to a `var g` (s-var-bind), so
+// `g` was name-keyed "var" — but a plain `let` shadow binds a NON-box local. `is-var` (name-
+// keyed) stayed true → box-read (ref.cast to $Fields) on a plain value → trap. Var-ness is now
+// PER-LOCAL-ENTRY (lookup-ventry-opt), so the shadow's entry (v=false) reads via local-get.
+test("self-hosted backend: a plain let shadowing a fun/var resolves (no ref.cast trap)", async () => {
+  await expect(runSourceSelfHosted(
+    "fun g(n): n + 1 end\nshadow g = lam(n): n + 2 end\nif g(5) == 7: 0 else: 1 / 0 end"
+  )).resolves.toBeDefined();
+  await expect(runSourceSelfHosted(
+    "var v = 1\nshadow v = 2\nif v == 2: 0 else: 1 / 0 end"
+  )).resolves.toBeDefined();
+  // regression: real var read+assign + recursive fun must still work (per-entry v flag)
+  await expect(runSourceSelfHosted("var c = 0\nc := c + 5\nif c == 5: 0 else: 1 / 0 end")).resolves.toBeDefined();
+  await expect(runSourceSelfHosted(
+    "fun f(n): if n == 0: 1 else: n * f(n - 1) end end\nif f(5) == 120: 0 else: 1 / 0 end"
+  )).resolves.toBeDefined();
+});
