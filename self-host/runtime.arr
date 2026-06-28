@@ -429,7 +429,7 @@ fun emit-render-rough() -> RtFun:
       E.local-get(3), E.i64-trunc-sat-f64-s, E.local-set(4),   # ip = trunc(ax)
       # fr = trunc((ax - ip)*1e15 + 0.5)
       E.local-get(3), E.local-get(4), E.f64-convert-i64-s, E.f64-sub,
-      E.f64-const(e15), E.f64-mul, E.f64-const(0.5), E.f64-add, E.i64-trunc-sat-f64-s, E.local-set(5),
+      E.f64-const(e15), E.f64-mul, E.f64-const(~0.5), E.f64-add, E.i64-trunc-sat-f64-s, E.local-set(5),
       # carry if rounding bumped to a whole unit
       E.local-get(5), E.i64-const(e15), E.i64-ge-u,
       iff([list: E.local-get(4), E.i64-const(1), E.i64-add, E.local-set(4), E.i64-const(0), E.local-set(5)]),

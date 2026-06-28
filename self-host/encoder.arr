@@ -164,7 +164,7 @@ i64-rem-s = [list: 129]  i64-and = [list: 131]  i64-or = [list: 132]  i64-shl = 
 f64-add = [list: 160]  f64-sub = [list: 161]  f64-mul = [list: 162]  f64-div = [list: 163]  f64-sqrt = [list: 159]
 # f64 comparisons (-> i32) + unary
 f64-eq = [list: 97]  f64-ne = [list: 98]  f64-lt = [list: 99]  f64-gt = [list: 100]  f64-le = [list: 101]  f64-ge = [list: 102]
-f64-abs = [list: 153]  f64-neg = [list: 154]  f64-floor = [list: 156]
+f64-abs = [list: 153]  f64-neg = [list: 154]  f64-ceil = [list: 155]  f64-floor = [list: 156]  f64-trunc = [list: 157]  f64-nearest = [list: 158]
 i32-wrap-i64 = [list: 167]
 i64-extend-i32-s = [list: 172]  i64-extend-i32-u = [list: 173]
 f64-convert-i64-s = [list: 185]  i64-trunc-f64-s = [list: 176]
