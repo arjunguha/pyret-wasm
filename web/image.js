@@ -188,13 +188,15 @@
     var urls = new Set(); collectUrls(node, urls);
     urls.forEach(function (u) {
       if (!imgCache[u]) {
-        // Load through the same-origin CORS proxy (/proxy?url=...) WITH
-        // crossOrigin="anonymous" so the canvas is NOT tainted (pixel ops work),
-        // even for hosts that don't send CORS headers (e.g. cse.ucsd.edu).
+        // Load the image DIRECTLY from its URL (the IDE is a fully static site on
+        // GitHub Pages — there is NO server-side CORS proxy). crossOrigin="anonymous"
+        // lets the canvas stay untainted (pixel ops work) for hosts that DO send CORS
+        // headers; hosts that don't will fail to load or taint the canvas. That's an
+        // accepted limitation of the static deploy.
         var im = new Image(); imgCache[u] = im;
         im.crossOrigin = "anonymous";
         im.onload = render; im.onerror = render;
-        im.src = "/proxy?url=" + encodeURIComponent(u);
+        im.src = u;
       } else if (!imgCache[u].complete) {
         imgCache[u].addEventListener("load", render);
       }

@@ -1,0 +1,56 @@
+name: Deploy web IDE to GitHub Pages
+
+# Builds the fully-static Pyret-on-WASM web IDE and deploys it to GitHub Pages.
+# The build is HERMETIC: the JS-GLR parser the seed needs is vendored under
+# vendor/pyret-lang/, so no external pyret-lang checkout is required.
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+# Allow this workflow to publish to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one concurrent Pages deployment; don't cancel an in-progress one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Build the static web IDE
+        # Emits web/{main.bundle.js(.map),parser-bundle.js,cps-driver.wasm,selfhost-driver.wasm}.
+        # Hermetic via vendor/pyret-lang (no `pyret` symlink needed).
+        run: bun run build:web
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

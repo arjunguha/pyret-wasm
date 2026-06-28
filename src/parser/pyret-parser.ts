@@ -4,6 +4,7 @@
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { dirname, resolve } from "path";
+import { existsSync } from "fs";
 import { parseWith, type CstNode } from "./parse-core.ts";
 
 export type { CstNode, Pos } from "./parse-core.ts";
@@ -11,7 +12,12 @@ export { ParseError } from "./parse-core.ts";
 
 const require = createRequire(import.meta.url);
 const HERE = dirname(fileURLToPath(import.meta.url));
-const LANG = resolve(HERE, "../../pyret/lang");
+// Prefer the local `pyret` symlink for dev; fall back to the vendored JS-GLR
+// parser (vendor/pyret-lang) so the seed compiles HERMETICALLY in CI / on a clean
+// checkout with no external pyret checkout.
+const SYMLINK_LANG = resolve(HERE, "../../pyret/lang");
+const VENDOR_LANG = resolve(HERE, "../../vendor/pyret-lang");
+const LANG = existsSync(SYMLINK_LANG) ? SYMLINK_LANG : VENDOR_LANG;
 
 let _loaded: Promise<{ T: any; G: any }> | null = null;
 

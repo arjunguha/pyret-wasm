@@ -4,9 +4,16 @@
 
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
+import { existsSync } from "fs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const LANG = resolve(HERE, "../pyret/lang");
+// Prefer the local `pyret` symlink (-> ../pyret/lang) for dev; fall back to the
+// vendored copy (vendor/pyret-lang) so the build is HERMETIC (works in CI / on a
+// clean checkout with no external pyret checkout). The vendored files are the exact
+// JS-GLR tokenizer + phase0 parser the seed needs.
+const SYMLINK_LANG = resolve(HERE, "../pyret/lang");
+const VENDOR_LANG = resolve(HERE, "../vendor/pyret-lang");
+const LANG = existsSync(SYMLINK_LANG) ? SYMLINK_LANG : VENDOR_LANG;
 
 const MODULES = [
   "lib/jglr/cyclicJSON.js",
