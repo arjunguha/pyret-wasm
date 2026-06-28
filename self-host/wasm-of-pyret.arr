@@ -451,6 +451,11 @@ fun compile-prim-app(fname :: String, args, c :: Ctx) -> List<Number>:
         .append(E.i32-const(R.SCRATCH-OFFSET))                       # addr (under the len)
         .append(E.local-get(v)).append(E.i-call(rt-funcidx("$val_to_string")))  # -> len
         .append(E.i-call(host-funcidx("print")))                    # print(addr, len)
+        # Force a yield right after printing: zero $gas so the NEXT yield-check pauses
+        # immediately. In CPS'd (stoppable) code the trampoline then yields to the event
+        # loop — the browser renders this line and Stop is serviced before the next print.
+        # In non-CPS code there are no yield-checks, so this is a harmless global write.
+        .append(E.i32-const(0)).append(E.global-set(R.GI-GAS))
         .append(E.local-get(v))                                     # result = the value
     # ---- control-flow aborts + the unmapped tail -> $raise host import ----
     | throw-prims.member(fname) then: raise-instr()

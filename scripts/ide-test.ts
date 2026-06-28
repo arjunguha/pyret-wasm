@@ -70,6 +70,62 @@ try {
     return s === "stopped" || s.includes("Stop");
   }, { timeout: 30000 });
   console.log("✓ Stop button interrupts an infinite loop (cooperative stop)");
+
+  // --- Examples dropdown: it exists, is populated, and loads programs into the editor.
+  const demoCount = await page.$eval("#demos", (e: any) => e.options.length);
+  if (demoCount >= 5) console.log(`✓ Examples dropdown present + populated (${demoCount - 1} demos)`);
+  else fail(`Examples dropdown missing/empty (options=${demoCount})`);
+
+  // helper: pick a demo by value (fires the change handler that sets the editor), then Run
+  // and wait for a terminal status.
+  async function loadAndRun(demoId: string): Promise<string> {
+    await page.evaluate((id) => {
+      const sel = document.getElementById("demos") as HTMLSelectElement;
+      sel.value = id;
+      sel.dispatchEvent(new Event("change"));
+    }, demoId);
+    const loaded = await page.evaluate(() => (window as any).cm.getValue());
+    if (!loaded || loaded.length < 10) fail(`demo ${demoId} did not load into the editor`);
+    await page.click("#run");
+    await page.waitForFunction(() => {
+      const s = document.getElementById("status")?.textContent ?? "";
+      return s.startsWith("done") || s === "error" || s === "stopped";
+    }, { timeout: 60000 });
+    return page.$eval("#interactions", (e) => e.textContent ?? "");
+  }
+
+  // Images demo → a <canvas> is drawn from the image scene-graph value.
+  await loadAndRun("images");
+  const canvasCount = await page.$$eval("#interactions canvas", (els) => els.length);
+  if (canvasCount > 0) console.log(`✓ "Drawing images" demo renders a canvas (${canvasCount})`);
+  else fail("images demo produced no canvas");
+
+  // Lambda-calculus demo → evaluates (lam x: x+10)(5+7) = 22 through data/cases.
+  const lam = await loadAndRun("lambda");
+  if (lam.includes("result = 22")) console.log('✓ "Lambda calculus" demo → result = 22');
+  else fail("lambda demo wrong output: " + JSON.stringify(lam.slice(-120)));
+
+  // Rough numbers demo → exact 3.14 = 157/50 and a rough sum ~3.5.
+  const rough = await loadAndRun("rough");
+  if (rough.includes("157/50") && rough.includes("~3.5")) console.log('✓ "Rough numbers" demo → 157/50 (exact) + ~3.5 (rough)');
+  else fail("rough demo wrong output: " + JSON.stringify(rough.slice(-160)));
+
+  // Stoppable-loop demo: it prints + is interruptible.
+  await page.evaluate(() => {
+    const sel = document.getElementById("demos") as HTMLSelectElement;
+    sel.value = "loop"; sel.dispatchEvent(new Event("change"));
+    (window as any).__pausesSeen = 0;
+  });
+  await page.click("#run");
+  await page.waitForFunction(() => ((window as any).__pausesSeen ?? 0) > 0, { timeout: 60000 });
+  await page.click("#stop");
+  await page.waitForFunction(() => {
+    const s = document.getElementById("status")?.textContent ?? "";
+    return s === "stopped" || s.includes("Stop");
+  }, { timeout: 30000 });
+  const loopOut = await page.$eval("#interactions", (e) => e.textContent ?? "");
+  if (loopOut.includes("tick ")) console.log('✓ "Stoppable loop" demo prints "tick …" and is interruptible');
+  else fail("loop demo printed no ticks: " + JSON.stringify(loopOut.slice(0, 120)));
 } catch (e) {
   fail("test threw: " + String(e).slice(0, 200));
 } finally {

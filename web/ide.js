@@ -24,6 +24,97 @@ window.cm = cm; // exposed for the headless smoke test
 // editor fills to the bottom and gutter widths are correct.
 setTimeout(() => cm.refresh(), 0);
 window.addEventListener("resize", () => cm.refresh());
+
+// --- Example programs (the "Examples ▾" dropdown next to the title). Each runs through
+// the deployed single self-hosted+CPS path and exercises features that work today.
+const DEMOS = [
+  { id: "images", label: "Drawing images", src:
+`# Images are values: build a scene by combining shapes — it draws on the canvas.
+overlay(
+  star(40, "solid", "gold"),
+  overlay(
+    circle(55, "outline", "blue"),
+    rectangle(170, 130, "solid", "lightblue")))` },
+
+  { id: "loop", label: "Stoppable loop", src:
+`# An infinite loop that prints as it spins. Click  Stop ■  to interrupt it —
+# the CPS transform makes compiled code cooperatively stoppable on one thread.
+fun count(n):
+  print("tick " + num-to-string(n))
+  count(n + 1)
+end
+count(0)` },
+
+  { id: "lambda", label: "Lambda calculus", src:
+`# A tiny lambda-calculus interpreter (with arithmetic) over an algebraic data type.
+data Term:
+  | lit(value)
+  | plus(left, right)
+  | id(name)
+  | fun-term(param, body)
+  | app(func, arg)
+end
+
+fun subst(t, x, v):
+  cases(Term) t:
+    | lit(n) => lit(n)
+    | plus(l, r) => plus(subst(l, x, v), subst(r, x, v))
+    | id(nm) => if nm == x: v else: id(nm) end
+    | fun-term(p, b) => if p == x: fun-term(p, b) else: fun-term(p, subst(b, x, v)) end
+    | app(f, a) => app(subst(f, x, v), subst(a, x, v))
+  end
+end
+
+fun interp(t):
+  cases(Term) t:
+    | lit(n) => lit(n)
+    | plus(l, r) =>
+      cases(Term) interp(l):
+        | lit(a) => cases(Term) interp(r): | lit(b) => lit(a + b) | else => lit(0) end
+        | else => lit(0)
+      end
+    | id(nm) => id(nm)
+    | fun-term(p, b) => fun-term(p, b)
+    | app(f, a) =>
+      cases(Term) interp(f):
+        | fun-term(p, b) => interp(subst(b, p, interp(a)))
+        | else => lit(0)
+      end
+  end
+end
+
+# (lam x: x + 10)(5 + 7)  ==>  22
+result = interp(app(fun-term("x", plus(id("x"), lit(10))), plus(lit(5), lit(7))))
+cases(Term) result:
+  | lit(n) => print("result = " + num-to-string(n))
+  | else => print("not a number")
+end` },
+
+  { id: "rough", label: "Rough numbers", src:
+`# Pyret has EXACT numbers (3.14 is the rational 157/50) and ROUGH numbers
+# (~3.14 is an inexact float). Rough is "contagious": touch a rough, get a rough.
+print("exact 3.14    = " + num-to-string(3.14))
+print("rough ~3.14   = " + num-to-string(~3.14))
+print("rough sum     = " + num-to-string(~1.5 + ~2.0))
+print("contagion     = " + num-to-string(2 + ~0.5))
+print("rough * exact = " + num-to-string(~2.0 * 3))` },
+];
+
+const demosSel = document.getElementById("demos");
+if (demosSel) {
+  for (const d of DEMOS) {
+    const opt = document.createElement("option");
+    opt.value = d.id; opt.textContent = d.label;
+    demosSel.appendChild(opt);
+  }
+  demosSel.addEventListener("change", () => {
+    const d = DEMOS.find((x) => x.id === demosSel.value);
+    if (d) cm.setValue(d.src);
+    demosSel.value = ""; // reset to the "Examples ▾" placeholder
+    cm.focus();
+  });
+}
+
 const interactions = document.getElementById("interactions");
 const statusEl = document.getElementById("status");
 const runBtn = document.getElementById("run");

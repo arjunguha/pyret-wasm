@@ -18,6 +18,13 @@
 // ONLY compiler on the web is the prebuilt cps-compile-driver.wasm; the only TS here is the
 // host imports + the stoppable trampoline + IDE glue.
 import { buildHostImports, newHostState, PauseSignal, PyretError } from "../src/runtime/run.ts";
+// The standard prelude (list combinators, the image scene-graph library, …), imported as
+// TEXT (no seed compiler is pulled into the browser bundle — see src/compiler/prelude.ts).
+// It is PREPENDED to user source and compiled through the same single driver, so programs
+// get `map`/`filter`/`circle`/`overlay`/… The line count lets us remap error locations
+// back to the user's own line numbers.
+import { PRELUDE_SRC } from "../src/compiler/prelude.ts";
+const PRELUDE_LINES = PRELUDE_SRC.split("\n").length;
 
 export type RunState = "running" | "paused";
 
@@ -55,7 +62,8 @@ function compileDriverWasm(): Promise<Uint8Array> {
 async function compileStoppable(src: string): Promise<Uint8Array> {
   const driver = await compileDriverWasm();
   const state = newHostState(() => {}); // discard the compiler's own stdout
-  state.sourceBytes = new TextEncoder().encode(src);
+  // Prepend the standard prelude so user code sees the stdlib (map/filter/images/…).
+  state.sourceBytes = new TextEncoder().encode(PRELUDE_SRC + "\n" + src);
   const { instance } = await WebAssembly.instantiate(driver as BufferSource, buildHostImports(state));
   state.instance = instance;
   const mem = instance.exports.memory as WebAssembly.Memory;
@@ -151,7 +159,18 @@ function runControlled(wasm: Uint8Array, opts: ControlledOpts = {}): ControlledH
 // so parse/compile errors surface as plain Errors (or PyretError) thrown out of the
 // driver's main() — there is no JS ParseError/CompileError type on the web anymore.
 function withLocation(e: unknown): Error {
-  return e instanceof Error ? e : new Error(String(e));
+  const err = e instanceof Error ? e : new Error(String(e));
+  // User source is compiled as PRELUDE_SRC + "\n" + src, so any 1-based line number the
+  // compiler reports is shifted down by the prelude's line count. Remap `line N` (N past
+  // the prelude) back to the user's own numbering. (The path emits no line numbers today;
+  // this is harmless until it does.)
+  if (err.message) {
+    err.message = err.message.replace(/\bline (\d+)\b/g, (m, n) => {
+      const ln = Number(n);
+      return ln > PRELUDE_LINES ? `line ${ln - PRELUDE_LINES}` : m;
+    });
+  }
+  return err;
 }
 
 const NOOP = () => {};

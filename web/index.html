@@ -16,6 +16,8 @@
   header { background:var(--hdr); color:#fff; padding:8px 16px; display:flex; align-items:center; gap:14px; box-shadow:0 1px 4px rgba(0,0,0,.2); }
   header h1 { font-size:17px; margin:0; font-weight:600; letter-spacing:.3px; }
   header .sub { font-size:12px; opacity:.85; }
+  header #demos { font-size:12px; padding:3px 6px; border-radius:4px; border:1px solid rgba(255,255,255,.4); background:rgba(255,255,255,.12); color:#fff; cursor:pointer; }
+  header #demos option { color:#222; }
   .toolbar { margin-left:auto; display:flex; gap:8px; align-items:center; }
   button { font-size:14px; padding:6px 16px; border:0; border-radius:5px; cursor:pointer; font-weight:600; }
   #run { background:#27ae60; color:#fff; }
@@ -84,6 +86,9 @@
 <header>
   <h1>Pyret</h1>
   <span class="sub">on WebAssembly</span>
+  <select id="demos" title="Load an example program">
+    <option value="" selected>Examples ▾</option>
+  </select>
   <div class="toolbar">
     <button id="run">Run ▶</button>
     <button id="pause" disabled>Pause ⏸</button>

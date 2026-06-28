@@ -75,8 +75,12 @@ NUM-RT-GLOBALS = 7
 GI-VARIANT-NAMES = 7    # first global after the runtime block (when variants exist)
 GI-VARIANT-METHODS = 8  # (ref null $Fields): per-variant-id methods object, set at each
                         # a-data-expr; consumed by $lookup_method for method dispatch.
-# yield-check ticks between event-loop yields (mirrors seed GAS_RESET).
-GAS-RESET = 100000
+# yield-check ticks between event-loop yields (mirrors seed GAS_RESET). Kept SMALL so the
+# Stop button stays responsive: the trampoline yields to the event loop once per GAS-RESET
+# ticks, so a smaller value services Stop sooner (and floods the output pane less per
+# interval). Throughput cost is negligible — even a 1M-iteration program just throws a few
+# hundred extra PauseSignals, and the benchmark resumes immediately.
+GAS-RESET = 2000
 
 # fixed scratch region in linear memory for marshalling strings to the host (runtime.ts).
 SCRATCH-OFFSET = 1024

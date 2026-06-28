@@ -16,7 +16,9 @@ export const SCRATCH_OFFSET = 1024;
 // Stoppable codegen: number of yield-check ticks between event-loop yields.
 // Each instrumented function/lambda entry burns one tick; when gas hits 0 the
 // computation pauses (captures its continuation) and returns to the JS driver.
-export const GAS_RESET = 100000;
+// Small so the Stop button stays responsive (the trampoline yields to the event loop once
+// per GAS_RESET ticks). Throughput cost is negligible; mirror of self-host/runtime.arr.
+export const GAS_RESET = 2000;
 
 export class Runtime {
   m: binaryen.Module;
