@@ -48,29 +48,46 @@ fun list-sort-by(l, lt, eq):
 end
 fun list-sort(l): list-sort-by(l, lam(a, b): a < b end, lam(a, b): a == b end) end
 
-fun length(l):
+fun length-onto(l, acc):
   cases(List) l:
-    | empty => 0
-    | link(f, r) => 1 + length(r)
+    | empty => acc
+    | link(_, r) => length-onto(r, acc + 1)
   end
 end
+fun length(l): length-onto(l, 0) end
 
-fun map(fn, l):
+# ── CONSTANT-STACK list combinators ──────────────────────────────────────────
+# These were NON-tail-recursive (`link(fn(f), map(fn, r))` etc.), so they used O(N)
+# stack and OVERFLOWED on module-length lists — the dominant self-compile blocker
+# (the self-hosted compiler's passes use map/filter/foldr/append/reverse over huge
+# lists). Rewritten tail-recursively (accumulate reversed, then reverse): the seed
+# emits native tail calls, so these now run in CONSTANT stack. Semantics preserved
+# exactly (same element order; foldr/foldl unchanged acc-first behavior).
+fun reverse-onto(l, acc):
   cases(List) l:
-    | empty => empty
-    | link(f, r) => link(fn(f), map(fn, r))
+    | empty => acc
+    | link(f, r) => reverse-onto(r, link(f, acc))
   end
 end
+fun reverse(l): reverse-onto(l, empty) end
 
-fun filter(pred, l):
+fun map-onto(fn, l, acc):
   cases(List) l:
-    | empty => empty
-    | link(f, r) =>
-      if pred(f): link(f, filter(pred, r))
-      else: filter(pred, r) end
+    | empty => acc
+    | link(f, r) => map-onto(fn, r, link(fn(f), acc))
   end
 end
+fun map(fn, l): reverse-onto(map-onto(fn, l, empty), empty) end
 
+fun filter-onto(pred, l, acc):
+  cases(List) l:
+    | empty => acc
+    | link(f, r) => filter-onto(pred, r, if pred(f): link(f, acc) else: acc end)
+  end
+end
+fun filter(pred, l): reverse-onto(filter-onto(pred, l, empty), empty) end
+
+# foldl is already tail-recursive.
 fun foldl(fn, acc, l):
   cases(List) l:
     | empty => acc
@@ -78,33 +95,13 @@ fun foldl(fn, acc, l):
   end
 end
 
-fun foldr(fn, acc, l):
-  cases(List) l:
-    | empty => acc
-    | link(f, r) => fn(foldr(fn, acc, r), f)
-  end
-end
+# foldr(fn,acc,[a,b,c]) = fn(fn(fn(acc,c),b),a) = foldl(fn, acc, reverse(l)). Tail.
+fun foldr(fn, acc, l): foldl(fn, acc, reverse-onto(l, empty)) end
 
-fun sum(l):
-  cases(List) l:
-    | empty => 0
-    | link(f, r) => f + sum(r)
-  end
-end
+fun sum(l): foldl(lam(a, e): a + e end, 0, l) end
 
-fun append(a, b):
-  cases(List) a:
-    | empty => b
-    | link(f, r) => link(f, append(r, b))
-  end
-end
-
-fun reverse(l):
-  cases(List) l:
-    | empty => empty
-    | link(f, r) => append(reverse(r), link(f, empty))
-  end
-end
+# append(a,b) = a ++ b, tail via two reverses.
+fun append(a, b): reverse-onto(reverse-onto(a, empty), b) end
 
 fun member(l, x):
   cases(List) l:
@@ -151,7 +148,8 @@ fun all(pred, l): cases(List) l: | empty => true | link(f, r) => pred(f) and all
 fun any(pred, l): cases(List) l: | empty => false | link(f, r) => pred(f) or any(pred, r) end end
 
 # ---- string library (built on string-from-code-point + string-to-code-points) ----
-fun list-take(l, n): if n <= 0: empty else: cases(List) l: | empty => empty | link(f, r) => link(f, list-take(r, n - 1)) end end end
+fun list-take-onto(l, n, acc): if n <= 0: acc else: cases(List) l: | empty => acc | link(f, r) => list-take-onto(r, n - 1, link(f, acc)) end end end
+fun list-take(l, n): reverse-onto(list-take-onto(l, n, empty), empty) end
 fun list-drop(l, n): if n <= 0: l else: cases(List) l: | empty => empty | link(f, r) => list-drop(r, n - 1) end end end
 fun cps-prefix(pre, l): cases(List) pre: | empty => true | link(pf, pr) => cases(List) l: | empty => false | link(lf, lr) => (pf == lf) and cps-prefix(pr, lr) end end end
 fun cps-contains(scp, sub): if cps-prefix(sub, scp): true else: cases(List) scp: | empty => false | link(f, r) => cps-contains(r, sub) end end end
@@ -179,13 +177,13 @@ fun num-sqr(n): n * n end
 fun num-negate(n): 0 - n end
 
 # ---- more list builtins (pure Pyret) ----
-fun range(a, b):
-  if a >= b: empty else: link(a, range(a + 1, b)) end
+fun range-onto(a, b, acc):
+  if a >= b: acc else: range-onto(a, b - 1, link(b - 1, acc)) end
 end
+fun range(a, b): range-onto(a, b, empty) end
 
-fun repeat(n, e):
-  if n <= 0: empty else: link(e, repeat(n - 1, e)) end
-end
+fun repeat-onto(n, e, acc): if n <= 0: acc else: repeat-onto(n - 1, e, link(e, acc)) end end
+fun repeat(n, e): repeat-onto(n, e, empty) end
 
 # numbers start..stop in steps of delta (stop exclusive).
 fun range-by(start, stop, delta):
@@ -218,14 +216,16 @@ fun fold3(f, base, l1, l2, l3):
   if is-empty(l1) or is-empty(l2) or is-empty(l3): base
   else: fold3(f, f(base, l1.first, l2.first, l3.first), l1.rest, l2.rest, l3.rest) end
 end
-fun map3(f, l1, l2, l3):
-  if is-empty(l1) or is-empty(l2) or is-empty(l3): empty
-  else: link(f(l1.first, l2.first, l3.first), map3(f, l1.rest, l2.rest, l3.rest)) end
+fun map3-onto(f, l1, l2, l3, acc):
+  if is-empty(l1) or is-empty(l2) or is-empty(l3): acc
+  else: map3-onto(f, l1.rest, l2.rest, l3.rest, link(f(l1.first, l2.first, l3.first), acc)) end
 end
-fun map4(f, l1, l2, l3, l4):
-  if is-empty(l1) or is-empty(l2) or is-empty(l3) or is-empty(l4): empty
-  else: link(f(l1.first, l2.first, l3.first, l4.first), map4(f, l1.rest, l2.rest, l3.rest, l4.rest)) end
+fun map3(f, l1, l2, l3): reverse-onto(map3-onto(f, l1, l2, l3, empty), empty) end
+fun map4-onto(f, l1, l2, l3, l4, acc):
+  if is-empty(l1) or is-empty(l2) or is-empty(l3) or is-empty(l4): acc
+  else: map4-onto(f, l1.rest, l2.rest, l3.rest, l4.rest, link(f(l1.first, l2.first, l3.first, l4.first), acc)) end
 end
+fun map4(f, l1, l2, l3, l4): reverse-onto(map4-onto(f, l1, l2, l3, l4, empty), empty) end
 
 fun each(f, l):
   cases(List) l:
@@ -237,16 +237,17 @@ fun each(f, l):
   end
 end
 
-fun map2(f, a, b):
+fun map2-onto(f, a, b, acc):
   cases(List) a:
-    | empty => empty
+    | empty => acc
     | link(fa, ra) =>
       cases(List) b:
-        | empty => empty
-        | link(fb, rb) => link(f(fa, fb), map2(f, ra, rb))
+        | empty => acc
+        | link(fb, rb) => map2-onto(f, ra, rb, link(f(fa, fb), acc))
       end
   end
 end
+fun map2(f, a, b): reverse-onto(map2-onto(f, a, b, empty), empty) end
 # multi-list map/each (lockstep; stop at the shortest list)
 fun map3(f, a, b, c):
   cases(List) a: | empty => empty
@@ -592,12 +593,13 @@ fun raw-array-duplicate(arr):
 end
 fun take(l, n): list-take(l, n) end
 fun drop(l, n): list-drop(l, n) end
-fun filter-map(f, l):
+fun filter-map-onto(f, l, acc):
   cases(List) l:
-    | empty => empty
-    | link(x, r) => cases(Option) f(x): | some(v) => link(v, filter-map(f, r)) | none => filter-map(f, r) end
+    | empty => acc
+    | link(x, r) => cases(Option) f(x): | some(v) => filter-map-onto(f, r, link(v, acc)) | none => filter-map-onto(f, r, acc) end
   end
 end
+fun filter-map(f, l): reverse-onto(filter-map-onto(f, l, empty), empty) end
 fun distinct(l):
   cases(List) l:
     | empty => empty
