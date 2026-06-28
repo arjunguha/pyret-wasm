@@ -325,6 +325,32 @@ export async function buildSourceFile(path: string): Promise<Uint8Array> {
   return compile(mergeMany(programs), { stmtMod, aliasMap });
 }
 
+// ---- merge-to-SOURCE (for the self-hosting fixpoint) ----
+// The self-hosted compiler driver compiles a SINGLE program (its surface-parse parses one
+// program, no import/module merge). To feed it the WHOLE compiler, produce one merged SOURCE
+// text: the prelude + every closure module's BODY (sliced after its prelude via the CST block's
+// startChar), in dependency order. NOTE: this is a flat concat — qualified `N.member` refs and
+// cross-module name collisions are NOT resolved here (the seed does that on CstNodes via
+// aliasMap/stmtMod). So the merged source only round-trips through a compiler that either does
+// module loading or qualified-ref flattening. Returns { source, paths } for diagnostics.
+export async function mergeSourcesFor(path: string): Promise<{ source: string; paths: string[] }> {
+  const seen = new Map<string, CstNode | null>();
+  const order: CstNode[] = [];
+  const orderPaths: string[] = [];
+  await loadModule(resolve(path), seen, order, orderPaths);
+  if (!_preludeProgram) _preludeProgram = await parsePyret(PRELUDE_SRC);
+  const parts: string[] = [PRELUDE_SRC];
+  for (let i = 0; i < order.length; i++) {
+    const prog = order[i]!;
+    const src = await Bun.file(orderPaths[i]!).text();
+    const block = prog.kids.find((k) => k.name === "block");
+    const start = (block?.pos?.startChar && block.pos.startChar > 0) ? block.pos.startChar : 0;
+    parts.push(`\n# ===== module: ${orderPaths[i]} =====\n`);
+    parts.push(src.slice(start));
+  }
+  return { source: parts.join("\n"), paths: [PRELUDE_PATH, ...orderPaths] };
+}
+
 // Exposed for tests: the cross-module top-level name collisions for a .arr entry.
 export async function collisionsFor(path: string): Promise<Map<string, string[]>> {
   const seen = new Map<string, CstNode | null>();
