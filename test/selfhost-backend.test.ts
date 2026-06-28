@@ -62,11 +62,26 @@ test("self-hosted backend: deep nested-if chain compiles + runs", async () => {
 
 // Roughnum LITERALS (~3.14, PI, …) used to compile to corrupt IEEE-754 bytes — the encoder's
 // f64-bits did num-modulo/num-quotient on a ROUGHNUM, which ref.cast-traps DURING compilation.
-// Now f64-bits emits faithful IEEE-754 bytes (exact mantissa via num-to-rational; magnitude-only
-// split with the sign OR'd into the top byte), so roughnum literals compile + run.
-// (Faithful rough RENDERING + rough arithmetic remain — the rough-tower TODO in runtime.arr.)
+// Now f64-bits emits faithful IEEE-754 bytes, so roughnum literals compile + run.
 test("self-hosted backend: roughnum literals compile + run (faithful f64-bits, no encode trap)", async () => {
   for (const lit of ["~3.14", "~0.5", "~-2.5", "~5.0"]) {
     await expect(runSourceSelfHosted(`x = ${lit}\nprint("ok")`)).resolves.toBeDefined();
   }
+});
+
+// Rough number TOWER (self-host/runtime.arr): rendering ($render_rough) + arithmetic /
+// comparison with Pyret contagion (any rough operand -> rough result). Previously
+// $render_num printed the "roughnum" placeholder and rough ops ref.cast-trapped.
+test("self-hosted: roughnums render as ~decimal ($render_rough)", async () => {
+  expect(await selfHosted("print(~3.14)")).toBe("~3.14");
+  expect(await selfHosted("print(~5.0)")).toBe("~5");
+  expect(await selfHosted("print(~0.5)")).toBe("~0.5");
+  expect(await selfHosted("print(0 - ~0.5)")).toBe("~-0.5"); // negative
+});
+
+test("self-hosted: rough arithmetic + contagion + comparison", async () => {
+  expect(await selfHosted("print(~1.5 + ~2.0)")).toBe("~3.5");
+  expect(await selfHosted("print(~1.5 + 2)")).toBe("~3.5");   // fix+rough = rough (contagion)
+  await expect(runSourceSelfHosted("if ~1.5 < ~2.0: 0 else: 1 / 0 end")).resolves.toBeDefined();
+  await expect(runSourceSelfHosted("if (~1.5 + 2) == ~3.5: 0 else: 1 / 0 end")).resolves.toBeDefined();
 });

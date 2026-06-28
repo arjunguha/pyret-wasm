@@ -196,57 +196,77 @@ fun emit-make-rat() -> RtFun:
   todo("$make_rat", "reduce num/den via $gcd, normalize sign, struct.new $Rational {TAG-RAT,num,den}")
 end
 
-# ===== number tower: ops (FIXNUM fast path; rough/rational/bignum still TODO) =====
-# $plus(a, b) -> anyref : string concat if a is a $Str, else fixnum add. (mirrors
-# runtime.ts $plus, fixnum-only arithmetic — TODO(port): num-tower contagion.)
+# ===== number tower: ops (FIXNUM + ROUGH; rational/bignum still TODO) =====
+# Rough CONTAGION: if either operand is a roughnum, compute in f64 and return $make_rough
+# (mirrors the seed's buildBinop: eitherRough -> f64 op -> $make_rough). Exact rational/
+# bignum paths remain fixnum-only TODO.
+# tag of the $Num in local idx (anyref/ref $Num -> field 0).
+fun num-tag(idx :: Number) -> List<Number>:
+  E.local-get(idx).append(E.ref-cast(T-NUM)).append(E.struct-get(T-NUM, 0))
+end
+# i32: 1 if either operand (locals 0,1) is a roughnum.
+fun either-rough() -> List<Number>:
+  num-tag(0).append(E.i32-const(TAG-ROUGH)).append(E.i32-eq)
+    .append(num-tag(1)).append(E.i32-const(TAG-ROUGH)).append(E.i32-eq).append(E.i32-or)
+end
+# f64 value of operand in local idx (-> $Num -> $to_f64).
+fun to-f64(idx :: Number) -> List<Number>:
+  E.local-get(idx).append(E.ref-cast(T-NUM)).append(rt-call("$to_f64"))
+end
+# $plus(a, b) -> anyref : string concat if a is a $Str; rough add if either rough; else fixnum.
 fun emit-plus() -> RtFun:
   body = E.local-get(0).append(E.ref-test-null(T-STR))
     .append(ifel-bt(anyref,
         [list: E.local-get(0), E.ref-cast(T-STR), E.local-get(1), E.ref-cast(T-STR), rt-call("$str_concat")],
-        [list: fix-i64(0), fix-i64(1), E.i64-add, rt-call("$make_fix")]))
+        [list: either-rough(), ifel-bt(anyref,
+            [list: to-f64(0), to-f64(1), E.f64-add, rt-call("$make_rough")],
+            [list: fix-i64(0), fix-i64(1), E.i64-add, rt-call("$make_fix")])]))
     .append(E.end-instr)
   rt-fun("$plus", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $minus(a, b) -> anyref : fixnum subtraction. TODO(port): num-tower contagion.
+# $minus/$times/$divide : rough contagion then fixnum.
 fun emit-minus() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-sub).append(rt-call("$make_fix"))
-    .append(E.end-instr)
+  body = either-rough().append(ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-sub, rt-call("$make_rough")],
+      [list: fix-i64(0), fix-i64(1), E.i64-sub, rt-call("$make_fix")])).append(E.end-instr)
   rt-fun("$minus", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $times(a, b) -> anyref : fixnum multiplication. TODO(port): num-tower contagion.
 fun emit-times() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-mul).append(rt-call("$make_fix"))
-    .append(E.end-instr)
+  body = either-rough().append(ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-mul, rt-call("$make_rough")],
+      [list: fix-i64(0), fix-i64(1), E.i64-mul, rt-call("$make_fix")])).append(E.end-instr)
   rt-fun("$times", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $divide(a, b) -> anyref : fixnum division. TODO(port): rationals, zero check.
+# $divide : rough -> f64 div; else fixnum (TODO(port): exact rationals, zero check).
 fun emit-divide() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-div-s).append(rt-call("$make_fix"))
-    .append(E.end-instr)
+  body = either-rough().append(ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-div, rt-call("$make_rough")],
+      [list: fix-i64(0), fix-i64(1), E.i64-div-s, rt-call("$make_fix")])).append(E.end-instr)
   rt-fun("$divide", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $lessthan(a, b) -> anyref (Pyret bool i31): fixnum <. TODO(port): num-tower.
+# comparisons -> Pyret bool i31 : rough f64 compare if either rough, else fixnum i64.
 fun emit-lessthan() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-lt-s).append(E.ref-i31)
-    .append(E.end-instr)
+  body = either-rough().append(ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-lt, E.ref-i31],
+      [list: fix-i64(0), fix-i64(1), E.i64-lt-s, E.ref-i31])).append(E.end-instr)
   rt-fun("$lessthan", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $greaterthan(a, b) -> anyref (Pyret bool i31): fixnum >. TODO(port): num-tower.
 fun emit-greaterthan() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-gt-s).append(E.ref-i31)
-    .append(E.end-instr)
+  body = either-rough().append(ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-gt, E.ref-i31],
+      [list: fix-i64(0), fix-i64(1), E.i64-gt-s, E.ref-i31])).append(E.end-instr)
   rt-fun("$greaterthan", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $lessequal(a, b) -> anyref (Pyret bool i31): fixnum <=. TODO(port): num-tower.
 fun emit-lessequal() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-le-s).append(E.ref-i31)
-    .append(E.end-instr)
+  body = either-rough().append(ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-le, E.ref-i31],
+      [list: fix-i64(0), fix-i64(1), E.i64-le-s, E.ref-i31])).append(E.end-instr)
   rt-fun("$lessequal", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $greaterequal(a, b) -> anyref (Pyret bool i31): fixnum >=. TODO(port): num-tower.
 fun emit-greaterequal() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-ge-s).append(E.ref-i31)
-    .append(E.end-instr)
+  body = either-rough().append(ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-ge, E.ref-i31],
+      [list: fix-i64(0), fix-i64(1), E.i64-ge-s, E.ref-i31])).append(E.end-instr)
   rt-fun("$greaterequal", [list: anyref, anyref], [list: anyref], empty, body)
 end
 # $equal_wrap(a, b) -> anyref (Pyret bool i31): structural equality, wrapped as bool.
@@ -256,17 +276,24 @@ fun emit-equal-wrap() -> RtFun:
     .append(E.end-instr)
   rt-fun("$equal_wrap", [list: anyref, anyref], [list: anyref], empty, body)
 end
-# $num_equal(a, b) -> i32 : fixnum i64 equality. TODO(port): rationals/rough/bignum.
+# $num_equal(a, b) -> i32 : rough f64 eq if either rough, else fixnum i64 eq.
 fun emit-num-equal() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-eq).append(E.end-instr)
+  body = either-rough().append(ifel-bt(i32t,
+      [list: to-f64(0), to-f64(1), E.f64-eq],
+      [list: fix-i64(0), fix-i64(1), E.i64-eq])).append(E.end-instr)
   rt-fun("$num_equal", [list: E.reft(T-NUM), E.reft(T-NUM)], [list: i32t], empty, body)
 end
-# $num_compare(a, b) -> i32 (-1/0/1) : fixnum i64 compare.
+# $num_compare(a, b) -> i32 (-1/0/1) : rough f64 compare if either rough, else fixnum.
 fun emit-num-compare() -> RtFun:
-  body = fix-i64(0).append(fix-i64(1)).append(E.i64-lt-s)
-    .append(ifel-bt(i32t, [list: E.i32-const(0 - 1)],
-        [list: fix-i64(0), fix-i64(1), E.i64-gt-s,
-               ifel-bt(i32t, [list: E.i32-const(1)], [list: E.i32-const(0)])]))
+  body = either-rough().append(ifel-bt(i32t,
+      [list: to-f64(0), to-f64(1), E.f64-lt,
+             ifel-bt(i32t, [list: E.i32-const(0 - 1)],
+               [list: to-f64(0), to-f64(1), E.f64-gt,
+                      ifel-bt(i32t, [list: E.i32-const(1)], [list: E.i32-const(0)])])],
+      [list: fix-i64(0), fix-i64(1), E.i64-lt-s,
+             ifel-bt(i32t, [list: E.i32-const(0 - 1)],
+               [list: fix-i64(0), fix-i64(1), E.i64-gt-s,
+                      ifel-bt(i32t, [list: E.i32-const(1)], [list: E.i32-const(0)])])]))
     .append(E.end-instr)
   rt-fun("$num_compare", [list: E.reft(T-NUM), E.reft(T-NUM)], [list: i32t], empty, body)
 end
@@ -337,13 +364,71 @@ fun emit-to-f64() -> RtFun:
     .append(E.end-instr)
   rt-fun("$to_f64", [list: E.reft(T-NUM)], [list: f64t], empty, body)
 end
-# $render_num(v :: $Num, addr :: i32) -> i32 end-addr. Roughnums print "roughnum";
-# everything else uses the fixnum decimal path (the tower is fixnum-only). locals: none.
+# $render_rough(x :: f64, addr :: i32) -> i32 end-addr. Pyret's `~`-prefixed decimal
+# (port of the seed's $render_rough): "~" + sign + integer part (via $write_i64) + up to
+# 15 fractional digits, rounded, trailing zeros trimmed; NaN -> "~nan", inf -> "~inf".
+# params: 0=x(f64) 1=addr(i32). locals: 2=a(i32 cursor) 3=ax(f64 |x|) 4=ip(i64) 5=fr(i64)
+# 6=width(i32) 7=divisor(i64) 8=d(i64).
+fun emit-render-rough() -> RtFun:
+  store-char = lam(c :: Number): seq([list: E.local-get(2), E.i32-const(c), E.i32-store8]) end
+  inc-a = seq([list: E.local-get(2), E.i32-const(1), E.i32-add, E.local-set(2)])
+  e15 = 1000000000000000
+  body = blk(i32t, [list:
+      E.local-get(1), E.local-set(2),                 # a = addr
+      store-char(126), inc-a,                          # "~"
+      # NaN: x != x -> "~nan", return a+3
+      E.local-get(0), E.local-get(0), E.f64-ne,
+      iff([list: lit-at(2, "nan"), E.local-get(2), E.i32-const(3), E.i32-add, E.i-br(1)]),
+      # sign
+      E.local-get(0), E.f64-const(0), E.f64-lt, iff([list: store-char(45), inc-a]),
+      E.local-get(0), E.f64-abs, E.local-set(3),       # ax = |x|
+      # inf: (ax*0) is NaN (true only for inf, nan already handled) -> "~inf", return a+3
+      E.local-get(3), E.f64-const(0), E.f64-mul, E.local-get(3), E.f64-const(0), E.f64-mul, E.f64-ne,
+      iff([list: lit-at(2, "inf"), E.local-get(2), E.i32-const(3), E.i32-add, E.i-br(1)]),
+      E.local-get(3), E.i64-trunc-sat-f64-s, E.local-set(4),   # ip = trunc(ax)
+      # fr = trunc((ax - ip)*1e15 + 0.5)
+      E.local-get(3), E.local-get(4), E.f64-convert-i64-s, E.f64-sub,
+      E.f64-const(e15), E.f64-mul, E.f64-const(0.5), E.f64-add, E.i64-trunc-sat-f64-s, E.local-set(5),
+      # carry if rounding bumped to a whole unit
+      E.local-get(5), E.i64-const(e15), E.i64-ge-u,
+      iff([list: E.local-get(4), E.i64-const(1), E.i64-add, E.local-set(4), E.i64-const(0), E.local-set(5)]),
+      # integer digits: a += $write_i64(ip, a)
+      E.local-get(2), E.local-get(4), E.local-get(2), rt-call("$write_i64"), E.i32-add, E.local-set(2),
+      # fractional digits (only when nonzero)
+      E.local-get(5), E.i64-const(0), E.i64-ne,
+      iff([list:
+        E.i32-const(15), E.local-set(6),               # width = 15
+        # trim trailing zeros
+        lp([list: E.local-get(5), E.i64-const(10), E.i64-rem-u, E.i64-eqz, iff([list:
+          E.local-get(5), E.i64-const(10), E.i64-div-u, E.local-set(5),
+          E.local-get(6), E.i32-const(1), E.i32-sub, E.local-set(6), E.i-br(1)])]),
+        store-char(46), inc-a,                          # "."
+        # divisor = 10^(width-1)
+        E.i64-const(1), E.local-set(7),
+        E.local-get(6), E.i32-const(1), E.i32-sub, E.i64-extend-i32-u, E.local-set(8),
+        lp([list: E.local-get(8), E.i64-const(0), E.i64-gt-s, iff([list:
+          E.local-get(7), E.i64-const(10), E.i64-mul, E.local-set(7),
+          E.local-get(8), E.i64-const(1), E.i64-sub, E.local-set(8), E.i-br(1)])]),
+        # emit `width` digits, most-significant first
+        lp([list: E.local-get(6), E.i32-const(0), E.i32-gt-s, iff([list:
+          E.local-get(5), E.local-get(7), E.i64-div-u, E.local-set(8),
+          E.local-get(2), E.i32-const(48), E.local-get(8), E.i32-wrap-i64, E.i32-add, E.i32-store8,
+          inc-a,
+          E.local-get(5), E.local-get(8), E.local-get(7), E.i64-mul, E.i64-sub, E.local-set(5),
+          E.local-get(7), E.i64-const(10), E.i64-div-u, E.local-set(7),
+          E.local-get(6), E.i32-const(1), E.i32-sub, E.local-set(6), E.i-br(1)])])]),
+      E.local-get(2) ]).append(E.end-instr)
+  rt-fun("$render_rough", [list: f64t, i32t], [list: i32t],
+    [list: E.local-decl(1, i32t), E.local-decl(1, f64t), E.local-decl(2, i64t),
+           E.local-decl(1, i32t), E.local-decl(2, i64t)], body)
+end
+# $render_num(v :: $Num, addr :: i32) -> i32 end-addr. Roughnums via $render_rough;
+# everything else uses the fixnum decimal path (exact rational/bignum render still TODO).
 fun emit-render-num() -> RtFun:
   body = blk(i32t, [list:
       E.local-get(0), E.struct-get(T-NUM, 0), E.i32-const(TAG-ROUGH), E.i32-eq, iff([list:
-        lit-at(1, "roughnum"),
-        E.local-get(1), E.i32-const(8), E.i32-add, E.i-br(1) ]),
+        E.local-get(0), E.ref-cast(T-ROUGH), E.struct-get(T-ROUGH, 1), E.local-get(1), rt-call("$render_rough"),
+        E.i-br(1) ]),
       # fixnum: addr + $write_i64((cast $Fixnum).payload, addr)
       E.local-get(1),
       E.local-get(0), E.ref-cast(T-FIX), E.struct-get(T-FIX, 1), E.local-get(1), rt-call("$write_i64"),
@@ -979,7 +1064,7 @@ all-runtime-funs :: List<String> = [list:
   "$equal","$render","$val_to_string",
   "$check_is","$check_is_not","$check_pred","$yield",
   # renderer helpers + decimal writer + str-copy (appended; order parallels build-runtime)
-  "$render_num","$write_i64","$str_copy","$render_variant","$render_list","$render_tuple","$render_object",
+  "$render_num","$render_rough","$write_i64","$str_copy","$render_variant","$render_list","$render_tuple","$render_object",
   "$variant_match" ]
 
 # Assemble all runtime functions in order. TODO bodies trap; fleshed ones are real.
@@ -998,7 +1083,7 @@ fun build-runtime() -> List<RtFun>:
     emit-make-object(), emit-obj-get(), emit-obj-equal(), emit-obj-extend(), emit-make-method(), emit-lookup-method(), emit-cons(), emit-empty-list(),
     emit-equal(), emit-render(), emit-val-to-string(),
     emit-check-is(), emit-check-is-not(), emit-check-pred(), emit-yield(),
-    emit-render-num(), emit-write-i64(), emit-str-copy(),
+    emit-render-num(), emit-render-rough(), emit-write-i64(), emit-str-copy(),
     emit-render-variant(), emit-render-list(), emit-render-tuple(), emit-render-object(),
     emit-variant-match() ]
 end
