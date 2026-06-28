@@ -104,10 +104,12 @@ data Ctx: ctx(locals, next-local :: Number, vars, fenv, lams, dreg, gvars, nlams
 # old tostring instead of crashing on a missing .key(). (Loc-independent for s-name, which
 # is what the injected-List link/empty resolution needs.)
 fun name-key(n): if A.is-s-name(n): "name#" + n.s else: tostring(n) end end
-fun bind-local(c :: Ctx, key, idx :: Number) -> Ctx:
+fun bind-local(c :: Ctx, key, idx :: Number) -> Ctx block:
+  max-local-used := num-max(max-local-used, idx + 1)
   ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
-fun bind-var(c :: Ctx, key, idx :: Number) -> Ctx:
+fun bind-var(c :: Ctx, key, idx :: Number) -> Ctx block:
+  max-local-used := num-max(max-local-used, idx + 1)
   ctx(link({k: key, i: idx}, c.locals), num-max(c.next-local, idx + 1), link(key, c.vars), c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
 end
 fun is-var(c :: Ctx, key) -> Boolean: c.vars.member(key) end
@@ -933,7 +935,18 @@ fun main-type-idx(): NUM-GC-TYPES + length(RT-FUNS) + 1 end
 fun import-type-base(): NUM-GC-TYPES + length(RT-FUNS) + 2 end
 fun import-type-idx(k :: Number): import-type-base() + k end
 
-LOCAL-BUDGET = 512   # anyref locals declared per function (over-declared; unused are legal)
+# Per-function declared-local COUNT is computed EXACTLY (max local index used) rather than a
+# fixed cap — big self-compiled functions (long a-let spines) need far more than the old 512,
+# which caused "unknown local 512" at instantiation. bind-local/bind-var bump max-local-used;
+# locals-decl(nparams) reads it AFTER the body bytes are built. LOCAL-MARGIN covers the small
+# inline scratch temps (a-app uses next-local+2, a-extend +3, a-cases vtmp +1, ...) that are
+# allocated by index without going through bind-local.
+var max-local-used :: Number = 0
+LOCAL-MARGIN = 32
+fun locals-decl(nparams :: Number) -> List<List<Number>>:
+  cnt = num-max(0, max-local-used - nparams) + LOCAL-MARGIN
+  [list: E.local-decl(cnt, E.anyref)]
+end
 
 # assign each collected lambda its fnIndex (== source position) -> List<{k; i; fvs}>
 fun index-pairs(items, i :: Number, acc):
@@ -946,12 +959,13 @@ end
 # compile one lambda to a code entry: caps (free vars from the closure env, local 0) and
 # args (from the $Fields param, local 1) are loaded into fresh locals, then the body in
 # tail position.  A captured `var` is re-bound as a var so reads/writes go through the box.
-fun compile-lam(lr, lam-map, dreg, gvars, nlams :: Number, gmap) -> List<Number>:
+fun compile-lam(lr, lam-map, dreg, gvars, nlams :: Number, gmap) -> List<Number> block:
+  max-local-used := 2   # 2 params: local 0 = closure env, local 1 = args $Fields
   c0 = ctx(empty, 2, empty, gmap, lam-map, dreg, gvars, nlams)
   capres = bind-caps(lr.fvs, 0, c0, empty)
   argres = setup-args(lr.args, capres.cx, capres.code, 0)
-  body-code = compile-aexpr(lr.body, argres.cx, true)
-  E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], argres.code.append(body-code))
+  body-code = compile-aexpr(lr.body, argres.cx, true)   # built first -> max-local-used final
+  E.code-entry(locals-decl(2), argres.code.append(body-code))
 end
 # load each captured free var out of the closure env (local 0 -> $Closure.caps[j]).
 fun bind-caps(fvs, j :: Number, c :: Ctx, code):
@@ -982,12 +996,13 @@ fun setup-args(args, c :: Ctx, code, argi :: Number):
 end
 # compile one variant constructor: receives args as $Fields (local 1); builds the
 # $Variant {id, name, fields=local1} and returns it.
-fun compile-ctor(d) -> List<Number>:
+fun compile-ctor(d) -> List<Number> block:
+  max-local-used := 2   # only param local 1 is used; no fresh locals
   # local 1 (the args $Fields param) is nullable in the closure-call signature; the
   # $Variant.fields field is non-null, so cast before struct.new.
   body = E.i32-const(d.id).append(emit-str(d.name))
     .append(E.local-get(1)).append(E.ref-cast(T-FIELDS)).append(E.struct-new(T-VARIANT))
-  E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)], body)
+  E.code-entry(locals-decl(2), body)   # ctor uses only param local 1 -> just the margin
 end
 # $variant_names global = (ref $Fields) of $Names, indexed by variant id, so
 # $variant_field_by_name can scan a variant's field names. Built from the registry.
@@ -1073,9 +1088,13 @@ fun compile-prog(prog) -> List<Number>:
           .append(E.end-instr)
       # NB: assemble with concat-bytes (tail-recursive), NOT `huge-body.append(...)` —
       # appending onto the whole compiled body recurses to its length and overflows.
-      main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)],
+      # build main's body FIRST (updating max-local-used), THEN read it for locals-decl.
+      main-body-bytes = block:
+        max-local-used := 0   # main() has no params
         E.concat-bytes([list: list-id-init, vm-init,
-          compile-aexpr(body, main-ctx, false), check-summary-instrs]))
+          compile-aexpr(body, main-ctx, false), check-summary-instrs])
+      end
+      main-code = E.code-entry(locals-decl(0), main-body-bytes)
       lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry

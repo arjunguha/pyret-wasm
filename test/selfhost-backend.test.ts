@@ -85,3 +85,14 @@ test("self-hosted: rough arithmetic + contagion + comparison", async () => {
   await expect(runSourceSelfHosted("if ~1.5 < ~2.0: 0 else: 1 / 0 end")).resolves.toBeDefined();
   await expect(runSourceSelfHosted("if (~1.5 + 2) == ~3.5: 0 else: 1 / 0 end")).resolves.toBeDefined();
 });
+
+// Per-function declared-local count is now EXACT (was a fixed 512 cap). A function needing
+// >512 locals (a long let-spine) used to fail WASM INSTANTIATION with "unknown local 512";
+// the backend now declares (max local index used) + margin, so big functions validate. This
+// was the last blocker for the self-hosted compiler to compile its OWN large functions.
+test("self-hosted backend: a function with >512 locals instantiates (no fixed local cap)", async () => {
+  let src = "x0 = 0\n";
+  for (let i = 1; i <= 600; i = i + 1) src = src + ("x" + i + " = x" + (i - 1) + " + 1\n");
+  src = src + ("if x600 == 600: 0 else: 1 / 0 end");
+  await expect(runSourceSelfHosted(src)).resolves.toBeDefined();
+});
