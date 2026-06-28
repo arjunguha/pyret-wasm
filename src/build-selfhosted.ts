@@ -2,10 +2,7 @@
 // that is ITSELF written in Pyret — the real front-end (self-compiler/) + the
 // Pyret-written backend (self-host/wasm-of-pyret.arr + encoder.arr + runtime.arr),
 // driven by self-host/compile-driver.arr — and compiled to WASM by the seed.
-//
-// (NB: the older src/build-selfhost.ts drives the small `selfhost/compiler.arr`
-// microcosm toy used by the dual-run/fixpoint discipline in test/selfhost.test.ts.
-// THIS module drives the real driver and is what the CLI's --self-hosted uses.)
+// THIS module drives the real driver and is what the CLI's --self-hosted uses.
 //
 // To compile a *user* program we instantiate the seed-compiled driver, hand it the
 // user's source via the `read-source()` host import (state.sourceBytes) plus the

@@ -1,7 +1,7 @@
 // Self-hosted compiler STOPPABILITY (CPS) codegen tests.
 //
 // The deployable IDE runs user code through ONE path: the Pyret->Pyret CPS transform
-// (self-host/cps.arr) composed BEFORE the self-hosted compiler, run on the single-thread
+// (self-host/cps-ast.arr) composed BEFORE the self-hosted compiler, run on the single-thread
 // trampoline (run-stoppable.ts). For that to work the self-hosted BACKEND must lower the
 // stoppability primitives the CPS pass emits — previously only the TS seed could:
 //   yield-check(thunk)        -- per-fn/loop interrupt point  -> runtime $yield (tail call)

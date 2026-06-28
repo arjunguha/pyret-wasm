@@ -622,7 +622,7 @@ fun find-arith(tbl, key :: String):
 end
 
 # ===== stoppable (CPS) codegen intrinsics =====
-# The CPS pass (self-host/cps.arr, mirrored by src/compiler/cps.ts) rewrites the program
+# The CPS pass (self-host/cps-ast.arr) rewrites the program
 # into continuation-passing style and emits three intrinsic call families the backend must
 # lower (the seed lowers them in compile.ts; this is the self-hosted port):
 #   yield-check(thunk)            -- per-fn/loop interrupt point  -> runtime $yield (tail)

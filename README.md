@@ -73,12 +73,9 @@ tracked as a *health metric*, not the target.
 
 ```
 src/                     The SEED compiler + runtime (TypeScript)
-  cli.ts                 `pyretc run [--self-hosted] <file.arr>` entry point
+  cli.ts                 `pyretc run [--self-hosted] [--stoppable] <file.arr>` entry point
   build.ts               buildSource / buildSourceFile: parse → compile → wasm (+ multi-module inlining)
   build-core.ts          parser-agnostic build helper
-  build-stoppable.ts     STOPPABLE build: run the Pyret CPS transform, then seed-compile
-  build-stoppable-core.ts  parser-agnostic stoppable build
-  build-selfhost.ts      drive the old selfhost/ toy compiler (used by selfhost.test.ts / dual-run)
   build-selfhosted.ts    drive the REAL self-hosted compiler (self-host/compile-driver.arr);
                          used by the CLI's --self-hosted and the fixpoint script
   parser/
@@ -116,10 +113,8 @@ self-host/               The SELF-HOSTED compiler + CPS transform, WRITTEN IN PY
                          parses 83 of 84 real compiler/library files; the only parser the
                          web IDE uses
   parse-from-tree.arr    rebuilds ast.arr nodes from the JS-GLR bridge (seed/CLI crutch path)
-  cps-ast.arr            the ast→ast CPS stoppable transform (no string emission/re-parse)
-  cps-ast-driver.arr     driver for cps-ast (test/bootstrap shim)
-  cps.arr                OLDER string-emitting CPS transform (seed's stoppable build path;
-                         being superseded by cps-ast.arr for the self-hosted path)
+  cps-ast.arr            the ast→ast CPS stoppable transform (no string emission/re-parse);
+                         the ONLY CPS transform — composed in cps-compile-driver.arr
   *-notes.md             coverage/plan notes (parser, namespace)
 
 self-compiler/           A COPY of Pyret's real in-Pyret compiler, reused + modifiable
@@ -133,21 +128,21 @@ web/                     The browser IDE (served statically; user code runs on t
 
 scripts/
   serve.ts               static server for the IDE (PORT, HOST env)
-  bench.ts               benchmark: seed Pyret→Wasm on the pitometer programs
+  bench-cps.ts           benchmark: the CPS self-hosted compiler (web/cps-compile-driver.wasm)
+                         on the pitometer programs, immediate-resume trampoline
   bench-pyret-baseline.sh benchmark: original Pyret (rebuilds + times standalones)
+  test-par.ts            parallel test runner (`bun run test:par`): shards test files
+                         across worker processes (default 8-way)
   ide-test.ts            headless-Chrome smoke test of the IDE (puppeteer-core)
   run-corpus.ts          runs Pyret's own .arr test corpus as a scoreboard
-  selfhost-fixpoint.ts   old fixpoint meter (iterates compile-driver.arr generations)
+  selfhost-corpus.ts     per-program self-hosted-vs-seed compile scoreboard
   fixpoint-bytecompare.ts  the fixpoint gate: iterates until two consecutive generations
                          are byte-identical; reports FIXPOINT ✅ when converged
   gen-cps-compile-driver.ts  builds web/cps-compile-driver.wasm (the web IDE's single artifact)
   gen-merged-compiler.ts  reports stats on the merged whole-compiler source
 
-selfhost/                EARLIER microcosm demos (a ~500-line toy compiler-in-Pyret that
-                         proved every WASM-emission mechanism). SUPERSEDED by self-host/ +
-                         self-compiler/; kept for reference and the dual-run fixpoint tests.
 examples/                small standalone .arr programs
-test/                    ~64 *.test.ts suites (see Testing)
+test/                    ~60 *.test.ts suites (see Testing)
 pyret/                   upstream Pyret (brownplt/pyret-lang) — reused parser, the .arr passes
                          we copied, the pitometer benchmark suite, and the baseline compiler
                          (a gitignored symlink to ../pyret)
@@ -395,8 +390,7 @@ Config A startup baseline = average of three `trivial` (`print(1)`) measurements
 |---|---|
 | `e2e.test.ts` + the feature suites | full pipeline: number tower, strings, data/cases, objects, lists, closures, tail calls, error messages, `check` blocks, multi-module, modules + name-collision resolution |
 | `selfhost-e2e.test.ts` | the **self-hosted** compiler: a program compiled by the Pyret-written compiler (no JS codegen) to a runnable WASM module |
-| `selfhost-stoppable.test.ts` | the self-hosted CPS path: Stop interrupts an infinite loop, pause/resume work, via the pure-Pyret backend's `$yield`/`resume` |
-| `cps-ast.test.ts` + `cps.test.ts` + `stoppable.test.ts` | the ast→ast CPS transform preserves semantics; Stop interrupts an infinite loop / a built-in `each` on one thread |
+| `selfhost-stoppable.test.ts` | the self-hosted CPS path: the ast→ast CPS transform's stoppability primitives lower correctly — Stop interrupts an infinite loop, pause/resume work, via the pure-Pyret backend's `$yield`/`resume` |
 | `pyret-parser.test.ts` | the **pure-Pyret parser**: parses real source (incl. real compiler/library files, large files via constant-stack tokenizer) into the real `ast.arr` AST |
 | `surface-parse.test.ts` | the JS-GLR `surface-parse` crutch: ~38 grammar forms rebuilt into `ast.arr` |
 | `runtime.test.ts` | the WASM number tower directly (add/sub/mul/divide, equality, compare, rendering) |
