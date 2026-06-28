@@ -115,3 +115,13 @@ test("self-hosted: top-level value forward-references a later fun / data-ctor (d
   await expect(runSourceSelfHosted("y = mk(3)\ndata D: | mk(n) end\nif y.n == 3: 0 else: 1 / 0 end")).resolves.toBeDefined();
   await expect(runSourceSelfHosted("fun g(): x end\nx = 7\nif g() == 7: 0 else: 1 / 0 end")).resolves.toBeDefined();
 });
+
+// Operator overloading: `a + b` where `+` resolves to a data variant's `_plus` method
+// (e.g. pprint's `doc + doc`) used to ref.cast-trap — $plus only handled str/num and cast
+// the $Variant operand to $Num. $plus now dispatches to the operand's _plus method.
+test("self-hosted: operator + dispatches to a data _plus method (no ref.cast)", async () => {
+  await expect(runSourceSelfHosted(
+    "data D:\n  | a(n)\nsharing:\n  method _plus(self, o): a(self.n + o.n) end\nend\n" +
+    "x = a(1)\ny = x + a(2)\nif y.n == 3: 0 else: 1 / 0 end"
+  )).resolves.toBeDefined();
+});

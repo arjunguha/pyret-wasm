@@ -223,14 +223,38 @@ fun to-f64(idx :: Number) -> List<Number>:
 end
 # $plus(a, b) -> anyref : string concat if a is a $Str; rough add if either rough; else fixnum.
 fun emit-plus() -> RtFun:
+  # a is $Str -> concat; a is a number ($Num) -> rough/fixnum; ELSE (a $Variant/$Object) ->
+  # dispatch its `_plus` method with [a, b] (Pyret operator overloading). The variant/object
+  # case previously fell through to the fixnum path and ref.cast-trapped on a $Variant — the
+  # `pprint`-style `doc + doc` at top level (the fixpoint compiler2-run blocker).
+  number-path = seq([list: either-rough(), ifel-bt(anyref,
+      [list: to-f64(0), to-f64(1), E.f64-add, rt-call("$make_rough")],
+      [list: fix-i64(0), fix-i64(1), E.i64-add, rt-call("$make_fix")])])
   body = E.local-get(0).append(E.ref-test-null(T-STR))
     .append(ifel-bt(anyref,
         [list: E.local-get(0), E.ref-cast(T-STR), E.local-get(1), E.ref-cast(T-STR), rt-call("$str_concat")],
-        [list: either-rough(), ifel-bt(anyref,
-            [list: to-f64(0), to-f64(1), E.f64-add, rt-call("$make_rough")],
-            [list: fix-i64(0), fix-i64(1), E.i64-add, rt-call("$make_fix")])]))
+        [list: E.local-get(0), E.ref-test-null(T-NUM),
+               ifel-bt(anyref, [list: number-path], [list: dispatch-binop-method("_plus")])]))
     .append(E.end-instr)
-  rt-fun("$plus", [list: anyref, anyref], [list: anyref], empty, body)
+  rt-fun("$plus", [list: anyref, anyref], [list: anyref],
+    [list: E.local-decl(1, anyref), E.local-decl(1, E.reft(T-CLOSURE))], body)
+end
+# Dispatch an overloaded binary operator to the operand's method (e.g. `a + b` -> a's
+# `_plus` method called with [a, b]). a (local 0) is a $Variant or $Object; $lookup_method
+# returns the field ($Method or plain closure); call its closure with $Fields(self=a, b).
+# Locals 2 = looked-up field (anyref), 3 = closure. Mirrors a-method-app in wasm-of-pyret.
+fun dispatch-binop-method(mname :: String) -> List<Number>:
+  seq([list:
+    E.local-get(0), str-lit(mname), rt-call("$lookup_method"), E.local-set(2),
+    E.local-get(2), E.ref-test-null(T-METHOD),
+    ifel-bt(E.reft(T-CLOSURE),
+      [list: E.local-get(2), E.ref-cast(T-METHOD), E.struct-get(T-METHOD, 0)],
+      [list: E.local-get(2), E.ref-cast(T-CLOSURE)]),
+    E.local-set(3),
+    E.local-get(3),
+    E.local-get(0), E.local-get(1), E.array-new-fixed(T-FIELDS, 2),
+    E.local-get(3), E.struct-get(T-CLOSURE, 0),
+    E.i-return-call-indirect(closure-call-tyidx(), 0) ])
 end
 # $minus/$times/$divide : rough contagion then fixnum.
 fun emit-minus() -> RtFun:
