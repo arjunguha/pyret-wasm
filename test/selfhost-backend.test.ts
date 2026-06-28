@@ -1,11 +1,11 @@
-// Self-hosted BACKEND regression tests: object `.{ ... }` extend + method dispatch.
-// Object EXTEND was doubly broken: (1) the backend passed the super as anyref where
-// $obj_extend wants (ref $Object) — data-field extend failed WASM validation; (2) the
-// driver's s-extend desugar read f.value directly, crashing on method fields (they have
-// .body, not .value) — the `default-map-visitor.{ method ... }` idiom every visitor
-// module uses. Both fixed; these assert the result via the SELF-HOSTED compiler.
+// Self-hosted BACKEND regression tests (self-host/wasm-of-pyret.arr), driven through the
+// real driver via src/build-selfhosted.ts.
+// - object `.{ ... }` extend + method dispatch (extend was doubly broken: the backend
+//   passed the super as anyref where $obj_extend wants (ref $Object); the driver's s-extend
+//   desugar read f.value, crashing on method fields). Both fixed.
+// - method-as-value: `f = o.m` is a $Method wrapping a $Closure; a-app unwraps it before call.
 import { test, expect } from "bun:test";
-import { buildSourceSelfHosted, runSelfHostedModule } from "../src/build-selfhosted.ts";
+import { buildSourceSelfHosted, runSelfHostedModule, runSourceSelfHosted } from "../src/build-selfhosted.ts";
 
 async function selfHosted(src: string): Promise<string> {
   return (await runSelfHostedModule(await buildSourceSelfHosted(src))).trim();
@@ -28,4 +28,14 @@ test("object extend with a METHOD: call an inherited base method", async () => {
 test("object extend with a METHOD: call the newly-added method", async () => {
   const out = await selfHosted(`base = { method m(self): 11 end }\next = base.{ method k(self): 22 end }\nprint(ext.k())`);
   expect(out).toContain("22");
+});
+
+// `f = o.m` takes a method off an object as a VALUE — a $Method wrapping a $Closure.
+// Applying it (`f(o, 4)`) used to ref.cast-fail; a-app now unwraps a $Method callee first.
+test("self-hosted backend: a method taken as a value is callable (o.m unwraps $Method)", async () => {
+  await expect(runSourceSelfHosted(
+    "o = { method m(self, k): k + 1 end }\n" +
+    "f = o.m\n" +
+    "if f(o, 4) == 5: 0 else: 1 / 0 end"
+  )).resolves.toBeDefined();
 });
