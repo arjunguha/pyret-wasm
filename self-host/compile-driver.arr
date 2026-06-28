@@ -723,6 +723,59 @@ end
 # would also clobber the shared host parse state.  So we construct the data node directly
 # and inject it into the already-parsed program.  Distinct (fresh) locs per variant avoid
 # constructor table-slot collisions (the same dummy-loc hazard as lambdas).
+# ── injected-List method builders (concise ast.arr constructors) ──────────────
+fun lml(): S.builtin("list-method") end
+fun lnm(s :: String): A.s-name(lml(), s) end
+fun lid(s :: String): A.s-id(lml(), lnm(s)) end
+fun lbind(s :: String): A.s-bind(lml(), false, lnm(s), A.a-blank) end
+fun lcbind(s :: String): A.s-cases-bind(lml(), A.s-cases-bind-normal, lbind(s)) end
+fun lcall(fn :: A.Expr, args :: List): A.s-app(lml(), fn, args) end
+fun ldot(o :: A.Expr, f :: String): A.s-dot(lml(), o, f) end
+fun lop(o :: String, a :: A.Expr, b :: A.Expr): A.s-op(lml(), lml(), o, a, b) end
+# `cases(List) self: | empty => empty-e | link(f, r) => link-e end`
+fun list-cases(scrut :: A.Expr, empty-e :: A.Expr, link-e :: A.Expr) -> A.Expr:
+  A.s-cases(lml(), A.a-name(lml(), lnm("List")), scrut,
+    [list:
+      A.s-singleton-cases-branch(lml(), lml(), "empty", empty-e),
+      A.s-cases-branch(lml(), lml(), "link", [list: lcbind("f"), lcbind("r")], link-e) ],
+    false)
+end
+fun lshared(name :: String, argnames :: List<String>, body :: A.Expr) -> A.Member:
+  A.s-method-field(lml(), name, [list:], tmap(lbind, argnames), A.a-blank, "", body, none, none, false)
+end
+# `sharing:` methods so `[list: ...].length()` / `.map`/`.each`/`.foldl`/`.member` work on
+# the injected List. Recursion is via METHOD calls (r.length()), which the seed compiles as
+# native tail/closure calls — constant stack. (first/rest are the link variant's fields.)
+fun list-shared-methods() -> List:
+  self-l = lid("self")
+  [list:
+    lshared("length", [list: "self"],
+      list-cases(self-l, A.s-num(lml(), 0),
+        lop("op+", A.s-num(lml(), 1), lcall(ldot(lid("r"), "length"), [list:])))),
+    lshared("is-empty", [list: "self"],
+      list-cases(self-l, A.s-bool(lml(), true), A.s-bool(lml(), false))),
+    lshared("map", [list: "self", "fn"],
+      list-cases(self-l, lid("empty"),
+        lcall(lid("link"),
+          [list: lcall(lid("fn"), [list: lid("f")]),
+                 lcall(ldot(lid("r"), "map"), [list: lid("fn")])]))),
+    lshared("each", [list: "self", "fn"],
+      list-cases(self-l, lid("nothing"),
+        A.s-block(lml(),
+          [list: lcall(lid("fn"), [list: lid("f")]),
+                 lcall(ldot(lid("r"), "each"), [list: lid("fn")])]))),
+    lshared("foldl", [list: "self", "fn", "acc"],   # element-first: fn(elt, acc)
+      list-cases(self-l, lid("acc"),
+        lcall(ldot(lid("r"), "foldl"),
+          [list: lid("fn"), lcall(lid("fn"), [list: lid("f"), lid("acc")])]))),
+    lshared("member", [list: "self", "x"],
+      list-cases(self-l, A.s-bool(lml(), false),
+        A.s-if-else(lml(),
+          [list: A.s-if-branch(lml(), lop("op==", lid("f"), lid("x")), A.s-bool(lml(), true))],
+          lcall(ldot(lid("r"), "member"), [list: lid("x")]), false)))
+  ]
+end
+
 fun list-data-node() -> A.Expr:
   fun loc(n :: Number): S.srcloc("list-prelude", n, 0, n, n, 0, n) end
   ml = loc(10)
@@ -731,7 +784,7 @@ fun list-data-node() -> A.Expr:
     [list:
       A.s-singleton-variant(loc(2), "empty", [list:]),
       A.s-variant(loc(3), loc(4), "link", [list: mem("first"), mem("rest")], [list:]) ],
-    [list:], none, none)
+    list-shared-methods(), none, none)
 end
 
 fun inject-list-data(prog :: A.Program) -> A.Program:
