@@ -39,3 +39,23 @@ test("self-hosted backend: a method taken as a value is callable (o.m unwraps $M
     "if f(o, 4) == 5: 0 else: 1 / 0 end"
   )).resolves.toBeDefined();
 });
+
+// Constant-stack codegen: a long statement SPINE (hundreds of lets) used to overflow the
+// WASM stack — the backend's byte-list concatenation (concat-bytes/code-entry) and the
+// compile-aexpr spine recursion were non-tail. Now tail-recursive, so a big body compiles.
+test("self-hosted backend: a long let-spine compiles + runs (constant stack)", async () => {
+  const n = 400;
+  let src = "x0 = 0\n";
+  for (let i = 1; i <= n; i = i + 1) src = src + ("x" + i + " = x" + (i - 1) + " + 1\n");
+  src = src + ("if x" + n + " == " + n + ": 0 else: 1 / 0 end");
+  await expect(runSourceSelfHosted(src)).resolves.toBeDefined();
+});
+
+// Many nested if/else (mid-chain branch bodies) — exercised the a-if/compile-branches
+// concat-bytes path that previously deep-appended onto the accumulated branch bytes.
+test("self-hosted backend: deep nested-if chain compiles + runs", async () => {
+  const n = 120;
+  let expr = "0";
+  for (let i = 0; i < n; i = i + 1) expr = "if true: " + expr + " else: 1 / 0 end";
+  await expect(runSourceSelfHosted("if (" + expr + ") == 0: 0 else: 1 / 0 end")).resolves.toBeDefined();
+});

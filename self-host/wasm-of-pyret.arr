@@ -272,6 +272,12 @@ fun compile-aval(v, c :: Ctx) -> List<Number>:
     | a-num(l, n) =>
       # roughnum literal (~3.14) -> $make_rough(f64); exact integer -> $make_fix(i64).
       # (Exact rational/bignum literals still TODO(port): need $make_rat / bignum limbs.)
+      # BUG(roughnum-literal): a ROUGH n traps with "ref.cast failed" because encoder's
+      # f64-bits does Pyret arithmetic that stays rough on rough input — `num-floor(rough)`
+      # returns a rough (not an exact int), so the byte/split-le computation is corrupt.
+      # `num-to-rational(n)` would make it exact BUT is LOSSY here (truncates: ~3.14->3,
+      # ~0.5->0), giving wrong values — so NOT used. Needs a faithful roughnum->f64-bits
+      # (a host import, or exact dyadic extraction). Blocks constants.arr/checker.arr.
       if num-is-roughnum(n): E.f64-const(n).append(E.i-call(idx-make-rough()))
       else if num-is-integer(n): E.i64-const(n).append(E.i-call(idx-make-fix()))
       else: raise("a-num: exact rational/bignum literal not yet supported (need $make_rat): " + tostring(n))
@@ -481,13 +487,11 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       end
     | a-prim-app(l, fname, args, info) => compile-prim-app(fname, args, c)
     | a-if(l, cnd, t, e) =>
-      compile-aval(cnd, c)
-        .append(truthy-instr())
-        .append(E.i-if(ANYREF-BT))
-        .append(compile-aexpr(t, c, tail))
-        .append(E.i-else)
-        .append(compile-aexpr(e, c, tail))
-        .append(E.i-end)
+      # branch bodies (compile-aexpr) can be large + sit mid-chain, so `.append` after them
+      # would recurse to their length — assemble with tail-recursive concat-bytes instead.
+      E.concat-bytes([list:
+        compile-aval(cnd, c), truthy-instr(), E.i-if(ANYREF-BT),
+        compile-aexpr(t, c, tail), E.i-else, compile-aexpr(e, c, tail), E.i-end])
     | a-lam(l, name, args, ret, body) =>
       # closure value: struct.new $Closure {fnIndex, caps}.  fnIndex is the table slot the
       # collect-lambdas pass assigned this lambda; caps is its free vars packed into a
@@ -615,11 +619,15 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
       # methods (a methods $Object: name -> the let-bound $Method/closure value, in scope
       # here).  These side-effects leave nothing on the stack; the data $Object follows.
       this-names = variants.map(variant-name)
-      set-all-variant-methods(c, variants, shared)
-        .append(emit-names-of(this-names))
-        .append(E.concat-bytes(variants.map(lam(vv): data-field-value(c, vv) end)))
-        .append(E.array-new-fixed(T-FIELDS, length(variants)))
-        .append(E.i-call(idx-make-object()))
+      # set-all-variant-methods can be large (e.g. ast.arr's 225 variants) and is FIRST in
+      # the chain — assemble with tail-recursive concat-bytes so `.append` after it doesn't
+      # recurse to its length.
+      E.concat-bytes([list:
+        set-all-variant-methods(c, variants, shared),
+        emit-names-of(this-names),
+        E.concat-bytes(variants.map(lam(vv): data-field-value(c, vv) end)),
+        E.array-new-fixed(T-FIELDS, length(variants)),
+        E.i-call(idx-make-object())])
     | a-ref(l, ann) => E.i-ref-null(110)                                   # TODO(port): bare ref
     | a-module(l, ans, dv, dt, prov, types, checks) =>
       # Return the answer (the last evaluated expression in the body). The module value
@@ -718,23 +726,20 @@ fun compile-branches(branches, vtmp :: Number, c :: Ctx, tail :: Boolean, els) -
             | none => compile-branches(rest, vtmp, c, tail, els)     # unknown variant: skip
             | some(d) =>
               bound = bind-cases-args(bargs, 0, vtmp, c, empty)
-              val-id.append(E.i32-const(d.id)).append(E.i32-eq)
-                .append(E.i-if(ANYREF-BT))
-                .append(bound.code).append(compile-aexpr(bbody, bound.cx, tail))
-                .append(E.i-else)
-                .append(compile-branches(rest, vtmp, c, tail, els))
-                .append(E.i-end)
+              # branch body + recursive rest are large + mid-chain → concat-bytes (tail).
+              E.concat-bytes([list:
+                val-id, E.i32-const(d.id), E.i32-eq, E.i-if(ANYREF-BT),
+                bound.code, compile-aexpr(bbody, bound.cx, tail), E.i-else,
+                compile-branches(rest, vtmp, c, tail, els), E.i-end])
           end
         | a-singleton-cases-branch(_, _, bname, bbody) =>
           cases(Option) data-lookup(c, bname):
             | none => compile-branches(rest, vtmp, c, tail, els)
             | some(d) =>
-              val-id.append(E.i32-const(d.id)).append(E.i32-eq)
-                .append(E.i-if(ANYREF-BT))
-                .append(compile-aexpr(bbody, c, tail))
-                .append(E.i-else)
-                .append(compile-branches(rest, vtmp, c, tail, els))
-                .append(E.i-end)
+              E.concat-bytes([list:
+                val-id, E.i32-const(d.id), E.i32-eq, E.i-if(ANYREF-BT),
+                compile-aexpr(bbody, c, tail), E.i-else,
+                compile-branches(rest, vtmp, c, tail, els), E.i-end])
           end
       end
   end
@@ -760,34 +765,37 @@ fun bind-cases-args(args, j :: Number, vtmp :: Number, c :: Ctx, code):
 end
 
 # ===== AExpr -> instructions =====
+# Compile an AExpr. The a-let/a-var/a-seq/a-arr-let/a-type-let SPINE is walked with a
+# TAIL-recursive loop (constant stack) — a big module is one long spine, so recursing it
+# would overflow. Each spine step's prefix instructions are accumulated (reversed); the
+# terminal lettable is compiled in `tail` position, then everything is concat'd (tail).
 fun compile-aexpr(e, c :: Ctx, tail :: Boolean) -> List<Number>:
-  cases(N.AExpr) e:
-    | a-let(l, b, lt, body) =>
-      idx = c.next-local
-      k = name-key(b.id)
-      compile-lettable(lt, c, false)
-        .append(E.local-set(idx))
-        .append(mirror-global(c, k, idx))                 # top-level: also set the global
-        .append(compile-aexpr(body, bind-local(c, k, idx), tail))
-    | a-var(l, b, lt, body) =>
-      # box the value into a 1-cell $Fields so closures share the mutation.
-      idx = c.next-local
-      compile-lettable(lt, c, false)
-        .append(E.array-new-fixed(T-FIELDS, 1))
-        .append(E.local-set(idx))
-        .append(compile-aexpr(body, bind-var(c, name-key(b.id), idx), tail))
-    | a-seq(l, e1, e2) =>
-      compile-lettable(e1, c, false).append(E.i-drop).append(compile-aexpr(e2, c, tail))
-    | a-lettable(l, lt) => compile-lettable(lt, c, tail)
-    | a-type-let(l, bind, body) => compile-aexpr(body, c, tail)            # types erased
-    | a-arr-let(l, b, idx2, lt, body) =>
-      slot = c.next-local
-      k = name-key(b.id)
-      compile-lettable(lt, c, false)
-        .append(E.local-set(slot))
-        .append(mirror-global(c, k, slot))
-        .append(compile-aexpr(body, bind-local(c, k, slot), tail))
+  fun loop(e2, c2 :: Ctx, prefix-rev :: List<List<Number>>) -> List<Number>:
+    cases(N.AExpr) e2:
+      | a-let(l, b, lt, body) =>
+        idx = c2.next-local
+        k = name-key(b.id)
+        step = E.concat-bytes([list: compile-lettable(lt, c2, false), E.local-set(idx), mirror-global(c2, k, idx)])
+        loop(body, bind-local(c2, k, idx), link(step, prefix-rev))
+      | a-var(l, b, lt, body) =>
+        idx = c2.next-local
+        step = E.concat-bytes([list: compile-lettable(lt, c2, false), E.array-new-fixed(T-FIELDS, 1), E.local-set(idx)])
+        loop(body, bind-var(c2, name-key(b.id), idx), link(step, prefix-rev))
+      | a-seq(l, e1, e2b) =>
+        step = E.concat-bytes([list: compile-lettable(e1, c2, false), E.i-drop])
+        loop(e2b, c2, link(step, prefix-rev))
+      | a-type-let(l, bind, body) => loop(body, c2, prefix-rev)            # types erased
+      | a-arr-let(l, b, idx2, lt, body) =>
+        slot = c2.next-local
+        k = name-key(b.id)
+        step = E.concat-bytes([list: compile-lettable(lt, c2, false), E.local-set(slot), mirror-global(c2, k, slot)])
+        loop(body, bind-local(c2, k, slot), link(step, prefix-rev))
+      | a-lettable(l, lt) =>
+        # terminal: prefix steps (un-reverse) ++ the final lettable (in tail position).
+        E.concat-bytes(E.rev-onto(prefix-rev, [list: compile-lettable(lt, c2, tail)]))
+    end
   end
+  loop(e, c, empty)
 end
 
 # ===== pre-pass: collect lambdas (so each gets a stable fnIndex/table slot) =====
@@ -1063,8 +1071,11 @@ fun compile-prog(prog) -> List<Number>:
           .append(E.global-get(R.GI-PASSED)).append(E.global-get(R.GI-TOTAL))
           .append(E.i-call(host-funcidx("check_summary")))
           .append(E.end-instr)
+      # NB: assemble with concat-bytes (tail-recursive), NOT `huge-body.append(...)` —
+      # appending onto the whole compiled body recurses to its length and overflows.
       main-code = E.code-entry([list: E.local-decl(LOCAL-BUDGET, E.anyref)],
-        list-id-init.append(vm-init).append(compile-aexpr(body, main-ctx, false)).append(check-summary-instrs))
+        E.concat-bytes([list: list-id-init, vm-init,
+          compile-aexpr(body, main-ctx, false), check-summary-instrs]))
       lam-code = lams.map(lam(lr): compile-lam(lr, lam-map, dreg, gvars, num-lams, gmap) end)
       ctor-code = ordered.map(lam(d): compile-ctor(d) end)
       # runtime bodies already end with `end`, so build their code entries raw (code-entry

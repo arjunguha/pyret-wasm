@@ -31,8 +31,20 @@ fun sleb(n):
   done = ((rest == 0) and (byte < 64)) or ((rest == (0 - 1)) and (byte >= 64))
   if done: [list: byte] else: link(byte + 128, sleb(rest)) end
 end
+# TAIL-RECURSIVE list helpers — the prelude's `append`/`.append` are NON-tail (they recurse
+# to the length of the receiver/first arg), so concatenating the large byte lists a big
+# module produces overflows the WASM stack. These run in CONSTANT stack (the seed emits
+# native tail calls), so module size no longer blows the stack.
+fun rev-onto(xs, acc):
+  cases(List) xs: | empty => acc | link(f, r) => rev-onto(r, link(f, acc)) end
+end
+fun tappend(a, b): rev-onto(rev-onto(a, empty), b) end   # a ++ b, tail-recursive
 fun concat-bytes(lol):
-  cases(List) lol: | empty => empty | link(f, r) => append(f, concat-bytes(r)) end
+  # accumulate all bytes in reverse (tail), then reverse once (tail).
+  fun go(parts, acc):
+    cases(List) parts: | empty => acc | link(f, r) => go(r, rev-onto(f, acc)) end
+  end
+  rev-onto(go(lol, empty), empty)
 end
 fun cat(parts): concat-bytes(parts) end
 fun vec(items): append(leb-u(length(items)), concat-bytes(items)) end        # vector of pre-encoded items
@@ -205,7 +217,9 @@ end
 # code entry: vec(locals-decls) ++ body ++ end, wrapped length-prefixed.
 fun local-decl(count, vt): append(leb-u(count), vt) end
 fun code-entry(local-decls, body):
-  byte-vec(append(vec(local-decls), append(body, i-end)))
+  # `body` is a whole function's instruction stream (can be large) — use tail-recursive
+  # tappend so `body ++ end` doesn't recurse to body's length and overflow.
+  byte-vec(tappend(vec(local-decls), tappend(body, i-end)))
 end
 # export entry: name (utf8 byte-vec) ++ kind(0 func/1 table/2 mem/3 global) ++ idx
 fun str-bytes(s): string-to-code-points(s) end   # ASCII names only (TODO(port): real UTF-8)
