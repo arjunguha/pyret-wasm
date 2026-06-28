@@ -62,6 +62,8 @@ const MATRIX: [string, string][] = [
   ["block: fun sq(x): x * x end\n sq(9) end", "81"],
   ["(lam(x): x + 2 end)(8)", "10"],
   ["{a: 3, b: 4}.b", "4"],
+  ["[list: 1, 2, 3].length()", "3"], // injected-List methods now compile self-hosted
+  ["(_ + 1)(4)", "5"],               // _-curry now desugars self-hosted
 ];
 
 // Per-compiler PENDING — programs a given compiler can't handle YET. Promote into
@@ -69,10 +71,8 @@ const MATRIX: [string, string][] = [
 //   self-hosted: needs data/cases-in-anf, prelude inclusion (lists/print), check-in-anf.
 //   stoppable:   handles check: now (see test/stoppable.test.ts); nothing pending.
 const PENDING_SELF_HOSTED: [string, string][] = [
-  ["check: 2 + 3 is 5 end", "(check block)"],
-  ["[list: 1, 2, 3].length()", "3"],     // works on seed + stoppable; not self-hosted yet
-  ["data D: | a(n) | b end\ncases(D) a(7): | a(n) => n | b => 0 end", "7"],
-  ['"ab" + "cd"', '"abcd"'],              // works on seed + stoppable; not self-hosted yet
+  // num-* builtins aren't in the driver's minimal injected prelude (seed handles them).
+  ["num-max(2, 5)", "5"],
 ];
 // stoppable now handles check: (promoted — see test/stoppable.test.ts check tests),
 // lists, and strings; nothing pending for the stoppable compiler.
@@ -114,9 +114,9 @@ test("tri-run PENDING (self-hosted) run on the SEED; not yet self-hosted", async
     const seedExpr = expr.includes("\n") ? `block:\n${expr}\nend` : expr;
     expect(await seedOutcome(seedExpr)).toBe("ok");
   }
-  // tripwire: `[list:].length()` is the next promotion candidate (works on seed+stoppable).
-  // When the self-hosted compiler handles it, this flips and we promote it to MATRIX.
-  expect(await selfHostedOutcome(wrap("[list: 1, 2, 3].length()", "3"))).toBe("fail");
+  // tripwire: `num-max` (a num builtin) isn't in the driver's minimal prelude yet — works
+  // on seed+stoppable. When the self-hosted compiler handles it, this flips → promote it.
+  expect(await selfHostedOutcome(wrap("num-max(2, 5)", "5"))).toBe("fail");
 });
 
 test("tri-run PENDING (stoppable) run on the SEED; not yet stoppable", async () => {

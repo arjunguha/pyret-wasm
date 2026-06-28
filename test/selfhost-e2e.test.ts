@@ -512,3 +512,30 @@ test("self-hosted: nested tuple-bind {a; {b; c}} = {1; {2; 3}}", async () => {
   const { result } = await selfHostRun(EXPECT + "{a; {b; c}} = {1; {2; 3}}\nexpect(a + b + c, 6)");
   expect(result.error).toBeUndefined();
 });
+
+// ── `_` curry desugaring ─────────────────────────────────────────────────────
+test("self-hosted: _ + 1 curries to a lambda", async () => {
+  const { result } = await selfHostRun(EXPECT + "expect((_ + 1)(4), 5)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: _ + _ curries to a 2-arg lambda", async () => {
+  const { result } = await selfHostRun(EXPECT + "expect((_ + _)(3, 4), 7)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: f(_, x) curries the application", async () => {
+  const { result } = await selfHostRun(EXPECT + "fun sub(a, b): a - b end\nexpect((sub(_, 2))(10), 8)");
+  expect(result.error).toBeUndefined();
+});
+
+// ── injected-List methods ([list:].length() etc.) ────────────────────────────
+test("self-hosted: [list:].length()", async () => {
+  const { result } = await selfHostRun(EXPECT + "expect([list: 1, 2, 3].length(), 3)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: [list:].map / .foldl / .member", async () => {
+  const { result } = await selfHostRun(
+    EXPECT + "expect([list: 1, 2].map(_ + 1).first, 2)\n" +
+    "expect([list: 1, 2, 3].foldl(lam(e, a): e + a end, 0), 6)\n" +
+    "expect([list: 1, 2, 3].member(2), true)");
+  expect(result.error).toBeUndefined();
+});
