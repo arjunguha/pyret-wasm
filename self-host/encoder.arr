@@ -162,9 +162,15 @@ i-select = [list: 27]   # select : [a, b, cond:i32] -> a if cond else b
 i64-add = [list: 124]  i64-sub = [list: 125]  i64-mul = [list: 126]  i64-div-s = [list: 127]
 i64-rem-s = [list: 129]  i64-and = [list: 131]  i64-or = [list: 132]  i64-shl = [list: 134]  i64-shr-u = [list: 136]
 f64-add = [list: 160]  f64-sub = [list: 161]  f64-mul = [list: 162]  f64-div = [list: 163]  f64-sqrt = [list: 159]
+# f64 comparisons (-> i32) + unary
+f64-eq = [list: 97]  f64-ne = [list: 98]  f64-lt = [list: 99]  f64-gt = [list: 100]  f64-le = [list: 101]  f64-ge = [list: 102]
+f64-abs = [list: 153]  f64-neg = [list: 154]  f64-floor = [list: 156]
 i32-wrap-i64 = [list: 167]
 i64-extend-i32-s = [list: 172]  i64-extend-i32-u = [list: 173]
 f64-convert-i64-s = [list: 185]  i64-trunc-f64-s = [list: 176]
+# saturating f64->int truncation (0xFC prefix): i64.trunc_sat_f64_s = 0xFC 0x06, i32.trunc_sat_f64_s = 0xFC 0x00
+i64-trunc-sat-f64-s = [list: 252, 6]  i32-trunc-sat-f64-s = [list: 252, 0]
+i64-ge-u = [list: 90]  i64-gt-u = [list: 86]  i64-lt-u = [list: 84]
 i64-rem-u = [list: 130]  i64-div-u = [list: 128]
 i64-extend-u-i32 = i64-extend-i32-u
 
@@ -179,8 +185,15 @@ fun mem-type(min, max): append([list: 1], append(leb-u(min), leb-u(max))) end
 
 # ===== f64 IEEE-754 -> 8 little-endian bytes (for f64.const) =====
 fun pow2(e): if e <= 0: 1 else: 2 * pow2(e - 1) end end
-fun split-le(bits, i):  # 8 little-endian bytes of a 64-bit integer `bits`
-  if i == 8: empty else: link(num-modulo(num-quotient(bits, pow2(8 * i)), 256), split-le(bits, i + 1)) end
+fun split-le(bits, i, sign):  # 8 little-endian bytes of the 63-bit magnitude `bits`,
+  # OR-ing the sign into the high bit of the most-significant byte (index 7). `bits` stays
+  # < 2^63 (fixnum-range) so num-modulo/num-quotient never hit the bignum path.
+  if i == 8: empty
+  else:
+    base = num-modulo(num-quotient(bits, pow2(8 * i)), 256)
+    byte = if i == 7: base + (sign * 128) else: base end
+    link(byte, split-le(bits, i + 1, sign))
+  end
 end
 fun norm-exp(ax, e):    # find e with 1 <= ax/2^e < 2  (ax > 0)
   if ax >= 2: norm-exp(ax / 2, e + 1)
@@ -194,10 +207,16 @@ fun f64-bits(x):
     ax = num-abs(x)
     e = norm-exp(ax, 0)
     biased = e + 1023
-    frac = (ax / pow2(e)) - 1               # in [0,1)
-    mant = num-floor(frac * pow2(52))       # 52-bit mantissa (TODO(port): round-to-nearest-even)
-    bits = ((sign * pow2(63)) + (biased * pow2(52))) + mant
-    split-le(bits, 0)
+    # scale ax into [1,2): pow2 only handles e>=0, so divide by 2^e for e>=0 and multiply by
+    # 2^(-e) for e<0 (|x|<1). Both are exact in f64 (powers of two only shift the exponent).
+    scaled = if e >= 0: ax / pow2(e) else: ax * pow2(0 - e) end
+    frac = scaled - 1                       # in [0,1)
+    # frac*2^52 is the EXACT integer mantissa but stays a ROUGHNUM; num-to-rational converts
+    # it to an exact integer (num-floor would keep it rough, and num-modulo on a rough traps).
+    mant = num-to-rational(frac * pow2(52))
+    # magnitude bits only (< 2^63 = fixnum-range); sign goes into the top byte in split-le.
+    magbits = (biased * pow2(52)) + mant
+    split-le(magbits, 0, sign)
   end
 end
 
