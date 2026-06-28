@@ -19,8 +19,6 @@
 import { test, expect } from "bun:test";
 import { resolve } from "path";
 import { buildSourceFile } from "../src/build.ts";
-import { parsePyret } from "../src/parser/pyret-parser.ts";
-import { serializeCst } from "../src/runtime/parse-bridge.ts";
 import { buildHostImports, newHostState, run } from "../src/runtime/run.ts";
 
 const DRIVER = resolve(import.meta.dir, "../self-host/compile-driver.arr");
@@ -36,7 +34,9 @@ async function driverWasm(): Promise<Uint8Array> {
 async function selfHostCompile(src: string): Promise<Uint8Array> {
   const state = newHostState(() => {});
   state.sourceBytes = new TextEncoder().encode(src);
-  state.parseNodes = serializeCst(await parsePyret(src)); // prime the JS-GLR bridge
+  // (no parseNodes priming: the driver's surface-parse is the no-JS pure-Pyret parser,
+  // which reads sourceBytes; the old JS-GLR serializeCst priming crashed on forms like
+  // contract-stmt the bridge can't lower.)
   const { instance } = await WebAssembly.instantiate(await driverWasm() as BufferSource, buildHostImports(state));
   state.instance = instance;
   state.memory = instance.exports.memory as WebAssembly.Memory;
@@ -455,5 +455,21 @@ test("self-hosted: a-app annotations (List<Number>) compile and run", async () =
 test("self-hosted: annotated let + annotated variant member compile", async () => {
   const { result } = await selfHostRun(
     "data D: | a(n :: Number) end\nx :: Option<Number> = a(7)\nif x.n == 7: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+
+// ── driver round 2: s-rec, s-contract (erased), s-template (throw) ────────────
+test("self-hosted: rec binding (recursive lambda) compiles and runs", async () => {
+  const { result } = await selfHostRun(
+    EXPECT + "rec f = lam(n): if n == 0: 1 else: n * f(n - 1) end end\nexpect(f(4), 24)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: contract statement (x :: Number) is erased", async () => {
+  const { result } = await selfHostRun(EXPECT + "x :: Number\nx = 5\nexpect(x, 5)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: s-template (...) in an uncalled fun compiles; program runs", async () => {
+  // `...` lowers to throwUnfinishedTemplate; here it's never reached, so the program is fine.
+  const { result } = await selfHostRun(EXPECT + "fun todo-later(): ... end\nexpect(5, 5)");
   expect(result.error).toBeUndefined();
 });

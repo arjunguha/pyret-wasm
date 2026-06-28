@@ -393,6 +393,10 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
 
     | s-paren(_, inner) => desugar-expr(inner)
 
+    | s-template(loc) =>
+      # `...` unfinished-expression placeholder: abort at runtime (backend prim).
+      A.s-prim-app(loc, "throwUnfinishedTemplate", [list:], A.prim-app-info-c(false))
+
     | else => e
   end
 end
@@ -475,6 +479,11 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
           [list: A.s-let-expr(ll, [list: A.s-var-bind(ll, strip-bind(bind), desugar-expr(val))], body, false)]
         | s-type(_, _, _, _) => desugar-stmts(rest)        # type alias: erased
         | s-newtype(_, _, _) => desugar-stmts(rest)        # newtype: erased
+        | s-contract(_, _, _, _) => desugar-stmts(rest)    # `name :: Ann` contract: erased
+        | s-rec(rl, bind, val) =>
+          # top-level `rec x = e` → recursive let (s-letrec) over the remaining statements
+          body = stmts-to-body(desugar-stmts(rest))
+          [list: A.s-letrec(rl, [list: A.s-letrec-bind(rl, strip-bind(bind), desugar-expr(val))], body, false)]
         | else =>
           link(desugar-expr(f), desugar-stmts(rest))
       end
