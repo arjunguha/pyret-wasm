@@ -196,9 +196,26 @@ fun fv-union(a, b):
   end
 end
 fun fv-subtract(a, ks): a.filter(lam(x): not(ks.member(x)) end) end
+# Primitive intrinsic globals (handled by compile-intrinsic) have NO runtime value, so they
+# must never be captured as a lambda free var — else the body would bind them as a (null)
+# local, shadowing the intrinsic dispatch. (Matches the seed treating these as call-only.)
+intrinsic-names :: List<String> = [list:
+  "tostring", "to-string", "torepr", "to-repr", "string-length",
+  "string-to-code-points", "string-from-code-point", "string-to-code-point",
+  "num-modulo", "num-quotient", "num-expt", "num-to-roughnum", "num-is-roughnum",
+  "num-floor", "num-ceiling", "num-round", "num-is-integer", "num-to-rational",
+  "prim-raw-array-get", "prim-raw-array-set", "prim-raw-array-length", "prim-raw-array-of",
+  "time-now", "read-source", "emit-byte" ]
+fun name-is-intrinsic(id) -> Boolean:
+  cases(A.Name) id:
+    | s-name(_, s) => intrinsic-names.member(s)
+    | s-global(s) => intrinsic-names.member(s)
+    | else => false
+  end
+end
 fun fv-val(v):
   cases(N.AVal) v:
-    | a-id(_, id) => [list: name-key(id)]
+    | a-id(_, id) => if name-is-intrinsic(id): empty else: [list: name-key(id)] end
     | a-id-safe-letrec(_, id) => [list: name-key(id)]
     | else => empty
   end
@@ -421,6 +438,146 @@ fun compile-prim-app(fname :: String, args, c :: Ctx) -> List<Number>:
   end
 end
 
+# ===== runtime intrinsics (mirrors the seed's compile.ts compileIntrinsic ladder) =====
+# Primitive globals that are NOT user-defined funs: string-length, num-modulo, the
+# prim-raw-array-* kernels, tostring, read-source, the num tower ops, … The driver lowers
+# these as plain s-app(s-id(s-global NAME), args); they'd otherwise resolve to a NULL global
+# (resolve-nonlocal) and trap. Each branch leaves ONE anyref. Returns none if NAME is unknown,
+# so the a-app caller falls back to the closure-calling convention.
+fun as-num(v, c :: Ctx) -> List<Number>:
+  compile-aval(v, c).append(E.ref-cast(T-NUM))
+end
+# round/floor/ceiling: exact in -> exact integer ($make_fix); roughnum (tag 2) -> roughnum.
+fun compile-round(op :: String, arg, c :: Ctx) -> List<Number>:
+  v = c.next-local
+  c2 = ctx(c.locals, c.next-local + 1, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  f64op = ask:
+    | op == "ceil" then: E.f64-ceil
+    | op == "nearest" then: E.f64-nearest
+    | otherwise: E.f64-floor
+  end
+  get-num = E.local-get(v).append(E.ref-cast(T-NUM))
+  the-f64 = get-num.append(E.i-call(rt-funcidx("$to_f64"))).append(f64op)   # f64
+  E.concat-bytes([list:
+    compile-aval(arg, c2), E.local-set(v),
+    get-num, E.struct-get(T-NUM, 0), E.i32-const(2), E.i32-eq, E.i-if(ANYREF-BT),
+    the-f64, E.i-call(idx-make-rough()),
+    E.i-else,
+    the-f64, E.i64-trunc-f64-s, E.i-call(idx-make-fix()),
+    E.i-end])
+end
+# num-is-integer: fix(0)/bignum(3) -> true; rough(2) and floor(f)==f -> true; rational -> false.
+fun compile-num-is-integer(arg, c :: Ctx) -> List<Number>:
+  v = c.next-local
+  c2 = ctx(c.locals, c.next-local + 1, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  get-num = E.local-get(v).append(E.ref-cast(T-NUM))
+  tag = get-num.append(E.struct-get(T-NUM, 0))
+  f = get-num.append(E.i-call(rt-funcidx("$to_f64")))
+  floor-eq = f.append(E.f64-floor).append(f).append(E.f64-eq)             # floor(f) == f
+  rough-int = tag.append(E.i32-const(2)).append(E.i32-eq).append(floor-eq).append(E.i32-and)
+  E.concat-bytes([list:
+    compile-aval(arg, c2), E.local-set(v),
+    tag, E.i32-const(0), E.i32-eq,
+    tag, E.i32-const(3), E.i32-eq, E.i32-or,
+    rough-int, E.i32-or,
+    to-bool()])
+end
+# num-to-rational: exact passthrough; roughnum -> nearest exact integer (best-effort).
+fun compile-num-to-rational(arg, c :: Ctx) -> List<Number>:
+  v = c.next-local
+  c2 = ctx(c.locals, c.next-local + 1, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  get-num = E.local-get(v).append(E.ref-cast(T-NUM))
+  E.concat-bytes([list:
+    compile-aval(arg, c2), E.local-set(v),
+    get-num, E.struct-get(T-NUM, 0), E.i32-const(2), E.i32-eq, E.i-if(ANYREF-BT),
+    get-num, E.i-call(rt-funcidx("$to_f64")), E.f64-nearest, E.i64-trunc-f64-s, E.i-call(idx-make-fix()),
+    E.i-else,
+    E.local-get(v),
+    E.i-end])
+end
+fun compile-intrinsic(name :: String, args, c :: Ctx) -> Option:
+  ask:
+    | (name == "tostring") or (name == "to-string") or (name == "torepr") or (name == "to-repr") then:
+      # render to SCRATCH ($val_to_string -> len), then copy back into a $Str.
+      some(E.i32-const(R.SCRATCH-OFFSET)
+        .append(compile-aval(args.first, c)).append(E.i-call(rt-funcidx("$val_to_string")))
+        .append(E.i-call(rt-funcidx("$str_from_mem"))))
+    | name == "string-length" then:
+      some(compile-aval(args.first, c).append(E.ref-cast(T-STR)).append(E.i-call(rt-funcidx("$string_length"))))
+    | name == "string-to-code-points" then:
+      some(compile-aval(args.first, c).append(E.ref-cast(T-STR)).append(E.i-call(rt-funcidx("$str_to_codepoints"))))
+    | name == "string-from-code-point" then:
+      some(compile-aval(args.first, c).append(E.i-call(idx-num-to-i32())).append(E.array-new-fixed(T-STR, 1)))
+    | name == "string-to-code-point" then: some(compile-prim-app("string-to-code-point", args, c))
+    | name == "num-modulo" then:
+      some(as-num(args.first, c).append(as-num(args.rest.first, c)).append(E.i-call(rt-funcidx("$num_modulo"))))
+    | name == "num-quotient" then:
+      some(as-num(args.first, c).append(as-num(args.rest.first, c)).append(E.i-call(rt-funcidx("$num_quotient"))))
+    | name == "num-expt" then:
+      some(as-num(args.first, c).append(as-num(args.rest.first, c)).append(E.i-call(rt-funcidx("$num_expt"))))
+    | name == "num-to-roughnum" then:
+      some(as-num(args.first, c).append(E.i-call(rt-funcidx("$to_f64"))).append(E.i-call(idx-make-rough())))
+    | name == "num-is-roughnum" then:
+      some(as-num(args.first, c).append(E.struct-get(T-NUM, 0)).append(E.i32-const(2)).append(E.i32-eq).append(to-bool()))
+    | name == "num-floor" then: some(compile-round("floor", args.first, c))
+    | name == "num-ceiling" then: some(compile-round("ceil", args.first, c))
+    | name == "num-round" then: some(compile-round("nearest", args.first, c))
+    | name == "num-is-integer" then: some(compile-num-is-integer(args.first, c))
+    | name == "num-to-rational" then: some(compile-num-to-rational(args.first, c))
+    | (name == "prim-raw-array-get") or (name == "prim-raw-array-set")
+        or (name == "prim-raw-array-length") or (name == "prim-raw-array-of") then:
+      some(compile-prim-app(name, args, c))
+    | name == "time-now" then:
+      some(E.i64-const(0).append(E.i-call(idx-make-fix())))
+    | name == "read-source" then:
+      # ask the host to write the program source into SCRATCH, then copy into a $Str.
+      some(E.i32-const(R.SCRATCH-OFFSET).append(E.i32-const(R.SCRATCH-OFFSET))
+        .append(E.i-call(host-funcidx("read_source_into"))).append(E.i-call(rt-funcidx("$str_from_mem"))))
+    | name == "emit-byte" then:
+      some(compile-aval(args.first, c).append(E.i-call(idx-num-to-i32()))
+        .append(E.i-call(host-funcidx("emit_byte"))).append(E.i32-const(2)).append(E.ref-i31))
+    | otherwise: none
+  end
+end
+# Extract the bare callee name of an a-id to a free global/name, for intrinsic dispatch.
+fun intrinsic-name-of(f) -> Option:
+  cases(N.AVal) f:
+    | a-id(_, id) =>
+      cases(A.Name) id:
+        | s-name(_, s) => some(s)
+        | s-global(s) => some(s)
+        | else => none
+      end
+    | else => none
+  end
+end
+# Auto-generated variant predicate `is-<variant>(x)`: true iff x is a $Variant with that
+# variant's id. (The seed reifies these in compileApp; the self-hosted driver's hand-written
+# desugar never generates is-X funs, so they'd resolve to a null global + trap.) Dispatched
+# UNCONDITIONALLY by dreg membership in a-app — a spurious null capture (when is-X appears
+# free inside a lambda) is harmless because the call is intercepted before reading the local.
+fun variant-pred-of(f, c :: Ctx) -> Option:
+  cases(Option) intrinsic-name-of(f):
+    | none => none
+    | some(nm) =>
+      if (string-length(nm) > 3) and (string-substring(nm, 0, 3) == "is-"):
+        data-lookup(c, string-substring(nm, 3, string-length(nm)))
+      else: none
+      end
+  end
+end
+fun compile-variant-pred(vinfo, arg, c :: Ctx) -> List<Number>:
+  v = c.next-local
+  c2 = ctx(c.locals, c.next-local + 1, c.vars, c.fenv, c.lams, c.dreg, c.gvars, c.nlams)
+  E.concat-bytes([list:
+    compile-aval(arg, c2), E.local-set(v),
+    E.local-get(v), E.ref-test-null(T-VARIANT), E.i-if(ANYREF-BT),
+      E.local-get(v), E.ref-cast(T-VARIANT), E.i-call(idx-variant-id()), E.i32-const(vinfo.id), E.i32-eq, to-bool(),
+    E.i-else,
+      E.i32-const(0), E.ref-i31,
+    E.i-end])
+end
+
 # ===== arithmetic global fast-path helpers =====
 # Get the .key() of an AVal id (for global detection). Uses A.Name.key() which returns
 # "global#<name>" for s-global, "atom#<base>#<serial>" for s-atom, etc. Returns "" for
@@ -486,6 +643,24 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
           # Direct runtime call: push args (anyref), call runtime fn.
           compile-avals(args, c).append(E.i-call(rt-funcidx(rt-name)))
         | none =>
+          cases(Option) variant-pred-of(f, c):
+            | some(vinfo) => compile-variant-pred(vinfo, args.first, c)
+            | none =>
+          # A free primitive global (string-length, num-modulo, prim-raw-array-*, tostring, …)
+          # is an intrinsic — it has no closure value, so the closure path below would null-trap.
+          maybe-intr = cases(Option) intrinsic-name-of(f):
+            | none => none
+            | some(nm) =>
+              ikey = cases(N.AVal) f: | a-id(_, iid) => name-key(iid) | else => "" end
+              ibound = cases(Option) lookup-local-opt(c, ikey):
+                | some(_) => true
+                | none => cases(Option) gmap-lookup(c, ikey): | some(_) => true | none => false end
+              end
+              if ibound: none else: compile-intrinsic(nm, args, c) end
+          end
+          cases(Option) maybe-intr:
+            | some(iinstrs) => iinstrs
+            | none =>
           # closure-calling convention: (closure-as-anyref, $Fields)->anyref via table 0.
           # The closure is used twice (passed as arg0 AND its fnIndex is the table selector),
           # so stash it in a temp local. Stack order for call_indirect: [arg0=closure,
@@ -509,6 +684,8 @@ fun compile-lettable(lt, c :: Ctx, tail :: Boolean) -> List<Number>:
             .append(pack-fields(args, c2))                            # arg1: args as $Fields
             .append(E.local-get(clos)).append(E.ref-cast(T-CLOSURE)).append(E.struct-get(T-CLOSURE, 0))  # selector
             .append(if tail: E.i-return-call-indirect(tyidx, 0) else: E.i-call-indirect(tyidx, 0) end)
+          end
+          end
       end
     | a-prim-app(l, fname, args, info) => compile-prim-app(fname, args, c)
     | a-if(l, cnd, t, e) =>

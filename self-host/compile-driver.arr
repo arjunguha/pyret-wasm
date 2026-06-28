@@ -325,6 +325,91 @@ end
 #   s-if        -> s-if-else (adds runtime error else-branch)
 # All other nodes are passed through with recursive descent into sub-expressions.
 
+# Auto-generated variant predicates `is-<variant>`: the backend dispatches them as a CALL
+# (a-app on the variant id), but the seed also reifies them as first-class CLOSURES when used
+# as VALUES (e.g. `MakeName`'s `is-s-name: is-s-name` object field, `.filter(is-link)`). The
+# hand-written desugar has no resolve-scope to do that, so a bare `is-<variant>` would resolve
+# to a null global. We ETA-EXPAND a value-position `is-V` into `lam(x): is-V(x) end`; the body
+# stays a CALL the backend's variant-pred dispatch handles. (Call-position callees are kept raw
+# by `desugar-callee`, so `is-V(arg)` does NOT eta-expand — avoiding infinite expansion.)
+# Cross-module qualified refs. The whole program is a FLAT concat of module bodies with the
+# `import ... as N` headers STRIPPED (build.ts mergeSourcesFor), so a qualified ref like
+# `S.builtin` / `PP.str` arrives as s-dot(s-id(<alias>), member) with `<alias>` UNBOUND — it
+# would read a null module value -> ref.cast. We flatten it to the bare global `member`,
+# detecting a module alias by Pyret naming convention: a Capitalized head whose `member` is a
+# known top-level global (modules/types are Capitalized; values/`self`/locals are lowercase,
+# so real field access like `self.flat-width` is never flattened). `shadow-exports` maps a
+# module-level shadowed surface name to its resolve-shadows fresh name, so `PP.str` resolves
+# to pprint's SMART ctor (the final binding) rather than the raw variant ctor.
+var top-globals :: List<String> = [list:]
+var shadow-exports :: List = [list:]   # List<{k :: String; v :: String}>
+fun is-uppercase-start(s :: String) -> Boolean:
+  if string-length(s) == 0: false
+  else:
+    c = string-to-code-points(s).first
+    (c >= 65) and (c <= 90)
+  end
+end
+# Names introduced at the program top level (fun/data-type/variant/let/var/rec), so a
+# qualified `Alias.member` flattens only when `member` really is a module global.
+fun collect-top-globals(stmts :: List) -> List<String>:
+  cases(List) stmts:
+    | empty => [list:]
+    | link(f, r) =>
+      ns = cases(A.Expr) f:
+        | s-fun(_, nm, _, _, _, _, _, _, _, _) => [list: nm]
+        | s-data(_, nm, _, _, variants, _, _, _) => link(nm, tmap(surface-variant-name, variants))
+        | s-let(_, bind, _, _) => cases(A.Bind) bind: | s-bind(_, _, bn, _) => if A.is-s-name(bn): [list: bn.s] else: [list:] end | else => [list:] end
+        | s-var(_, bind, _) => cases(A.Bind) bind: | s-bind(_, _, bn, _) => if A.is-s-name(bn): [list: bn.s] else: [list:] end | else => [list:] end
+        | s-rec(_, bind, _) => cases(A.Bind) bind: | s-bind(_, _, bn, _) => if A.is-s-name(bn): [list: bn.s] else: [list:] end | else => [list:] end
+        | else => [list:]
+      end
+      ns + collect-top-globals(r)
+  end
+end
+fun export-name(field :: String) -> String:
+  fun go(es):
+    cases(List) es:
+      | empty => field
+      | link(e, r) => if e.k == field: e.v else: go(r) end
+    end
+  end
+  go(shadow-exports)
+end
+var known-variants :: List<String> = [list:]
+fun is-variant-pred-name(s :: String) -> Boolean:
+  (string-length(s) > 3) and (string-substring(s, 0, 3) == "is-") and
+    known-variants.member(string-substring(s, 3, string-length(s)))
+end
+fun make-isvariant-eta(idl, s :: String) -> A.Expr:
+  x = A.s-name(idl, fresh-tuple-name())
+  body = A.s-block(idl, [list:
+      A.s-app-enriched(idl, A.s-id(idl, A.s-name(idl, s)), [list: A.s-id(idl, x)],
+        A.app-info-c(false, false))])
+  A.s-lam(fresh-loc(), "", [list:], [list: A.s-bind(idl, false, x, A.a-blank)], A.a-blank, "",
+    body, none, none, false)
+end
+# Collect every (top-level) data variant name, so is-<variant>-as-value can be detected.
+fun collect-variant-names(stmts :: List) -> List<String>:
+  cases(List) stmts:
+    | empty => [list:]
+    | link(f, r) =>
+      vs = cases(A.Expr) f:
+        | s-data(_, _, _, _, variants, _, _, _) => tmap(surface-variant-name, variants)
+        | else => [list:]
+      end
+      vs + collect-variant-names(r)
+  end
+end
+# Desugar a CALL callee: keep a bare s-id raw (so is-<variant>(arg) dispatches as a predicate
+# CALL rather than eta-expanding); everything else desugars normally.
+fun desugar-callee(f :: A.Expr) -> A.Expr:
+  cases(A.Expr) f:
+    | s-id(_, _) => f
+    | else => desugar-expr(f)
+  end
+end
+
 fun desugar-expr(e :: A.Expr) -> A.Expr:
   l = A.dummy-loc
   no-info = A.app-info-c(false, false)
@@ -332,7 +417,11 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
     | s-num(_, _)  => e
     | s-str(_, _)  => e
     | s-bool(_, _) => e
-    | s-id(_, _)   => e
+    | s-id(idl, nm) =>
+      cases(A.Name) nm:
+        | s-name(_, s) => if is-variant-pred-name(s): make-isvariant-eta(idl, s) else: e end
+        | else => e
+      end
     | s-prim-val(_, _) => e
     | s-undefined(_) => e
     | s-srcloc(_, _) => e
@@ -389,17 +478,17 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
         A.s-prim-app(loc, app-prim-name.value, [list: desugar-expr(args.first)],
           A.prim-app-info-c(false))
       else:
-        A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), no-info)
+        A.s-app-enriched(loc, desugar-callee(f), args.map(desugar-expr), no-info)
       end
       end
 
     | s-app-enriched(loc, f, args, info) =>
-      A.s-app-enriched(loc, desugar-expr(f), args.map(desugar-expr), info)
+      A.s-app-enriched(loc, desugar-callee(f), args.map(desugar-expr), info)
 
     | s-block(loc, stmts) =>
       # anf raises "Empty block" on an empty stmt list (e.g. a block whose only
       # statements were erased type-aliases/contracts) — nonempty-block emits `nothing`.
-      nonempty-block(loc, desugar-stmts(stmts))
+      nonempty-block(loc, desugar-stmts(stmts, false))   # nested block: not module-top-level
 
     | s-if-else(loc, branches, _else, blocky) =>
       A.s-if-else(loc,
@@ -472,7 +561,15 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
       A.s-assign(loc, id, desugar-expr(val))
 
     | s-dot(loc, obj, field) =>
-      if is-underscore-operand(obj):
+      is-modref = cases(A.Expr) obj:
+        | s-id(_, nm) => A.is-s-name(nm) and is-uppercase-start(nm.s) and top-globals.member(field)
+        | else => false
+      end
+      if is-modref:
+        # `N.member` (N an import alias) -> the bare global `member` (flat namespace),
+        # mapped through shadow-exports so a shadowed export resolves to its final binding.
+        A.s-id(loc, A.s-name(loc, export-name(field)))
+      else if is-underscore-operand(obj):
         # curry: `_.foo` -> `lam(a): a.foo end`
         {bs; ox} = curry-slot(loc, obj)
         curry-lam(loc, bs, A.s-dot(loc, ox, field))
@@ -677,6 +774,14 @@ fun partition-top(stmts, bind-acc :: List, rest-acc :: List):
         | s-rec(rl, bind, val) =>
           partition-top(more,
             link(A.s-letrec-bind(rl, strip-bind(bind), desugar-expr(val)), bind-acc), rest-acc)
+        | s-var(vl, bind, val) =>
+          # Hoist `var` into the letrec too: ANF lowers letrec binds to a PRE-ALLOCATED box
+          # (s-var-bind s-undefined) + an assign, so a nested `fun` defined before the var in
+          # the hoist order still captures the (pre-allocated) box -> shared mutation works.
+          # (Without this, a hoisted fun that mutates a local var — e.g. pprint's `format`
+          # whose inner `emit-text` mutates `cur-line` — captured a not-yet-bound null box.)
+          partition-top(more,
+            link(A.s-letrec-bind(vl, strip-bind(bind), desugar-expr(val)), bind-acc), rest-acc)
         | s-type(_, _, _, _) => partition-top(more, bind-acc, rest-acc)       # erased
         | s-newtype(_, _, _) => partition-top(more, bind-acc, rest-acc)       # erased
         | s-contract(_, _, _, _) => partition-top(more, bind-acc, rest-acc)   # erased
@@ -700,6 +805,26 @@ end
 # (lambdas + their app/dot/op bodies); stops under a binder that rebinds `fromn`.
 fun subst-id(e :: A.Expr, fromn :: String, ton) -> A.Expr:
   sub = lam(x): subst-id(x, fromn, ton) end
+  subst-branch = lam(br):
+    cases(A.CasesBranch) br:
+      | s-cases-branch(bl, pl, name, args, body) =>
+        rebinds = lists.any(lam(cb): cases(A.CasesBind) cb:
+            | s-cases-bind(_, _, bb) => bind-has-name(bb, fromn) end end, args)
+        if rebinds: br else: A.s-cases-branch(bl, pl, name, args, sub(body)) end
+      | s-singleton-cases-branch(bl, pl, name, body) =>
+        A.s-singleton-cases-branch(bl, pl, name, sub(body))
+    end
+  end
+  subst-member = lam(m):
+    cases(A.Member) m:
+      | s-data-field(ml, nm, v) => A.s-data-field(ml, nm, sub(v))
+      | s-method-field(ml, nm, ps, args, ann, doc, body, cl, ck, bl) =>
+        if lists.any(lam(a): bind-has-name(a, fromn) end, args): m
+        else: A.s-method-field(ml, nm, ps, args, ann, doc, sub(body), cl, ck, bl)
+        end
+      | else => m
+    end
+  end
   cases(A.Expr) e:
     | s-id(l, n) => if A.is-s-name(n) and (n.s == fromn): A.s-id(l, ton) else: e end
     | s-app(l, f, args) => A.s-app(l, sub(f), map(sub, args))
@@ -722,6 +847,48 @@ fun subst-id(e :: A.Expr, fromn :: String, ton) -> A.Expr:
     | s-if(l, branches, bl) =>
       A.s-if(l, map(lam(b): A.s-if-branch(b.l, sub(b.test), sub(b.body)) end, branches), bl)
     | s-user-block(l, bdy) => A.s-user-block(l, sub(bdy))
+    # ---- definitions/statements (so a forward shadow-rename reaches funs defined AFTER it) ----
+    | s-fun(l, nm, ps, args, ann, doc, body, cl, ck, bl) =>
+      if lists.any(lam(a): bind-has-name(a, fromn) end, args): e
+      else: A.s-fun(l, nm, ps, args, ann, doc, sub(body), cl, ck, bl)
+      end
+    | s-method(l, nm, ps, args, ann, doc, body, cl, ck, bl) =>
+      if lists.any(lam(a): bind-has-name(a, fromn) end, args): e
+      else: A.s-method(l, nm, ps, args, ann, doc, sub(body), cl, ck, bl)
+      end
+    | s-let(l, b, v, kv) => A.s-let(l, b, sub(v), kv)
+    | s-var(l, b, v) => A.s-var(l, b, sub(v))
+    | s-letrec(l, binds, body, bl) =>
+      A.s-letrec(l, map(lam(lb): cases(A.LetrecBind) lb:
+            | s-letrec-bind(bl2, bb, vv) => A.s-letrec-bind(bl2, bb, sub(vv)) end end, binds),
+        sub(body), bl)
+    | s-let-expr(l, binds, body, bl) =>
+      A.s-let-expr(l, map(lam(lb): cases(A.LetBind) lb:
+            | s-let-bind(bl2, bb, vv) => A.s-let-bind(bl2, bb, sub(vv))
+            | s-var-bind(bl2, bb, vv) => A.s-var-bind(bl2, bb, sub(vv)) end end, binds),
+        sub(body), bl)
+    | s-when(l, test, blk, bl) => A.s-when(l, sub(test), sub(blk), bl)
+    | s-for(l, it, binds, ann, body, bl) =>
+      fbinds = map(lam(fb): cases(A.ForBind) fb:
+          | s-for-bind(fl, bb, vv) => A.s-for-bind(fl, bb, sub(vv)) end end, binds)
+      rebinds = lists.any(lam(fb): cases(A.ForBind) fb:
+          | s-for-bind(_, bb, _) => bind-has-name(bb, fromn) end end, binds)
+      body2 = if rebinds: body else: sub(body) end
+      A.s-for(l, sub(it), fbinds, ann, body2, bl)
+    | s-cases(l, typ, val, branches, bl) =>
+      A.s-cases(l, typ, sub(val), map(subst-branch, branches), bl)
+    | s-cases-else(l, typ, val, branches, els, bl) =>
+      A.s-cases-else(l, typ, sub(val), map(subst-branch, branches), sub(els), bl)
+    | s-instantiate(l, ex, params) => A.s-instantiate(l, sub(ex), params)
+    | s-extend(l, supe, fields) => A.s-extend(l, sub(supe), map(subst-member, fields))
+    | s-update(l, supe, fields) => A.s-update(l, sub(supe), map(subst-member, fields))
+    | s-obj(l, fields) => A.s-obj(l, map(subst-member, fields))
+    | s-array(l, vs) => A.s-array(l, map(sub, vs))
+    | s-check-test(l, op, refi, lft, rgt, cause) =>
+      A.s-check-test(l, op, refi, sub(lft),
+        cases(Option) rgt: | none => none | some(x) => some(sub(x)) end, cause)
+    | s-check(l, name, body, kw) => A.s-check(l, name, sub(body), kw)
+    | s-check-expr(l, ex, ann) => A.s-check-expr(l, sub(ex), ann)
     | else => e
   end
 end
@@ -775,8 +942,47 @@ fun desugar-rest(stmts :: List<A.Expr>) -> List<A.Expr>:
   end
 end
 
-fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
+# PROGRAM-ORDER shadow resolution (runs BEFORE partition-top, on the raw surface stmts).
+# A top-level `shadow X = val` must NOT reassign the mutable global X — that corrupts X for
+# every fun/method/data-method defined BEFORE the shadow (e.g. pprint's `_plus` calls the raw
+# 4-arg `concat` ctor, but a later `shadow concat = lam(fst,snd): fst + snd end` would make it
+# read the 2-arg smart ctor -> infinite recursion). Correct Pyret semantics: `shadow X`
+# introduces a NEW binding visible only to code AFTER it. We model that by alpha-renaming:
+# bind a fresh name `X#k = val` and rename every later reference X -> X#k (capture-avoiding,
+# via subst-id). Code before the shadow keeps the original X; the global X is never mutated.
+# val itself keeps X (a non-recursive let binds the PRIOR X), and earlier shadows have already
+# been forward-substituted into both val and the rest.
+fun resolve-shadows(stmts :: List<A.Expr>, record :: Boolean) -> List<A.Expr> block:
+  cases(List) stmts:
+    | empty => empty
+    | link(f, rest) =>
+      info = cases(A.Expr) f:
+        | s-let(ll, bind, val, kv) =>
+          cases(A.Bind) bind:
+            | s-bind(_, shadows, nm, _) =>
+              if shadows and A.is-s-name(nm): some({ll: ll, nm: nm, val: val, kv: kv}) else: none end
+            | else => none
+          end
+        | else => none
+      end
+      cases(Option) info:
+        | none => link(f, resolve-shadows(rest, record))
+        | some(si) =>
+          fresh = A.s-name(si.ll, fresh-shadow-name(si.nm.s))
+          # record top-level shadows so a cross-module `ALIAS.X` resolves to the final binding.
+          when record:
+            shadow-exports := link({k: si.nm.s, v: fresh.s}, shadow-exports)
+          end
+          new-let = A.s-let(si.ll, A.s-bind(si.ll, false, fresh, A.a-blank), si.val, si.kv)
+          renamed-rest = map(lam(s): subst-id(s, si.nm.s, fresh) end, rest)
+          link(new-let, resolve-shadows(renamed-rest, record))
+      end
+  end
+end
+
+fun desugar-stmts(stmts0 :: List<A.Expr>, top :: Boolean) -> List<A.Expr>:
   l = A.dummy-loc
+  stmts = resolve-shadows(stmts0, top)
   {hoisted; rest} = partition-top(stmts, [list:], [list:])
   body = desugar-rest(rest)
   if is-empty(hoisted): body
@@ -784,11 +990,20 @@ fun desugar-stmts(stmts :: List<A.Expr>) -> List<A.Expr>:
   end
 end
 
-fun desugar-program(prog :: A.Program) -> A.Program:
+fun desugar-program(prog :: A.Program) -> A.Program block:
   cases(A.Program) prog:
     | s-program(loc, use, prov, prov-types, provides, imports, body) =>
+      shadow-exports := [list:]   # repopulated by resolve-shadows (top-level, run next)
+      cases(A.Expr) body:
+        | s-block(_, stmts) =>
+          known-variants := collect-variant-names(stmts)
+          top-globals := collect-top-globals(stmts)
+        | else =>
+          known-variants := [list:]
+          top-globals := [list:]
+      end
       new-body = cases(A.Expr) body:
-        | s-block(bl, stmts) => nonempty-block(bl, desugar-stmts(stmts))
+        | s-block(bl, stmts) => nonempty-block(bl, desugar-stmts(stmts, true))   # module top-level
         | else => desugar-expr(body)
       end
       A.s-program(loc, use, prov, prov-types, provides, imports, new-body)
