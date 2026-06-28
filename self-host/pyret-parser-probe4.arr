@@ -36,6 +36,10 @@ print("dec: " + num-to-string(xlet.value.n))
 rough = P.parse-expr-string("~5")
 print("rough: " + rough.label() + " " + to-string(num-is-roughnum(rough.n)))
 
+# ~3.14 (rough DECIMAL) -> s-num holding a roughnum, same node shape as ~5
+rdec = P.parse-expr-string("~3.14")
+print("rough-dec: " + rdec.label() + " " + to-string(num-is-roughnum(rdec.n)))
+
 # {a; b} = {1; 2}  -> s-let whose binding is a tuple-bind
 tlet = stmts.rest.first
 print("tuplelet: " + tlet.name.label())

@@ -94,6 +94,7 @@ test("pure-Pyret parser: let/letrec/type-let, check-ops, spy, decimals", async (
   expect(o).toContain("stmts: s-let s-let s-let s-letrec s-type-let s-check s-spy-block");
   expect(o).toContain("dec: 157/50");                 // 3.14 -> exact rational
   expect(o).toContain("rough: s-num true");           // ~5 -> roughnum-valued s-num
+  expect(o).toContain("rough-dec: s-num true");        // ~3.14 -> roughnum-valued s-num (same shape as ~5)
   expect(o).toContain("tuplelet: s-tuple-bind");      // {a; b} = {1; 2}
   expect(o).toContain("multilet: s-let binds=2 body=s-block");
   expect(o).toContain("letrec: s-letrec binds=1");
