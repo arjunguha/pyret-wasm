@@ -209,3 +209,71 @@ test("stoppable: named check block, mixed pass/fail + is-not, matches the seed",
 test("stoppable: check with interruptible call in a test operand matches the seed", async () => {
   await checkAgrees("fun f(x): x + 1 end\ncheck: f(4) is 5 end");
 });
+
+// ---- (c) per-construct coverage net (prerequisite for the cps.arr -> ast.arr migration) ----
+// Each program exercises a distinct construct cps-transform handles; the stoppable/CPS result
+// must MATCH the direct (non-stoppable) compiler. A future cps.arr rewrite that mis-handles any
+// construct fails the matching assertion loudly. Each program is small + single-construct.
+async function same(src: string): Promise<void> {
+  expect(await evalStoppable(src), `stoppable vs direct for ${JSON.stringify(src)}`)
+    .toBe(await evalDirect(src));
+}
+
+const CONSTRUCTS: Array<[string, string]> = [
+  ["if / else-if (if-expr)", "fun c(n): if n < 0: 0 - 1 else if n == 0: 0 else: 1 end end\nc(5) + c(0 - 3) + c(0)"],
+  ["ask: (if-pipe-expr)", "x = 5\nask: | x > 10 then: 1 | x > 0 then: 2 | otherwise: 3 end"],
+  ["for loop (for-expr)", "for fold(acc from 0, n from [list: 1, 2, 3, 4]): acc + n end"],
+  ["cases over data (cases-expr)", "data Sh: | circ(r) | sq(s) end\nfun area(x): cases(Sh) x: | circ(r) => r * r | sq(s) => s * s end end\narea(circ(3)) + area(sq(2))"],
+  ["cases with else branch", "cases(List) [list: 1]: | empty => 0 | else => 99 end"],
+  ["tuple + tuple-get (tuple-expr)", "t = {3; 4}\nt.{0} + t.{1}"],
+  ["object literal + dot (obj-expr/dot-expr)", "o = {a: 1, b: 2}\no.a + o.b"],
+  ["and / or (pure operands)", "if ((true and false) or (2 > 1)): 1 else: 0 end"],
+  ["comparisons (< <= > >= ==)", "if (1 < 2) and (2 <= 2) and (5 >= 5) and (6 == 6) and not(3 > 4): 1 else: 0 end"],
+  ["exact fraction literal (frac-expr)", "(1/2) + (1/3)"],
+  ["roughnum literal + contagion (rfrac/num)", "~1.5 + ~2.0"],
+  ["string literal + concat (string-expr)", '"ab" + "cd"'],
+  ["user block (block: ... end)", "block:\n  x = 1\n  x + 1\nend"],
+  ["paren-expr", "(1 + 2) * 3"],
+  ["nested closures (capture)", "fun mk(n): lam(m): lam(p): n + (m + p) end end end\nmk(1)(2)(3)"],
+  ["mutual recursion", "fun ev(n): if n == 0: true else: od(n - 1) end end\nfun od(n): if n == 0: false else: ev(n - 1) end end\nif ev(10): 1 else: 0 end"],
+  ["method call on object (self)", "o = { v: 5, method get(self): self.v end }\no.get()"],
+];
+
+for (const [label, src] of CONSTRUCTS) {
+  test(`stoppable construct: ${label} matches the direct compiler`, async () => {
+    await same(src);
+  });
+}
+
+// Interruptibility through a `for` loop (complements the each/operator/data-method stop tests).
+test("stoppable: a for-loop over a large range can be STOPPED", async () => {
+  const h = runStoppable(
+    await buildStoppableSource("for each(n from range(0, 100000000)): n end"),
+    { onPause: (n) => { if (n >= 2) h.stop(); } },
+  );
+  const r = await h.promise;
+  expect(r.stopped).toBe(true);
+  expect(r.pauses).toBeGreaterThanOrEqual(2);
+});
+
+// `when` is lowered to `if` by the CPS transform, so the STOPPABLE path supports it even
+// though the SEED's direct compiler does NOT (CompileError: unsupported expression: when-expr).
+// So assert against an expected value, not the direct compiler.
+test("stoppable construct: when (when-expr, cps-lowered to if; seed lacks when-expr)", async () => {
+  expect(await evalStoppable("x = 5\nwhen x > 0: nothing end\nx")).toBe("5");
+  expect(await evalStoppable("when 1 > 2: nothing end\n42")).toBe("42");
+});
+
+// ---- documented cps.arr GAPS (surfaced while building this net) ----
+// These constructs are NOT handled by cps-transform today; skipped so the net stays GREEN.
+// The cps.arr -> ast.arr migration should IMPLEMENT them and un-skip — and must not silently
+// regress the (c) construct net above.
+test.skip("GAP cps.arr: assign-expr (:=) — 'unsupported expression in CPS: assign-expr'", async () => {
+  await same("var c = 0\nc := c + 10\nc");
+});
+test.skip("GAP cps.arr: multi-let-expr — 'unsupported expression in CPS: multi-let-expr'", async () => {
+  await same("let a = 1, b = a + 1: a + b end");
+});
+test.skip("GAP cps.arr: and/or do NOT short-circuit (effectful RHS is evaluated -> traps)", async () => {
+  await same("if (false and ((1 / 0) == 0)): 9 else: 2 end");
+});
