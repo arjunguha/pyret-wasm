@@ -164,10 +164,34 @@ bun run build:web                 # parser bundle + cps driver + bundle web/main
 PORT=7000 HOST=0.0.0.0 bun scripts/serve.ts   # then open http://localhost:7000
 ```
 
-The IDE runs your code **on the UI thread** (no Web Worker). Try Run/Stop (an infinite
-loop is interruptible), the REPL, and images, e.g.
+The IDE runs your code **on the UI thread** (no Web Worker), and **only** through the
+self-hosted compiler composed with the CPS stop transform — there is **no seed fallback**
+(programs the self-hosted compiler can't yet handle surface as a real error). Try Run/Stop
+(an infinite loop is interruptible), the REPL, and images, e.g.
 `above(beside(circle(40, "solid", "red"), square(60, "solid", "blue")),
 image-url("https://.../photo.jpg"))`.
+
+### Deploy (static / GitHub Pages)
+
+The IDE is a **fully static site** — HTML + JS (+ source maps) + `.wasm` driver artifacts,
+no server-side code at runtime. `bun run build:web` emits everything into `web/`, which can
+be served by any static host:
+
+```bash
+bun run build:web
+cd web && python3 -m http.server 8000   # or any static file server
+```
+
+A GitHub Actions workflow (`.github/workflows/deploy-pages.yml`) builds and publishes `web/`
+to **GitHub Pages** on push to `master`/`main` (or via *Run workflow*). The build is
+**hermetic** — the JS-GLR parser the seed needs is vendored under `vendor/pyret-lang/`, so CI
+needs no external `pyret-lang` checkout. **One-time setup:** in the repo, *Settings → Pages →
+Build and deployment → Source = GitHub Actions.*
+
+> Because it's static, there is **no CORS image proxy**. `image-url(...)` loads images
+> directly with `crossOrigin="anonymous"`: images from hosts that send CORS headers work
+> (including pixel ops); images from hosts that don't will fail to load or taint the canvas.
+> That's an accepted limitation of the static deploy.
 
 ### Test
 
