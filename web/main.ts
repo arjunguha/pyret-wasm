@@ -19,12 +19,15 @@
 // optimistic — it lights up as the self-hosted compiler's coverage + stoppable codegen
 // come online.
 
-import { serializeCstNode } from "../src/build-stoppable-core.ts";
+// IMPORTANT: the browser bundle must NOT import the SEED compiler (src/compiler/compile.ts
+// → binaryen, ~21MB) or any module that transitively pulls it. serializeCstNode comes from
+// the browser-safe ../src/cst-serialize.ts (NOT build-stoppable-core.ts, which imports
+// compile.ts). The only compiler on the web is the prebuilt self-hosted + CPS driver wasm.
+import { serializeCstNode } from "../src/cst-serialize.ts";
 import { PRELUDE_SRC } from "../src/compiler/prelude.ts";
 import { parsePyretBrowser } from "../src/parser/parser-browser.ts";
 import { buildHostImports, newHostState, PauseSignal, PyretError } from "../src/runtime/run.ts";
 import { ParseError } from "../src/parser/parse-core.ts";
-import { CompileError } from "../src/compiler/compile.ts";
 
 export type RunState = "running" | "paused";
 
@@ -189,10 +192,8 @@ function withLocation(e: unknown): Error {
     const err = new Error(`${e.message} (at line ${e.pos.startLine}, column ${e.pos.startCol})`);
     return err;
   }
-  if (e instanceof CompileError && (e as any).node?.pos) {
-    const p = (e as any).node.pos;
-    return new Error(`${e.message} (at line ${p.startLine}, column ${p.startCol})`);
-  }
+  // NB: no CompileError branch — that's the SEED compiler's error type, and the seed
+  // is not on the web. The self-hosted compiler surfaces errors as plain Errors.
   return e instanceof Error ? e : new Error(String(e));
 }
 

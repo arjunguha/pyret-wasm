@@ -17,21 +17,13 @@ import { compile } from "./compiler/compile.ts";
 import { PRELUDE_SRC } from "./compiler/prelude.ts";
 import { newHostState, buildHostImports } from "./runtime/run.ts";
 import type { CstNode } from "./parser/parse-core.ts";
+import { serializeCstNode } from "./cst-serialize.ts";
 
 export type ParseFn = (src: string) => Promise<CstNode>;
 
-// Serialize a CST to a length-prefixed pre-order string the Pyret driver reads
-// back (see read-node in self-host/cps-driver.arr — the two MUST stay in sync).
-// Per node: "<nkids> <nameLen> <name><hasVal>[<valLen> <value>]" then its kids.
-// Lengths are in Unicode code points (string values may be non-ASCII).
-export function serializeCstNode(n: CstNode): string {
-  const cps = (s: string) => [...s].length;
-  let out = `${n.kids.length} ${cps(n.name)} ${n.name}`;
-  if (n.value === undefined || n.value === null) out += "0";
-  else out += `1${cps(n.value)} ${n.value}`;
-  for (const k of n.kids) out += serializeCstNode(k);
-  return out;
-}
+// serializeCstNode now lives in ./cst-serialize.ts (browser-safe — no compile import);
+// re-exported here so existing Node callers keep working.
+export { serializeCstNode };
 
 // Run the CPS driver wasm on the serialized CST; returns the transformed source.
 async function runCpsDriver(driverWasm: Uint8Array, serialized: string): Promise<string> {
