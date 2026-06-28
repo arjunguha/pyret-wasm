@@ -386,3 +386,17 @@ test("self-hosted: variant field access via a-dot (a(5).x)", async () => {
     "data D: | a(x) end\nif a(5).x == 5: 0 else: 1 / 0 end");
   expect(result.error).toBeUndefined();
 });
+
+// ─── Empty-after-erase blocks ───────────────────────────────────────────────────
+// A block whose statements are only erased contracts/types desugars to an EMPTY
+// s-block, which used to trip anf.arr's "Empty block". The driver's nonempty-block
+// guard now substitutes `nothing` at every s-block site (expr + program body).
+test("self-hosted: block with only an erased type alias compiles + runs (-> 5)", async () => {
+  const { result } = await selfHostRun("if (block:\n  type T = Number\n  5\nend) == 5: 0 else: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+
+test("self-hosted: lambda body that is empty after erasing a type alias runs", async () => {
+  const { result } = await selfHostRun("f = lam(): block: type T = Number end end\nf()\n0");
+  expect(result.error).toBeUndefined();
+});
