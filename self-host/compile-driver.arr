@@ -562,7 +562,8 @@ fun desugar-expr(e :: A.Expr) -> A.Expr:
 
     | s-dot(loc, obj, field) =>
       is-modref = cases(A.Expr) obj:
-        | s-id(_, nm) => A.is-s-name(nm) and is-uppercase-start(nm.s) and top-globals.member(field)
+        | s-id(_, nm) => A.is-s-name(nm) and is-uppercase-start(nm.s)
+            and (top-globals.member(field) or is-variant-pred-name(field))
         | else => false
       end
       if is-modref:
