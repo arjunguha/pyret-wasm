@@ -101,6 +101,59 @@ test("cps-ast: matches COMPILER #2 on core constructs", async () => {
   }
 });
 
+// STEP-2 constructs: data/cases, for (over a user-defined data list), when, tuple, object
+// + method, `:=`, ask, and data sharing-methods. Each is compared against compiler #2 on
+// the ORIGINAL program (so the CPS transform must preserve meaning).
+//
+// NB: programs avoid `[list: ...]`/`List`/the free HOFs — the ACTUAL path here is the bare
+// seed {stoppable} codegen with NO prelude injected (same constraint as stoppable.test.ts),
+// so we bring our own `data`-list + fold instead of the stdlib List.
+test("cps-ast: matches COMPILER #2 on step-2 constructs", async () => {
+  for (const src of [
+    // data + cases (branch with args + singleton)
+    "data Animal: | dog(n) | cat end\n" +
+      "fun describe(a): cases(Animal) a: | dog(n) => n | cat => 99 end end\n" +
+      "print(describe(dog(7)))\nprint(describe(cat))\nnothing",
+    // for-loop over a user-defined data list (s-for + s-cases over user data, no stdlib List)
+    "data Nums: | nnil | ncons(h, t) end\n" +
+      "fun myfold(f, acc, lst):\n" +
+      "  cases(Nums) lst: | nnil => acc | ncons(fst, rst) => myfold(f, f(acc, fst), rst) end\n" +
+      "end\n" +
+      "lst = ncons(1, ncons(2, ncons(3, ncons(4, nnil))))\n" +
+      "s = for myfold(acc from 0, e from lst): acc + e end\n" +
+      "print(s)\nnothing",
+    // when (effect, yields nothing) + assign — the body's effect must NOT be dropped
+    "var c = 0\nwhen 3 > 1: c := 10 end\nprint(c)\nnothing",
+    // tuple + tuple-get
+    "t = {1; 2; 3}\nprint(t.{0} + t.{2})\nnothing",
+    // object literal + method call
+    "o = { x: 5, method getx(self): self.x end }\nprint(o.getx())\nnothing",
+    // var + `:=` assignment
+    "var v = 1\nv := v + 41\nprint(v)\nnothing",
+    // ask: (s-if-pipe-else) — each test is CPS-evaluated
+    "fun classify(n): ask: | n > 10 then: 100 | n > 5 then: 50 | otherwise: 0 end end\n" +
+      "print(classify(8))\nnothing",
+    // data method (sharing:) called via dispatch
+    "data Box:\n  | box(v)\nsharing:\n  method get2(self): self.v + self.v end\nend\n" +
+      "print(box(21).get2())\nnothing",
+  ]) {
+    expect(stripNothing(await evalCpsAst(src)), src).toBe(stripNothing(await evalSelfHosted(src)));
+  }
+});
+
+// `check:` blocks: operands are CPS-evaluated then compared by VALUE so the check harness
+// records pass/fail. Compare the full output (incl. harness summary) against compiler #2
+// running the same block — both must agree on which tests pass and which fail. (No source
+// string literals: the seed runtime's `torepr` doesn't quote strings, which corrupts the
+// .tosource() TEST shim — irrelevant to production, which feeds the AST to the backend.)
+test("cps-ast: check blocks (pass + fail) agree with COMPILER #2", async () => {
+  const src =
+    "fun add1(n): n + 1 end\n" +
+    "check:\n  add1(2) is 3\n  1 + 1 is 2\n  add1(2) is 100\nend\n" +
+    "nothing";
+  expect(stripNothing(await evalCpsAst(src)), src).toBe(stripNothing(await evalSelfHosted(src)));
+});
+
 // `and`/`or` must SHORT-CIRCUIT: the right operand is only evaluated when reached.
 // cps.arr lowered these to a strict `(a and b)` (evaluating BOTH); cps-ast desugars
 // to `if`. We probe it with a right operand that would RAISE (1 / 0) if evaluated:

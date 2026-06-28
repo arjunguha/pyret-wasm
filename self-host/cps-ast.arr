@@ -21,10 +21,13 @@
 # short-circuit — a latent bug); here they desugar to `if` so the right operand is
 # only evaluated when reached.
 #
-# STEP-1 SCOPE (this file): core constructs — literals (num/str/bool/id), s-op
-# (binops incl. and/or short-circuit), s-app (prim / general / method), s-lam, s-fun,
-# s-let / s-var / s-let-expr, s-if-else, s-block.  Everything else (cases/data/for/
-# when/method/tuples/objects/check/:=/rec/multi-let) raises a clear `# TODO(cps-ast)`.
+# SCOPE: core constructs — literals (num/frac/rfrac/str/bool/id/undefined), s-op (binops
+# incl. and/or short-circuit), s-app (prim / general / method), s-lam, s-fun, s-let /
+# s-var / s-rec / s-let-expr, s-if / s-if-else, s-block / s-user-block.  PLUS (step 2):
+# s-cases / s-cases-else, s-data (+ ctor registration), s-for, s-when, s-method, s-tuple /
+# s-tuple-get, s-obj / s-extend / s-update (object + method fields), s-construct ([list:]),
+# s-assign (:=), s-if-pipe / s-if-pipe-else (ask:), s-dot / s-get-bang, s-instantiate, and
+# `check:` blocks (equality-style ops).  Unhandled nodes raise a clear `# TODO(cps-ast)`.
 
 provide *
 provide-types *
@@ -180,21 +183,55 @@ fun t(node :: A.Expr, k :: Cont) -> A.Expr:
     # literals + identifiers are already value-expressions — feed the node to k directly
     # (no num-to-string / no string quoting — the node IS the value).
     | s-num(_, _) => applyk(k, node)
+    | s-frac(_, _, _) => applyk(k, node)        # exact-rational literal `1/2`
+    | s-rfrac(_, _, _) => applyk(k, node)       # roughnum-rational literal `~1/2`
     | s-str(_, _) => applyk(k, node)
     | s-bool(_, _) => applyk(k, node)
     | s-id(_, _) => applyk(k, node)
     | s-id-letrec(_, _, _) => applyk(k, node)
     | s-id-var(_, _) => applyk(k, node)
+    | s-undefined(_) => applyk(k, node)
     | s-paren(_, e) => t(e, k)
     | s-block(_, stmts) => t-stmts(stmts, 0, k)
+    | s-user-block(_, body) => t(body, k)
     | s-let-expr(_, binds, body, _) => t-let-binds(binds, body, k)
     | s-op(_, _, op, lhs, rhs) => t-op(op, lhs, rhs, k)
     | s-app(_, _, _) => t-app(node, k)
     | s-app-enriched(l, f, args, _) => t-app(A.s-app(l, f, args), k)
     | s-dot(_, obj, field) =>
       t(obj, k-fn(lam(vo): applyk(k, A.s-dot(lml(), vo, field)) end))
+    | s-get-bang(_, obj, field) =>
+      t(obj, k-fn(lam(vo): applyk(k, A.s-get-bang(lml(), vo, field)) end))
     | s-lam(_, _, _, _, _, _, _, _, _, _) => applyk(k, cps-lambda(node))
+    | s-method(_, _, _, _, _, _, _, _, _, _) => applyk(k, cps-method-value(node))
     | s-if-else(_, branches, els, _) => t-if(branches, els, k)
+    | s-if(_, branches, _) => t-if(branches, lid("nothing"), k)  # no else -> nothing
+    | s-cases(_, typ, val, branches, _) => t-cases(typ, val, branches, none, k)
+    | s-cases-else(_, typ, val, branches, els, _) => t-cases(typ, val, branches, some(els), k)
+    | s-when(_, test-e, body, _) => t-when(test-e, body, k)
+    | s-if-pipe(_, branches, _) => t-ask(branches, none, k)
+    | s-if-pipe-else(_, branches, els, _) => t-ask(branches, some(els), k)
+    | s-for(_, iter, binds, _, body, _) => t-for(iter, binds, body, k)
+    | s-tuple(_, fields) =>
+      t-seq(fields, empty, lam(vs): applyk(k, A.s-tuple(lml(), vs)) end)
+    | s-tuple-get(_, tup, idx, _) =>
+      t(tup, k-fn(lam(v): applyk(k, A.s-tuple-get(lml(), v, idx, lml())) end))
+    | s-obj(_, fields) =>
+      cps-fields-then(fields, lam(fs): applyk(k, A.s-obj(lml(), fs)) end)
+    | s-extend(_, supe, fields) =>
+      t(supe, k-fn(lam(vsupe):
+        cps-fields-then(fields, lam(fs): applyk(k, A.s-extend(lml(), vsupe, fs)) end)
+      end))
+    | s-update(_, supe, fields) =>
+      t(supe, k-fn(lam(vsupe):
+        cps-fields-then(fields, lam(fs): applyk(k, A.s-update(lml(), vsupe, fs)) end)
+      end))
+    | s-construct(_, modifier, ctor, values) =>
+      t-seq(values, empty, lam(vs): applyk(k, A.s-construct(lml(), modifier, ctor, vs)) end)
+    | s-assign(_, id, value) =>
+      t(value, k-fn(lam(v): applyk(k, A.s-assign(lml(), id, v)) end))
+    | s-instantiate(_, expr, params) =>
+      t(expr, k-fn(lam(v): applyk(k, A.s-instantiate(lml(), v, params)) end))
     | else => raise("TODO(cps-ast): expression " + node.label())
   end
 end
@@ -277,6 +314,119 @@ fun t-branches(branches :: List<A.IfBranch>, els :: A.Expr, kk :: Cont) -> A.Exp
   end
 end
 
+# cases(T) scrut: | c(a) => body ... [| else => e] end — the scrutinee is CPS-evaluated,
+# each branch body CPS'd with the (reified-once) continuation so it isn't duplicated.
+fun t-cases(typ :: A.Ann, val :: A.Expr, branches :: List<A.CasesBranch>,
+    els-opt :: Option<A.Expr>, k :: Cont) -> A.Expr:
+  with-reified-k(k, lam(kk):
+    t(val, k-fn(lam(vscrut):
+      new-branches = map(lam(br): cps-cases-branch(br, kk) end, branches)
+      cases(Option) els-opt:
+        | none => A.s-cases(lml(), typ, vscrut, new-branches, false)
+        | some(els) => A.s-cases-else(lml(), typ, vscrut, new-branches, t(els, kk), false)
+      end
+    end))
+  end)
+end
+
+fun cps-cases-branch(br :: A.CasesBranch, kk :: Cont) -> A.CasesBranch:
+  cases(A.CasesBranch) br:
+    | s-cases-branch(_, _, name, args, body) =>
+      A.s-cases-branch(lml(), lml(), name, args, t(body, kk))
+    | s-singleton-cases-branch(_, _, name, body) =>
+      A.s-singleton-cases-branch(lml(), lml(), name, t(body, kk))
+  end
+end
+
+# when COND: BODY end  — BODY runs for effect (interruptible); the whole thing is nothing.
+# The body's value-expr is EMITTED (in a block) before continuing — a body like `c := 10`
+# or `print(x)` is side-effecting, so a continuation that discards its value must still
+# evaluate it (else the effect is dropped).
+fun t-when(test-e :: A.Expr, body :: A.Expr, k :: Cont) -> A.Expr:
+  with-reified-k(k, lam(kk):
+    t(test-e, k-fn(lam(vc):
+      lif(vc,
+        t(body, k-fn(lam(vb): lblock([list: vb, applyk(kk, lid("nothing"))]) end)),
+        applyk(kk, lid("nothing")))
+    end))
+  end)
+end
+
+# ask: | t1 then: b1 ... [| otherwise: e] end  ==>  nested if/else.  Unlike if's else-if
+# tests, ask branch TESTS sit in value position and may contain calls, so each is
+# CPS-evaluated; the rest of the chain becomes its else-branch.
+fun t-ask(branches :: List<A.IfPipeBranch>, els-opt :: Option<A.Expr>, k :: Cont) -> A.Expr:
+  with-reified-k(k, lam(kk): t-ask-branches(branches, els-opt, kk) end)
+end
+
+fun t-ask-branches(brs :: List<A.IfPipeBranch>, els-opt :: Option<A.Expr>, kk :: Cont) -> A.Expr:
+  cases(List) brs:
+    | empty =>
+      cases(Option) els-opt:
+        | some(e) => t(e, kk)
+        | none => lcall("raise", [list: A.s-str(lml(), "ask: no branch matched")])
+      end
+    | link(br, rest) =>
+      cases(A.IfPipeBranch) br:
+        | s-if-pipe-branch(_, test-e, body) =>
+          t(test-e, k-fn(lam(vt):
+            lif(vt, t(body, kk), t-ask-branches(rest, els-opt, kk))
+          end))
+      end
+  end
+end
+
+# for ITER(p from e, ...): body end  ==>  ITER(lam(p,...,kg): yield-check(...) end, e..., reify k)
+fun t-for(iter :: A.Expr, binds :: List<A.ForBind>, body :: A.Expr, k :: Cont) -> A.Expr:
+  params = map(lam(b): lbind(bind-name(b.bind)) end, binds)
+  from-exprs = map(lam(b): b.value end, binds)
+  kg = gensym("k")
+  lam-src = llam(params + [list: lbind(kg)], yield-wrap(t(body, k-var(kg))))
+  t(iter, k-fn(lam(viter):
+    t-seq(from-exprs, empty, lam(vs):
+      A.s-app(lml(), viter, link(lam-src, vs) + [list: reifyk(k)])
+    end)
+  end))
+end
+
+# object / extend / update fields: value (s-data-field) values are CPS-evaluated
+# left-to-right; method fields get a trailing continuation param + yield-check body;
+# anything else (e.g. mutable fields) passes through unchanged.
+fun cps-fields-then(fields :: List<A.Member>, k-on :: (List<A.Member> -> A.Expr)) -> A.Expr:
+  data-fields = filter(A.is-s-data-field, fields)
+  method-fields = filter(A.is-s-method-field, fields)
+  others = filter(lam(f): not(A.is-s-data-field(f)) and not(A.is-s-method-field(f)) end, fields)
+  vals = map(lam(f): f.value end, data-fields)
+  t-seq(vals, empty, lam(vs):
+    new-data = rebuild-data-fields(data-fields, vs)
+    new-methods = map(cps-method-field, method-fields)
+    k-on(new-data + new-methods + others)
+  end)
+end
+
+fun rebuild-data-fields(fs :: List<A.Member>, vs :: List<A.Expr>) -> List<A.Member>:
+  cases(List) fs:
+    | empty => empty
+    | link(f, frest) =>
+      cases(List) vs:
+        | empty => empty
+        | link(v, vrest) =>
+          link(A.s-data-field(lml(), f.name, v), rebuild-data-fields(frest, vrest))
+      end
+  end
+end
+
+fun cps-method-field(m :: A.Member) -> A.Member:
+  cases(A.Member) m:
+    | s-method-field(_, name, _, args, _, _, body, _, _, _) =>
+      kg = gensym("k")
+      params = map(lam(b): lbind(bind-name(b)) end, args) + [list: lbind(kg)]
+      A.s-method-field(lml(), name, [list:], params, A.a-blank, "",
+        yield-wrap(t(body, k-var(kg))), none, none, false)
+    | else => raise("TODO(cps-ast): non-method member in method position " + m.label())
+  end
+end
+
 fun t-let-binds(binds :: List<A.LetBind>, body :: A.Expr, k :: Cont) -> A.Expr:
   cases(List) binds:
     | empty => t(body, k)
@@ -316,6 +466,98 @@ fun cps-lambda(node :: A.Expr) -> A.Expr:
   end
 end
 
+# a bare `method(self, ...): ... end` expression used as a VALUE.
+fun cps-method-value(node :: A.Expr) -> A.Expr:
+  cases(A.Expr) node:
+    | s-method(_, _, _, args, _, _, body, _, _, _) =>
+      kg = gensym("k")
+      params = map(lam(b): lbind(bind-name(b)) end, args) + [list: lbind(kg)]
+      A.s-method(lml(), "", [list:], params, A.a-blank, "",
+        yield-wrap(t(body, k-var(kg))), none, none, false)
+  end
+end
+
+# ---- data definitions ----
+# A `data` decl is hoisted (so forward refs resolve) and its methods CPS'd (each gains a
+# trailing continuation param), mirroring the call sites that pass reifyk(k) as the last
+# arg.  Constructors are NOT CPS'd — they're registered in `ctors` so is-prim calls them
+# directly (no continuation).  The surface form is `s-data` (pre-desugar), what the
+# pure-Pyret parser emits.
+fun cps-data-def(d :: A.Expr) -> A.Expr:
+  cases(A.Expr) d:
+    | s-data(_, name, params, mixins, variants, shared, _, _) =>
+      A.s-data(lml(), name, params, mixins,
+        map(cps-variant, variants), map(cps-member, shared), none, none)
+  end
+end
+
+fun cps-variant(v :: A.Variant) -> A.Variant:
+  cases(A.Variant) v:
+    | s-variant(_, _, name, members, with-members) =>
+      A.s-variant(lml(), lml(), name, members, map(cps-member, with-members))
+    | s-singleton-variant(_, name, with-members) =>
+      A.s-singleton-variant(lml(), name, map(cps-member, with-members))
+  end
+end
+
+# data with:/sharing: members — methods are CPS-transformed; non-method (value) members
+# are constants, kept as-is.
+fun cps-member(m :: A.Member) -> A.Member:
+  if A.is-s-method-field(m): cps-method-field(m)
+  else: m
+  end
+end
+
+# ---- check: blocks ----
+# Each test's operands are CPS-evaluated (so calls inside them stay interruptible) and
+# bound to value-exprs; we then emit an `s-check` comparing those VALUES so the seed's
+# check harness records pass/fail exactly as for the direct compiler.  Only EQUALITY-style
+# ops (is / is-not / is<op> / is-roughly / …) are supported — satisfies/raises call a
+# user fn/thunk that, after CPS, takes a continuation the harness can't supply.
+fun check-op-ok(op :: A.CheckOp) -> Boolean:
+  lbl = op.label()
+  (lbl == "s-op-is") or (lbl == "s-op-is-not") or (lbl == "s-op-is-op") or
+    (lbl == "s-op-is-not-op") or (lbl == "s-op-is-roughly") or (lbl == "s-op-is-not-roughly")
+end
+
+fun t-check-block(name-opt :: Option<String>, body :: A.Expr, keyword-check :: Boolean,
+    k :: Cont) -> A.Expr:
+  tests = cases(A.Expr) body:
+    | s-block(_, ss) => ss
+    | else => [list: body]
+  end
+  cps-check-tests(tests, empty, lam(new-tests):
+    chk = A.s-check(lml(), name-opt, lblock(new-tests), keyword-check)
+    lblock([list: chk, applyk(k, lid("nothing"))])
+  end)
+end
+
+# CPS-eval each check-test's operands (threading lets around the whole block), collecting
+# rebuilt s-check-test nodes over the computed value-exprs, then hand them to kf.
+fun cps-check-tests(ts :: List<A.Expr>, acc :: List<A.Expr>,
+    kf :: (List<A.Expr> -> A.Expr)) -> A.Expr:
+  cases(List) ts:
+    | empty => kf(acc)
+    | link(ct, rest) =>
+      cases(A.Expr) ct:
+        | s-check-test(_, op, refinement, left, rightopt, _) =>
+          when not(check-op-ok(op)): raise("TODO(cps-ast): check-op " + op.label()) end
+          when is-some(refinement): raise("TODO(cps-ast): check refinement (%(...))") end
+          cases(Option) rightopt:
+            | none => raise("TODO(cps-ast): check-test without rhs " + op.label())
+            | some(right) =>
+              t(left, k-fn(lam(lv):
+                t(right, k-fn(lam(rv):
+                  new-test = A.s-check-test(lml(), op, none, lv, some(rv), none)
+                  cps-check-tests(rest, acc + [list: new-test], kf)
+                end))
+              end))
+          end
+        | else => raise("TODO(cps-ast): non-test statement in check block " + ct.label())
+      end
+  end
+end
+
 # ---- statement sequences ----
 fun t-stmts(stmts :: List<A.Expr>, i :: Number, k :: Cont) -> A.Expr:
   if is-empty(stmts): applyk(k, lid("nothing"))
@@ -329,8 +571,16 @@ fun t-stmts(stmts :: List<A.Expr>, i :: Number, k :: Cont) -> A.Expr:
       | s-var(_, name, val) =>
         nm = bind-name(name)
         t(val, k-fn(lam(v): lvar(nm, v, t-stmts(stmts, i + 1, k)) end))
+      | s-rec(_, name, val) =>
+        nm = bind-name(name)
+        t(val, k-fn(lam(v): llet(nm, v, t-stmts(stmts, i + 1, k)) end))
       | s-fun(_, _, _, _, _, _, _, _, _, _) =>
         lblock([list: cps-fun-def(s), t-stmts(stmts, i + 1, k)])
+      | s-data(_, _, _, _, _, _, _, _) =>
+        lblock([list: cps-data-def(s), t-stmts(stmts, i + 1, k)])
+      | s-check(_, nm, body, kw) =>
+        cont = if last: k else: k-fn(lam(_): t-stmts(stmts, i + 1, k) end) end
+        t-check-block(nm, body, kw, cont)
       | else =>
         # a plain expression statement
         if last: t(s, k)
@@ -353,6 +603,22 @@ fun collect-fun-defs(stmts :: List<A.Expr>) -> List<String>:
   end
 end
 
+# ---- collect top-level data constructor names (for is-prim: ctors are called directly) ----
+fun variant-name(v :: A.Variant) -> String:
+  cases(A.Variant) v:
+    | s-variant(_, _, name, _, _) => name
+    | s-singleton-variant(_, name, _) => name
+  end
+end
+fun collect-ctors(stmts :: List<A.Expr>) -> List<String>:
+  for fold(acc from empty, s from stmts):
+    cases(A.Expr) s:
+      | s-data(_, _, _, _, variants, _, _, _) => acc + map(variant-name, variants)
+      | else => acc
+    end
+  end
+end
+
 # ---- entry point ----
 # cps-program(prog) -> the CPS'd top-level as an `ast.arr` block Expr.  Top-level
 # `fun`s are hoisted as declarations (so forward references resolve); the remaining
@@ -368,13 +634,17 @@ fun cps-program(prog :: A.Program) -> A.Expr block:
         | else => [list: prog-block]
       end
       fun-defs := collect-fun-defs(stmts)
+      ctors := collect-ctors(stmts)
+      # Hoist top-level `fun` and `data` as declarations (forward refs resolve; both are
+      # globals), preserving original order so funs/data can reference one another.
       decls = for fold(acc from empty, s from stmts):
         cases(A.Expr) s:
           | s-fun(_, _, _, _, _, _, _, _, _, _) => acc + [list: cps-fun-def(s)]
+          | s-data(_, _, _, _, _, _, _, _) => acc + [list: cps-data-def(s)]
           | else => acc
         end
       end
-      rest = filter(lam(s): not(A.is-s-fun(s)) end, stmts)
+      rest = filter(lam(s): not(A.is-s-fun(s)) and not(A.is-s-data(s)) end, stmts)
       driver = if is-empty(rest): lcall("finish-result", [list: lid("nothing")])
         else: t-stmts(rest, 0, k-fn(lam(v): lcall("finish-result", [list: v]) end))
         end
