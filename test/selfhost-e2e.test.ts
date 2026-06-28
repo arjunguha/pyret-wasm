@@ -417,6 +417,32 @@ test("self-hosted: variant field access via a-dot (a(5).x)", async () => {
   expect(result.error).toBeUndefined();
 });
 
+// ── driver-desugar forms: op^ (reverse app), op<> (not-equal), ask:, when ─────
+const EXPECT = "fun expect(v, e): if v == e: 0 else: 1 / 0 end end\n";
+
+test("self-hosted: op^ reverse application (5 ^ inc -> 6)", async () => {
+  const { result } = await selfHostRun(EXPECT + "fun inc(x): x + 1 end\nexpect(5 ^ inc, 6)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: op<> not-equal (1 <> 2 -> true, 1 <> 1 -> false)", async () => {
+  const { result } = await selfHostRun(EXPECT + "expect(1 <> 2, true)\nexpect(1 <> 1, false)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: ask: with otherwise picks the right branch", async () => {
+  const { result } = await selfHostRun(
+    EXPECT + "expect(ask: | false then: 1 | true then: 2 | otherwise: 3 end, 2)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: ask: with no otherwise (s-if-pipe) takes a matching branch", async () => {
+  const { result } = await selfHostRun(EXPECT + "expect(ask: | true then: 7 end, 7)");
+  expect(result.error).toBeUndefined();
+});
+test("self-hosted: when (false guard skips its body, no trap)", async () => {
+  // body would `1 / 0` if run; a false `when` must skip it and yield nothing.
+  const { result } = await selfHostRun("when false: 1 / 0 end");
+  expect(result.error).toBeUndefined();
+});
+
 // Regression: `a-app` type-application annotations (List<Number>, Option<a>) — pervasive
 // in real modules — used to null-ref during compilation (the dummy-loc `.visit()` shim
 // trapped on them). surface-parse now returns the parser AST directly (name-key uses

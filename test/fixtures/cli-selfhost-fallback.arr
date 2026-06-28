@@ -1,4 +1,1 @@
-ask:
-  | true then: print(5)
-  | otherwise: print(0)
-end
+print(num-max(5, 3))
