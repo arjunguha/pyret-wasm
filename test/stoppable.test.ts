@@ -9,6 +9,7 @@ import { buildStoppableSource } from "../src/build-stoppable.ts";
 import { runStoppable } from "../src/runtime/run-stoppable.ts";
 import { buildSource } from "../src/build.ts";
 import { run } from "../src/runtime/run.ts";
+import { runSourceSelfHosted } from "../src/build-selfhosted.ts";
 
 async function evalStoppable(src: string): Promise<string> {
   const wasm = await buildStoppableSource(src);
@@ -23,7 +24,50 @@ async function evalDirect(src: string): Promise<string> {
   return r.output.trimEnd();
 }
 
-// ---- (a) correctness through the CPS pipeline ----
+// ---- CPS reference = COMPILER #2 (the self-hosted compiler compiled by the seed) ----
+// Per the project's three-compiler model: (1) the TS seed is bootstrap ONLY — not a
+// reference; (2) the self-hosted compiler compiled BY the seed (`runSourceSelfHosted`)
+// is the CPS correctness reference; (3) the fixpoint compiler ships on the web. So the
+// CPS transform should preserve meaning as judged by COMPILER #2, not the seed.
+//
+// Scope of this oracle TODAY: compiler #2 compiles a SINGLE source program (the driver
+// injects only a minimal List), so it can't run the FREE prelude HOFs (map/foldl/range —
+// they need the prelude inlined, which the stoppable path does but a bare oracle program
+// doesn't); those stay direct-referenced below. Compiler #2 also doesn't echo top-level
+// values, so oracle programs are `print`-wrapped. run-stoppable displays a trailing
+// top-level `nothing`, stripped before comparing.
+async function evalSelfHosted(src: string): Promise<string> {
+  return (await runSourceSelfHosted(src)).trimEnd();
+}
+function stripNothing(s: string): string {
+  return s.split("\n").filter((l) => l !== "nothing").join("\n").trimEnd();
+}
+// Each program ends in `nothing` so the top-level result is nothing (stripped on both
+// sides): run-stoppable echoes the top-level value but compiler #2 doesn't, so without
+// this `print(4)` would give stoppable "4\n4" vs compiler #2 "4". The `print(...)` is
+// the actual observable both must agree on.
+test("stoppable: matches COMPILER #2 (self-hosted reference) on core constructs", async () => {
+  for (const src of [
+    "print(1 + 1 + 1 + 1)\nnothing",                                                       // arithmetic
+    "fun sm(n, s): if n <= 0: s else: sm(n - 1, s + n) end end\nprint(sm(10, 0))\nnothing", // recursion
+    "fun app(f, x): f(x) end\nprint(app(lam(n): n + 1 end, 41))\nnothing",                  // lambda / HOF
+    "fun f(n): a = n + 1\n b = a * 2\n b end\nprint(f(10))\nnothing",                        // let-block
+    "data D: | mt | nd(v) end\nprint(cases(D) nd(7): | mt => 0 | nd(v) => v end)\nnothing", // data + cases
+    "print([list: 1, 2, 3].length())\nnothing",                                             // list method
+    "print(if 3 > 1: 100 else: 200 end)\nnothing",                                          // if/else
+  ]) {
+    expect(stripNothing(await evalStoppable(src)), src).toBe(stripNothing(await evalSelfHosted(src)));
+  }
+}, 180000);
+test("stoppable: check block matches COMPILER #2 (self-hosted reference)", async () => {
+  const src = "check: 2 + 3 is 5 end";
+  expect(stripNothing(await evalStoppable(src))).toBe(stripNothing(await evalSelfHosted(src)));
+}, 60000);
+
+// ---- (a) correctness through the CPS pipeline (direct/seed cross-check) ----
+// NOTE: the prelude-HOF / operator-method tests below stay referenced to the SEED
+// (`evalDirect`) because compiler #2 can't run free prelude HOFs as a bare program yet
+// (no prelude inlining) — see the compiler-#2 oracle note above.
 
 test("stoppable: arithmetic", async () => {
   expect(await evalStoppable("1 + 1 + 1 + 1")).toBe("4");
